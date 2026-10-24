@@ -1,0 +1,156 @@
+name: Package candidates
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package family to build and attest
+        required: true
+        type: choice
+        options: [rust, python]
+  push:
+    tags: ['rust/v*', 'python/v*']
+permissions:
+  contents: read
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.select.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: select
+        env:
+          REQUESTED_PACKAGE: ${{ inputs.package }}
+        run: python3 tools/release/package_family.py
+  rust:
+    needs: select
+    if: needs.select.outputs.package == 'rust'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Require a clean tree
+        run: |
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+      - run: nix develop --command bash -euo pipefail -c 'cargo test --locked --workspace --all-features; cargo test --locked -p zstar --no-default-features'
+      - run: nix develop --command python3 tools/release/package_rust.py
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/rust/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-packages
+          path: dist/rust/
+          if-no-files-found: error
+  python-sdist:
+    needs: select
+    if: needs.select.outputs.package == 'python'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Require a clean tree
+        run: |
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+      - name: Build and verify the single source distribution
+        run: nix develop --command python3 tools/release/package_python.py --sdist-only
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/python/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/python/
+          if-no-files-found: error
+  python:
+    needs: select
+    if: needs.select.outputs.package == 'python'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Require a clean tree
+        run: |
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+      - run: |
+          if [ "${{ runner.os }}" = Linux ]; then
+            nix develop --command python3 tools/release/package_python.py --wheels-only --manylinux
+          else
+            nix develop --command python3 tools/release/package_python.py --wheels-only
+          fi
+      - name: Audit and test candidate artifact with system Python
+        run: |
+          nix develop --command bash -euo pipefail <<'SH'
+            wheels=(dist/python/*-cp311-abi3-*.whl)
+            test "${#wheels[@]}" = 1
+            uv tool run --from abi3audit==0.0.26 abi3audit --strict --report "${wheels[0]}"
+            uv sync --locked --only-group test --python "$(command -v python3)"
+            uv pip install --python .venv/bin/python --reinstall "${wheels[0]}"
+            uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml --search-path sdks/python/src sdks/python/src/zstar
+            uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml sdks/python/tests/typing_api.py
+            uv run --no-sync python -I -m pytest sdks/python/tests
+          SH
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/python/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-packages-${{ matrix.os }}
+          path: dist/python/
+          if-no-files-found: error
+  python-windows:
+    needs: select
+    if: needs.select.outputs.package == 'python'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - name: Require a clean tree
+        run: |
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+      - run: python -m pip install uv==0.13.1
+      - name: Build source distribution and Windows wheel
+        run: |
+          uv sync --locked --only-group test --python "$(command -v python)"
+          uv run --no-sync python tools/release/package_python.py --wheels-only
+      - name: Audit and test candidate with system Python
+        run: |
+          wheels=(dist/python/*-cp311-abi3-win_amd64.whl)
+          test "${#wheels[@]}" = 1
+          uv tool run --from abi3audit==0.0.26 abi3audit --strict --report "${wheels[0]}"
+          uv pip install --python .venv/Scripts/python.exe --reinstall "${wheels[0]}"
+          uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml --search-path sdks/python/src sdks/python/src/zstar
+          uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml sdks/python/tests/typing_api.py
+          uv run --no-sync python -I -m pytest sdks/python/tests
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/python/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-packages-windows-latest
+          path: dist/python/
+          if-no-files-found: error

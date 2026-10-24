@@ -1,0 +1,103 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "zstar-py"
+version = "0.1.0"
+description = "Python SDK for Zstar archives"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["typing_extensions>=4.12"]
+authors = [{ name = "Brian Li", email = "me@brian14708.dev" }]
+keywords = ["zstd", "tar", "archive", "random-access", "fsspec", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: System :: Archiving",
+    "Topic :: System :: Archiving :: Compression",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/brian14708/zstar"
+Repository = "https://github.com/brian14708/zstar"
+Issues = "https://github.com/brian14708/zstar/issues"
+Documentation = "https://github.com/brian14708/zstar/tree/main/sdks/python"
+
+[project.optional-dependencies]
+fsspec = ["fsspec>=2024.2"]
+
+[project.entry-points."fsspec.specs"]
+zstar = "zstar.fsspec:ZstarFileSystem"
+
+[tool.maturin]
+locked = true
+profile = "release"
+python-source = "src"
+module-name = "zstar._native"
+include = [{ path = "docs/*.md", format = "sdist" }]
+
+[tool.pyrefly]
+python-version = "3.11"
+preset = "strict"
+project-includes = ["src/**/*.py", "src/**/*.pyi"]
+# Keep consumer checks on the installed wheel; source checks supply --search-path.
+search-path = []
+disable-search-path-heuristics = true
+enable-fallback-search-path = false
+# Match the existing treatment of the optional, untyped fsspec dependency.
+replace-imports-with-any = ["fsspec", "fsspec.*"]
+
+[tool.pyrefly.errors]
+unused-ignore = "error"
+# Allow forwarding option TypedDicts as keyword arguments.
+open-unpacking = "ignore"
+
+[tool.cibuildwheel]
+build = "cp311-manylinux*"
+
+[tool.cibuildwheel.linux]
+archs = ["native"]
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+before-all = """
+set -eu
+case "$(uname -m)" in
+  x86_64) sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
+  aarch64) sha=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;;
+  *) echo "unsupported architecture" >&2; exit 1 ;;
+esac
+curl --proto '=https' --tlsv1.2 --fail --location \
+  "https://static.rust-lang.org/rustup/archive/1.28.2/$(uname -m)-unknown-linux-gnu/rustup-init" \
+  -o /tmp/rustup-init
+echo "$sha  /tmp/rustup-init" | sha256sum --check -
+chmod +x /tmp/rustup-init
+/tmp/rustup-init -y --profile minimal --default-toolchain 1.97.0
+"""
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "rust/**/*.rs" },
+    { file = "src/**/*.py" },
+    { file = "src/**/*.pyi" },
+    { file = "src/zstar/py.typed" },
+    { file = "README.md" },
+    { file = "LICENSE" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+    { file = "../../crates/zstar/Cargo.toml" },
+    { file = "../../crates/zstar/src/**/*.rs" },
+]

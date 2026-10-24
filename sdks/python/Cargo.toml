@@ -1,0 +1,32 @@
+[package]
+publish = false
+name = "zstar-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Python bindings for Zstar archives"
+
+[lib]
+path = "rust/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+# abi3 wheels (cp311-abi3) are the default GIL build. Free-threaded CPython
+# (3.13t/3.14t) has no stable ABI before 3.15, so build those wheels with
+# `maturin build --no-default-features` (see docs/advanced.md).
+default = ["abi3"]
+abi3 = ["pyo3/abi3-py311"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+ciborium.workspace = true
+pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3-async-runtimes = { workspace = true, features = ["tokio-runtime"] }
+tokio.workspace = true
+zstar = { workspace = true, features = ["fs", "s3"] }
+
+[lints]
+workspace = true

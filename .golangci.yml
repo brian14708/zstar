@@ -1,0 +1,58 @@
+version: "2"
+run:
+  timeout: 5m
+  build-tags: [integration]
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - copyloopvar
+    - nilerr
+    - nilnesserr
+    - noctx
+    - perfsprint
+    - prealloc
+    - reassign
+    - usestdlibvars
+    - wastedassign
+    - gocritic
+    - intrange
+    - modernize
+    - revive
+    - unconvert
+    - unparam
+    - nolintlint
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    revive:
+      rules:
+        - name: exported
+          arguments: [disable-stuttering-check]
+        - name: var-naming
+        - name: error-naming
+        - name: error-strings
+        - name: error-return
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: superfluous-else
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+        clothe-returns: true

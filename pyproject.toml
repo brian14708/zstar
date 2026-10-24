@@ -1,0 +1,15 @@
+[dependency-groups]
+test = ["pyrefly>=1.4,<2", "pytest>=8", "fsspec>=2024.2", "boto3>=1.34"]
+
+[tool.uv]
+python-preference = "only-system"
+python-downloads = "never"
+
+[tool.uv.workspace]
+members = ["sdks/python"]
+
+[tool.uv.config-settings-package]
+zstar-py = { "maturin.build-args" = ["--profile", "release", "--locked"] }
+
+[tool.pytest.ini_options]
+testpaths = ["sdks/python/tests"]

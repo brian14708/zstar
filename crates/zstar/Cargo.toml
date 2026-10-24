@@ -1,0 +1,81 @@
+[package]
+name = "zstar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async indexed tar archive reader and writer"
+readme = "README.md"
+keywords = ["tar", "zstd", "archive", "seekable", "async"]
+categories = ["compression", "filesystem", "asynchronous"]
+
+[features]
+default = ["async", "spooling"]
+spooling = ["dep:tempfile"]
+compression = ["dep:zstd"]
+fs = ["async", "dep:cap-fs-ext", "dep:cap-std"]
+http = ["async", "dep:reqwest"]
+s3 = ["http", "dep:object_store"]
+async = [
+    "compression",
+    "dep:tokio",
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:lru",
+]
+
+[dependencies]
+cap-fs-ext = { workspace = true, optional = true }
+cap-std = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true, features = ["aws"] }
+reqwest = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+serde.workspace = true
+ciborium.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+tempfile.workspace = true
+
+[[example]]
+name = "in_memory"
+required-features = ["async"]
+
+[[example]]
+name = "local_range"
+required-features = ["fs"]
+
+[[test]]
+name = "transport"
+required-features = ["http"]
+
+[[test]]
+name = "storage"
+required-features = ["s3"]
+
+[[test]]
+name = "rustfs"
+required-features = ["s3"]
+
+[[test]]
+name = "hardening_http"
+required-features = ["http"]
+
+[[test]]
+name = "hardening_s3"
+required-features = ["s3"]
+
+[lints]
+workspace = true
