@@ -1,0 +1,40 @@
+{
+  "negative_catalogs": [
+    {
+      "category": "unsupported-version",
+      "file": "unknown-version.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "chunk-order.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "duplicate-chunk.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "duplicate-pack.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "outside-pack.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "weak-etag.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "overlap.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "truncated.cbor"
+    },
+    {
+      "category": "malformed-catalog",
+      "file": "trailing.cbor"
+    }
+  ]
+}

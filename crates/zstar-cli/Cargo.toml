@@ -1,0 +1,36 @@
+[package]
+name = "zstar-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line capture, inspection and restoration for Zstar archives"
+readme = "README.md"
+keywords = ["tar", "zstd", "archive", "cli"]
+categories = ["command-line-utilities", "compression", "filesystem"]
+
+[[bin]]
+name = "zstar"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+bytes.workspace = true
+clap = { workspace = true, features = ["derive"] }
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-runtime.workspace = true
+aws-types.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+tempfile.workspace = true
+zstar = { workspace = true, features = ["fs", "s3"] }
+tokio.workspace = true
+
+[dev-dependencies]
+zstd.workspace = true
+
+[lints]
+workspace = true

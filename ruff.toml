@@ -1,0 +1,9 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PERF", "RET", "PLW"]
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["B", "PLW"]
+"tools/**/*.py" = ["T201"]
