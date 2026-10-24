@@ -1,0 +1,104 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+      - run: nix develop --command just lint
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+      - run: nix develop --command just check
+  python-minimum:
+    # Lowest supported Python (requires-python); uv provisions the interpreter.
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON_DOWNLOADS: automatic
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+      - name: Test installed wheel on Python 3.11
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            uv sync --locked --package zstar-py --group test --no-editable --python 3.11
+            uv run --no-sync python -I -c "import sys; assert sys.version_info[:2] == (3, 11)"
+            uv run --no-sync python -I -m pytest python/tests
+          '
+  rust-minimum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets --all-features
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: Swatinem/rust-cache@v2
+      - name: Test and lint Rust
+        run: |
+          cargo test --locked --workspace --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: go test ./...
+      - name: Build and test installed Python wheel
+        run: |
+          python -m pip install uv==0.13.1
+          uv sync --locked --package zstar-py --group test --no-editable --python "$(python -c 'import sys; print(sys.executable)')"
+          env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml --search-path python/src python/src/zstar
+          env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml python/tests/typing_api.py
+          uv run --no-sync python -I -m pytest python/tests
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+      - name: Test local RustFS across Rust, Go, and Python
+        run: nix develop --command just check-integration
+  ci:
+    if: always()
+    needs: [lint, check, python-minimum, rust-minimum, integration, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every check to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            test "$result" = success
+          done
