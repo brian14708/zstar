@@ -17,7 +17,7 @@ jobs:
     outputs:
       package: ${{ steps.select.outputs.package }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: select
         env:
           REQUESTED_PACKAGE: ${{ inputs.package }}
@@ -31,17 +31,17 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - name: Require a clean tree
         run: |
           test -z "$(git status --porcelain)" || { git status --short; exit 1; }
       - run: nix develop --command bash -euo pipefail -c 'cargo test --locked --workspace --all-features; cargo test --locked -p zstar --no-default-features'
       - run: nix develop --command python3 tools/release/package_rust.py
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/rust/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rust-packages
           path: dist/rust/
@@ -55,17 +55,17 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - name: Require a clean tree
         run: |
           test -z "$(git status --porcelain)" || { git status --short; exit 1; }
       - name: Build and verify the single source distribution
         run: nix develop --command python3 tools/release/package_python.py --sdist-only
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/python/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-sdist
           path: dist/python/
@@ -82,7 +82,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - name: Require a clean tree
         run: |
@@ -105,10 +105,10 @@ jobs:
             uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml sdks/python/tests/typing_api.py
             uv run --no-sync python -I -m pytest sdks/python/tests
           SH
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/python/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-packages-${{ matrix.os }}
           path: dist/python/
@@ -125,7 +125,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
@@ -146,10 +146,10 @@ jobs:
           uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml --search-path sdks/python/src sdks/python/src/zstar
           uv run --no-sync python -I -m pyrefly check --config sdks/python/pyproject.toml sdks/python/tests/typing_api.py
           uv run --no-sync python -I -m pytest sdks/python/tests
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/python/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-packages-windows-latest
           path: dist/python/

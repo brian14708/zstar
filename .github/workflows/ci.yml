@@ -13,7 +13,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - uses: Swatinem/rust-cache@v2
       - run: nix develop --command just lint
@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - uses: Swatinem/rust-cache@v2
       - run: nix develop --command just check
@@ -35,7 +35,7 @@ jobs:
       UV_PYTHON_DOWNLOADS: automatic
       UV_PYTHON_PREFERENCE: only-managed
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - uses: Swatinem/rust-cache@v2
       - name: Test installed wheel on Python 3.11
@@ -48,7 +48,7 @@ jobs:
   rust-minimum:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
@@ -60,11 +60,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: sdks/go/go.mod
       - uses: Swatinem/rust-cache@v2
@@ -85,7 +85,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - uses: Swatinem/rust-cache@v2
       - name: Test local RustFS across Rust, Go, and Python
