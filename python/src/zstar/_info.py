@@ -1,41 +1,10 @@
-"""Tar-compatible member metadata, with exact timestamps and Zstar extensions."""
+"""Convert native entries to standard tarfile metadata."""
 
-from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
-from tarfile import DIRTYPE, REGTYPE, SYMTYPE
-from tarfile import TarInfo as _TarInfo
-from typing import Literal, cast
+from tarfile import DIRTYPE, REGTYPE, SYMTYPE, TarInfo
+from typing import Literal
 
 from .types import CborValue, EntryFields, EntryTuple
-
-
-class TarInfo(_TarInfo):
-    """A tar member with optional ``x-*`` CBOR extensions and exact nanoseconds.
-
-    Instances are owned snapshots. Changes do not modify an open archive.
-    ``pax_headers['mtime']`` takes precedence over ``mtime``, as in tarfile.
-    """
-
-    __slots__ = ("extensions",)
-
-    def __init__(self, name: str = "") -> None:
-        super().__init__(name)
-        self.extensions: dict[str, CborValue] = {}
-
-    @property
-    def mtime_ns(self) -> int:
-        return _nanoseconds(self.pax_headers.get("mtime", self.mtime))
-
-    @mtime_ns.setter
-    def mtime_ns(self, value: int) -> None:
-        if not isinstance(value, int):
-            raise TypeError("mtime_ns must be an integer")
-        if not -(1 << 63) <= value < 1 << 63:
-            raise OverflowError("mtime is outside the archive timestamp range")
-        seconds, fraction = divmod(abs(value), 1_000_000_000)
-        text = f"{'-' if value < 0 else ''}{seconds}.{fraction:09d}"
-        self.mtime = value // 1_000_000_000 if fraction == 0 else float(text)
-        self.pax_headers = {**self.pax_headers, "mtime": text}
 
 
 def _nanoseconds(value: int | float | str) -> int:
@@ -63,17 +32,19 @@ def _from_entry(entry: EntryTuple) -> TarInfo:
     info.type = {0: REGTYPE, 5: DIRTYPE, 2: SYMTYPE}[kind]
     info.size = sum(extent[0] for extent in extents)
     info.mode, info.uid, info.gid = mode, uid, gid
-    info.mtime_ns = mtime_ns
+    seconds, fraction = divmod(abs(mtime_ns), 1_000_000_000)
+    text = f"{'-' if mtime_ns < 0 else ''}{seconds}.{fraction:09d}"
+    info.mtime = mtime_ns // 1_000_000_000 if fraction == 0 else float(text)
+    info.pax_headers = {"mtime": text}
     fields = dict(entry[7]) if len(entry) == 8 else {}
     linkname = fields.pop("linkname", "")
     assert isinstance(linkname, str)
     info.linkname = linkname
-    info.extensions = fields
     return info
 
 
-def _to_entry(info: _TarInfo) -> EntryTuple:
-    if not isinstance(info, _TarInfo):
+def _to_entry(info: TarInfo) -> EntryTuple:
+    if not isinstance(info, TarInfo):
         raise TypeError("tarinfo must be a tarfile.TarInfo")
     kind: Literal[0, 2, 5]
     if info.isfile():
@@ -84,7 +55,7 @@ def _to_entry(info: _TarInfo) -> EntryTuple:
         kind = 2
     else:
         raise ValueError("only regular files, directories, and symlinks are supported")
-    fields = dict(cast(Mapping[str, CborValue], getattr(info, "extensions", {})))
+    fields: dict[str, CborValue] = {}
     if info.issym():
         fields["linkname"] = info.linkname
     entry: EntryFields = (

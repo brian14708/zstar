@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["typing_extensions>=4.12"]
+dependencies = ["fsspec>=2026.9.0", "typing_extensions>=4.16"]
 authors = [{ name = "Brian Li", email = "me@brian14708.dev" }]
 keywords = ["zstd", "tar", "archive", "random-access", "fsspec", "asyncio"]
 classifiers = [
@@ -36,12 +36,11 @@ Repository = "https://github.com/brian14708/zstar"
 Issues = "https://github.com/brian14708/zstar/issues"
 Documentation = "https://github.com/brian14708/zstar/tree/main/python"
 
-[project.optional-dependencies]
-fsspec = ["fsspec[http]>=2026.9.0"]
-
 [project.entry-points."fsspec.specs"]
-zstar = "zstar.fsspec:ZstarFileSystem"
-"zstar+s3" = "zstar.fsspec:ZstarS3FileSystem"
+zstar = "zstar._fsspec:ZstarFileSystem"
+
+[project.optional-dependencies]
+http = ["fsspec[http]>=2026.9.0"]
 
 [tool.maturin]
 locked = true
@@ -57,7 +56,7 @@ project-includes = ["src/**/*.py", "src/**/*.pyi"]
 search-path = []
 disable-search-path-heuristics = true
 enable-fallback-search-path = false
-# Match the existing treatment of the optional, untyped fsspec dependency.
+# fsspec currently provides no type annotations.
 replace-imports-with-any = ["fsspec", "fsspec.*"]
 
 [tool.pyrefly.errors]

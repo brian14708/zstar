@@ -38,6 +38,7 @@ pub(crate) async fn open_reader(
 pub(crate) fn reader_options(
     py: Python<'_>,
     cache_bytes: usize,
+    concurrent_chunks: usize,
     verify_external: bool,
     memory_bytes: u64,
     max_encoded_bytes: u64,
@@ -54,6 +55,7 @@ pub(crate) fn reader_options(
     let shared = super::decoded_cache_binding(py, shared_cache, shared_cache_identity)?;
     let options = ReaderOptions {
         cache_bytes,
+        concurrent_chunks,
         verify_external,
         resolver: resolver.map(|r| super::pack::binding(py, r)),
         manifest: zstar::ManifestOptions {
@@ -67,7 +69,6 @@ pub(crate) fn reader_options(
             create_spill_store: super::manifest_api::spill_factory(py, create_spill_store)?,
             ..Default::default()
         },
-        ..Default::default()
     };
     Ok((options, shared))
 }

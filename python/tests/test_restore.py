@@ -2,6 +2,7 @@ import os
 
 import pytest
 import zstar
+from zstar import _native
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix filesystem restoration")
@@ -12,12 +13,12 @@ def test_pack_restore_preserves_exact_symlinks_and_metadata(tmp_path):
     (source / "data").chmod(0o640)
     (source / "absolute").symlink_to("/missing/.././target")
     (source / "dangling").symlink_to(".././outside")
-    data = zstar.pack_directory(source, preserve_metadata=True)
+    data = _native.pack_directory(source, preserve_metadata=True)
     assert isinstance(data, bytes)
     archive = zstar.Archive(data)
     assert archive.read("data") == b"hello"
     destination = tmp_path / "destination"
-    zstar.extract(data, destination)
+    _native.extract(data, destination)
     assert (destination / "data").read_bytes() == b"hello"
     assert os.readlink(destination / "absolute") == "/missing/.././target"
     assert os.readlink(destination / "dangling") == ".././outside"
@@ -26,7 +27,7 @@ def test_pack_restore_preserves_exact_symlinks_and_metadata(tmp_path):
         source / "absolute"
     ).lstat().st_mtime_ns
     with pytest.raises(ValueError):
-        zstar.extract(data, destination)  # no silent overwrite
+        _native.extract(data, destination)  # no silent overwrite
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix filesystem restoration")
@@ -36,14 +37,14 @@ def test_extract_refuses_destination_symlink(tmp_path):
     destination = tmp_path / "dest"
     destination.symlink_to(outside)
     with pytest.raises(ValueError):
-        zstar.extract(bytes(zstar.pack_file("file", b"hello")), destination)
+        _native.extract(bytes(_native.pack_file("file", b"hello")), destination)
     assert list(outside.iterdir()) == []
 
 
 def test_materialize_external_objects(thin_data, corpus_dir):
     with pytest.raises(ValueError, match="requires"):
-        zstar.materialize(thin_data)
-    result = zstar.materialize(thin_data, objects=corpus_dir / "objects")
+        _native.materialize(thin_data)
+    result = _native.materialize(thin_data, objects=corpus_dir / "objects")
     assert isinstance(result, bytes)
     with zstar.Archive(result) as archive:
         assert archive.read("hello.txt") == b"hello\n"
@@ -67,12 +68,12 @@ def test_external_hash_policy_keeps_codec_validation(
 
     def restore():
         if operation == "materialize":
-            encoded = zstar.materialize(thin_data, objects=objects, verify_external=verify)
+            encoded = _native.materialize(thin_data, objects=objects, verify_external=verify)
             with zstar.Archive(encoded) as archive:
                 assert archive.verify()["full_archive_verified"]
                 return archive.read("hello.txt")
         destination = tmp_path / "destination"
-        zstar.extract(thin_data, destination, objects=objects, verify_external=verify)
+        _native.extract(thin_data, destination, objects=objects, verify_external=verify)
         return (destination / "hello.txt").read_bytes()
 
     if verify or malformed:
@@ -93,10 +94,10 @@ def test_filesystem_hash_opt_out_keeps_physical_and_metadata_validation(
 ):
     source = (corpus_dir / "invalid" / f"{fixture}.zstar").read_bytes()
     with pytest.raises(ValueError):
-        zstar.materialize(source, objects=corpus_dir / "objects", verify_external=False)
+        _native.materialize(source, objects=corpus_dir / "objects", verify_external=False)
     if os.name == "posix":
         with pytest.raises(ValueError):
-            zstar.extract(
+            _native.extract(
                 source,
                 tmp_path / "destination",
                 objects=corpus_dir / "objects",
@@ -106,9 +107,9 @@ def test_filesystem_hash_opt_out_keeps_physical_and_metadata_validation(
 
 @pytest.mark.skipif(os.name == "posix", reason="Non-Unix filesystem contract")
 def test_non_unix_extraction_reports_unsupported(tmp_path):
-    encoded = zstar.pack_file("file", b"hello")
+    encoded = _native.pack_file("file", b"hello")
     with pytest.raises(ValueError, match="Unix filesystem"):
-        zstar.extract(encoded, tmp_path / "destination")
+        _native.extract(encoded, tmp_path / "destination")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix capture metadata")
@@ -120,16 +121,16 @@ def test_default_capture_normalizes_metadata_and_is_reproducible(tmp_path):
         (source / name).write_bytes(name.encode())
         (source / name).chmod(mode)
     (source / "link").symlink_to(".././missing")
-    first = zstar.pack_directory(source)
+    first = _native.pack_directory(source)
     (source / "file").chmod(0o600)
     (source / "exec").chmod(0o711)
     for path in [source, *source.rglob("*")]:
         os.utime(path, ns=(1234567890, 9876543210), follow_symlinks=False)
-    assert first == zstar.pack_directory(source)
+    assert first == _native.pack_directory(source)
     destination = tmp_path / "out"
-    zstar.extract(first, destination)
+    _native.extract(first, destination)
     for name, mode in [("file", 0o644), ("exec", 0o755), ("dir", 0o755), ("link", 0o777)]:
         metadata = (destination / name).lstat()
         assert metadata.st_mode & 0o7777 == mode
         assert metadata.st_mtime_ns == 0
-    assert first != zstar.pack_directory(source, preserve_metadata=True)
+    assert first != _native.pack_directory(source, preserve_metadata=True)

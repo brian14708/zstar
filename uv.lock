@@ -926,17 +926,19 @@ name = "zstar-py"
 version = "0.0.1"
 source = { editable = "python" }
 dependencies = [
+    { name = "fsspec" },
     { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
-fsspec = [
+http = [
     { name = "fsspec", extra = ["http"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "fsspec", extras = ["http"], marker = "extra == 'fsspec'", specifier = ">=2026.9.0" },
-    { name = "typing-extensions", specifier = ">=4.12" },
+    { name = "fsspec", specifier = ">=2026.9.0" },
+    { name = "fsspec", extras = ["http"], marker = "extra == 'http'", specifier = ">=2026.9.0" },
+    { name = "typing-extensions", specifier = ">=4.16" },
 ]
-provides-extras = ["fsspec"]
+provides-extras = ["http"]

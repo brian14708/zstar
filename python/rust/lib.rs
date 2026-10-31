@@ -488,7 +488,7 @@ impl zstar::ObjectResolver for PythonResolver {
 
 /// Concurrent indexed reads over a synchronous Python source. Content requests
 /// use the native async entry reader; callbacks run on bounded blocking workers.
-#[pyclass(module = "zstar.format", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 struct IndexedArchive {
     inner: std::sync::Mutex<Option<Arc<IndexedState>>>,
 }
@@ -582,6 +582,18 @@ impl IndexedArchive {
             .transpose()
     }
     #[getter]
+    fn root_extensions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let reader = self.reader()?;
+        manifest_api::extensions_to_py(py, reader.reader.root_extensions())
+    }
+    fn read_link(&self, py: Python<'_>, path: &str) -> PyResult<String> {
+        let reader = self.reader()?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(reader.reader.read_link(path))
+        })
+        .map_err(core_error)
+    }
+    #[getter]
     fn entry_count(&self) -> PyResult<u64> {
         Ok(self.reader()?.reader.entry_count())
     }
@@ -616,12 +628,13 @@ impl IndexedArchive {
 
     /// Open an immutable encoded byte snapshot.
     #[staticmethod]
-    #[pyo3(signature=(data,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(data,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_bytes(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -638,6 +651,7 @@ impl IndexedArchive {
         let (options, shared_cache) = reader::reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -664,13 +678,14 @@ impl IndexedArchive {
 
     /// Open a strong-ETag-pinned HTTP archive.
     #[staticmethod]
-    #[pyo3(signature=(url,*,headers=None,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(url,*,headers=None,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_url(
         py: Python<'_>,
         url: String,
         headers: Option<std::collections::BTreeMap<String, String>>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -687,6 +702,7 @@ impl IndexedArchive {
         let (options, shared_cache) = reader::reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -719,7 +735,7 @@ impl IndexedArchive {
 
     /// Open an immutable native S3 archive.
     #[staticmethod]
-    #[pyo3(signature=(bucket,key,*,endpoint=None,region=None,object_prefix=None,anon=None,access_key_id=None,secret_access_key=None,session_token=None,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(bucket,key,*,endpoint=None,region=None,object_prefix=None,anon=None,access_key_id=None,secret_access_key=None,session_token=None,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_s3(
         py: Python<'_>,
@@ -733,6 +749,7 @@ impl IndexedArchive {
         secret_access_key: Option<String>,
         session_token: Option<String>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -749,6 +766,7 @@ impl IndexedArchive {
         let (options, shared_cache) = reader::reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -770,7 +788,7 @@ impl IndexedArchive {
             access_key_id,
             secret_access_key,
             session_token,
-        );
+        )?;
         py.detach(|| {
             let mut options = options;
             let source =
@@ -785,12 +803,13 @@ impl IndexedArchive {
 
     /// Open a local archive using native positional reads.
     #[staticmethod]
-    #[pyo3(signature=(path,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(path,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -807,6 +826,7 @@ impl IndexedArchive {
         let (options, shared_cache) = reader::reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -833,13 +853,14 @@ impl IndexedArchive {
     }
 
     #[new]
-    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,verify_external=true,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,concurrent_chunks=8,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,verify_external=true,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         source: Py<PyAny>,
         size: u64,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         memory_bytes: u64,
         max_encoded_bytes: u64,
         max_decoded_bytes: u64,
@@ -856,6 +877,7 @@ impl IndexedArchive {
         let (options, shared_cache) = reader::reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -1077,7 +1099,7 @@ struct EntriesState {
     exhausted: bool,
     buffer: std::collections::VecDeque<zstar::Entry>,
 }
-#[pyclass(module = "zstar.format", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 struct IndexedEntries {
     archive: Py<IndexedArchive>,
     state: std::sync::Mutex<EntriesState>,
@@ -1161,6 +1183,20 @@ fn decode_object(
         .detach(|| zstar::decode_frame(&encoded, size))
         .map_err(|error| core_error(zstar::Error::MalformedExternalContent(error.to_string())))?;
     Ok(pyo3::types::PyBytes::new(py, &raw).unbind())
+}
+
+/// Externalize one file and call a Python function for each encoded object.
+#[pyfunction]
+#[pyo3(signature=(fileobj,size,callback,*,chunking,compression_level=3))]
+fn _externalize(
+    py: Python<'_>,
+    fileobj: Py<PyAny>,
+    size: u64,
+    callback: Py<PyAny>,
+    chunking: PyRef<'_, pack::PyChunking>,
+    compression_level: i32,
+) -> PyResult<pack::PyExternal> {
+    pack::externalize_callback(py, fileobj, size, callback, chunking, compression_level)
 }
 
 #[pyfunction]
@@ -1285,6 +1321,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pack::register(m)?;
     m.add("ZstarError", m.py().get_type::<ZstarError>())?;
     m.add_function(wrap_pyfunction!(decode_object, m)?)?;
+    m.add_function(wrap_pyfunction!(_externalize, m)?)?;
     m.add_function(wrap_pyfunction!(request::put_presigned, m)?)?;
     m.add_function(wrap_pyfunction!(pack_file, m)?)?;
     m.add_function(wrap_pyfunction!(pack_directory, m)?)?;

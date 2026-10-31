@@ -13,10 +13,7 @@ use zstar::backend::BlockingArchive;
 use zstar::fs::{self as restore, LocalFileSource};
 use zstar::manifest_io::ManifestOptions;
 use zstar::s3::object_store::client::CredentialProvider;
-use zstar::s3::{
-    AmazonS3Builder,
-    object_store::{ObjectStoreExt, aws::AwsCredential, path::Path as ObjectPath},
-};
+use zstar::s3::object_store::{ObjectStoreExt, aws::AwsCredential, path::Path as ObjectPath};
 
 fn s3_error(operation: &str, error: zstar::s3::object_store::Error) -> std::io::Error {
     use zstar::s3::object_store::Error as E;
@@ -242,7 +239,9 @@ async fn s3_store(bucket: &str) -> restore::AnyResult<Arc<zstar::s3::AmazonS3>> 
     let credentials = config
         .credentials_provider()
         .ok_or("AWS credential chain did not return a provider")?;
-    let mut builder = AmazonS3Builder::from_env()
+    // The CLI owns ambient AWS configuration explicitly; the core library's
+    // S3 builder intentionally has no environment-discovery path.
+    let mut builder = zstar::s3::object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_credentials(Arc::new(AwsCredentials(credentials)));
     if let Some(region) = config.region() {

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import BinaryIO
+
+from .types import SeekableReader
 
 
 class _FileSource:
@@ -14,7 +15,7 @@ class _FileSource:
     ``length`` bytes arrive or end of file. The caller keeps ownership of the file.
     """
 
-    def __init__(self, file: BinaryIO) -> None:
+    def __init__(self, file: SeekableReader) -> None:
         self.file, self.lock = file, threading.Lock()
         position = file.tell()
         try:

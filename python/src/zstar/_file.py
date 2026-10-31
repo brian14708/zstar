@@ -4,6 +4,7 @@ import asyncio
 import io
 import operator
 import threading
+from collections.abc import AsyncIterator, Iterator
 from types import TracebackType
 from typing import TYPE_CHECKING, Self
 
@@ -112,6 +113,15 @@ class ArchiveFile(io.RawIOBase):
             self._position += len(data)
             return data
 
+    def iter_chunks(self, chunk_size: int = 64 << 10) -> Iterator[bytes]:
+        """Yield bytes from the current position, bounded by the read budget."""
+        chunk_size = operator.index(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        chunk_size = min(chunk_size, _step(self._owner()._max_read_bytes))
+        while chunk := self.read(chunk_size):
+            yield chunk
+
     @override
     def readall(self) -> bytes:
         return self.read(-1)
@@ -197,6 +207,15 @@ class AsyncArchiveFile:
             data = await archive._reader._read_member(self._cursor, self._position, count)
             self._position += len(data)
             return data
+
+    async def iter_chunks(self, chunk_size: int = 64 << 10) -> AsyncIterator[bytes]:
+        """Yield bytes from the current position, bounded by the read budget."""
+        chunk_size = operator.index(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        chunk_size = min(chunk_size, _step(self._owner()._max_read_bytes))
+        while chunk := await self.read(chunk_size):
+            yield chunk
 
     async def readinto(self, buffer: "Buffer") -> int:
         with memoryview(buffer).cast("B") as view:

@@ -1,11 +1,12 @@
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from os import PathLike
 from types import TracebackType
-from typing import BinaryIO, Literal, TypedDict, Unpack
+from typing import Literal, TypedDict, TypeVar, Unpack
 
-from typing_extensions import Buffer
+from typing_extensions import Buffer, Reader
 
 from .types import (
+    BinaryWriter,
     CborValue,
     EntryTuple,
     ErrorCategory,
@@ -15,9 +16,14 @@ from .types import (
     ReaderOptions,
     ReadReport,
     RequestProvider,
+    SeekableReader,
     VerificationReport,
     WriterOptions,
 )
+
+_T = TypeVar("_T")
+
+def _writer_call(operation: Callable[[], _T]) -> Awaitable[_T]: ...
 
 class ZstarError(ValueError):
     category: ErrorCategory
@@ -69,6 +75,8 @@ class IndexedArchive:
     @property
     def cache_bytes(self) -> int: ...
     @property
+    def root_extensions(self) -> dict[str, CborValue]: ...
+    @property
     def entry_count(self) -> int: ...
     def entry(self, path: str) -> EntryTuple | None: ...
     def _entry(self, path: str) -> EntryInfo: ...
@@ -82,6 +90,7 @@ class IndexedArchive:
         *,
         resolver: ObjectResolver | None = None,
     ) -> bytes: ...
+    def read_link(self, path: str) -> str: ...
     def read_many(
         self, requests: Sequence[tuple[str, int, int]], *, resolver: ObjectResolver | None = None
     ) -> list[bytes]: ...
@@ -127,7 +136,7 @@ class AsyncArchive:
     def from_file(path: str, **options: Unpack[ReaderOptions]) -> Awaitable[AsyncArchive]: ...
     @staticmethod
     def from_fileobj(
-        fileobj: BinaryIO, **options: Unpack[ReaderOptions]
+        fileobj: SeekableReader, **options: Unpack[ReaderOptions]
     ) -> Awaitable[AsyncArchive]: ...
     @staticmethod
     def from_url(
@@ -155,6 +164,8 @@ class AsyncArchive:
     def closed(self) -> bool: ...
     @property
     def cache_bytes(self) -> int: ...
+    @property
+    def root_extensions(self) -> dict[str, CborValue]: ...
     @property
     def entry_count(self) -> int: ...
     def entry(self, path: str) -> Awaitable[EntryTuple | None]: ...
@@ -238,10 +249,10 @@ class ManifestEntries:
     def __next__(self) -> EntryTuple: ...
 
 class EntryArchiveWriter:
-    def __init__(self, output: BinaryIO, **options: Unpack[WriterOptions]) -> None: ...
+    def __init__(self, output: BinaryWriter, **options: Unpack[WriterOptions]) -> None: ...
     @property
     def closed(self) -> bool: ...
-    def add(self, entry: EntryTuple, body: BinaryIO | None = None, size: int = 0) -> None: ...
+    def add(self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0) -> None: ...
     def add_path(
         self,
         path: str | PathLike[str],
@@ -300,6 +311,15 @@ class ExternalFile:
     @property
     def chunk_count(self) -> int: ...
     def _entry(self, entry: EntryTuple) -> EntryTuple: ...
+
+def _externalize(
+    fileobj: Reader[bytes],
+    size: int,
+    callback: Callable[[str, bytes, int], int],
+    *,
+    chunking: Chunking,
+    compression_level: int = 3,
+) -> ExternalFile: ...
 
 class PackStore:
     @staticmethod
@@ -366,10 +386,10 @@ class PackWriter:
         traceback: TracebackType | None,
     ) -> Awaitable[None]: ...
     def externalize(
-        self, fileobj: BinaryIO, size: int, *, chunking: Chunking | None = None
+        self, fileobj: Reader[bytes], size: int, *, chunking: Chunking | None = None
     ) -> ExternalFile: ...
     def externalize_async(
-        self, fileobj: BinaryIO, size: int, *, chunking: Chunking | None = None
+        self, fileobj: Reader[bytes], size: int, *, chunking: Chunking | None = None
     ) -> Awaitable[ExternalFile]: ...
     def finish(self) -> PackedCatalog: ...
     def finish_async(self) -> Awaitable[PackedCatalog]: ...
@@ -400,7 +420,7 @@ class PackedGeneration:
 
 def publish_packed_generation(
     store: PackStore,
-    archive: BinaryIO,
+    archive: Reader[bytes],
     catalog: PackedCatalog,
     *,
     prefix: str = "objects",
@@ -408,7 +428,7 @@ def publish_packed_generation(
 ) -> tuple[str, PackedGeneration]: ...
 def publish_packed_generation_async(
     store: PackStore,
-    archive: BinaryIO,
+    archive: Reader[bytes],
     catalog: PackedCatalog,
     *,
     prefix: str = "objects",

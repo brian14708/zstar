@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import zstar
-import zstar.format
+from zstar import _native
 
 ROOT = Path(__file__).resolve().parents[2] / "testdata" / "entry-manifest"
 MANIFEST = json.loads((ROOT / "manifest.json").read_text())
@@ -46,7 +46,7 @@ def test_corpus(case, source_factory):
         operation = case["operation"]
         options = case.get("limits", {})
         if operation in ("inline-range", "external-range"):
-            archive = zstar.format.IndexedArchive(
+            archive = zstar.Archive.from_source(
                 source_factory(data),
                 len(data),
                 verify_external=case.get("verify_external", True),
@@ -68,8 +68,8 @@ def test_corpus(case, source_factory):
                     assert report["external_objects_unchecked"]
                     assert not report["external_objects_sha256_checked"]
         elif operation == "metadata":
-            archive = zstar.format.IndexedArchive(source_factory(data), len(data), **options)
-            archive.validate_metadata()
+            archive = zstar.Archive.from_source(source_factory(data), len(data), **options)
+            assert not archive.closed
         else:
             resolver = Objects(case.get("objects", {})) if operation == "external-closure" else None
             archive = zstar.Archive(data, resolver=resolver, **options)
@@ -77,7 +77,7 @@ def test_corpus(case, source_factory):
             for path, expected in case.get("members", {}).items():
                 assert archive.read(path, resolver=resolver) == artifact(expected)
             for path, target in case.get("links", {}).items():
-                assert archive.getmember(path).linkname == target
+                assert archive.getinfo(path).linkname == target
     except zstar.ZstarError as error:
         assert error.category == case["expected_error"], str(error)
     else:
@@ -94,7 +94,7 @@ def test_error_compatibility_and_budgets():
         zstar.Archive(b"invalid")
     assert isinstance(caught.value, zstar.ZstarError)
     assert caught.value.category == "not-zstar"
-    archive = zstar.Archive(zstar.pack_file("x", b"hello"), max_read_bytes=2)
+    archive = zstar.Archive(_native.pack_file("x", b"hello"), max_read_bytes=2)
     with pytest.raises(zstar.ZstarError) as caught:
         archive.read("x")
     assert caught.value.category == "resource-limit"

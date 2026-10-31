@@ -38,6 +38,7 @@ impl S3PackStore {
                 std::num::NonZeroUsize::new(1024).unwrap(),
             )),
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(60))

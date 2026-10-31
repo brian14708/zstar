@@ -16,7 +16,7 @@ use super::request::FailureSlot;
 
 /// Async indexed archive over bytes, local sources, HTTP, or S3.
 /// Open authenticates metadata; use `verify` to check physical content.
-#[pyclass(module = "zstar", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncArchive {
     state: Mutex<Owner>,
 }
@@ -206,6 +206,11 @@ impl AsyncArchive {
         })
     }
     #[getter]
+    fn root_extensions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let lease = self.lease()?;
+        super::manifest_api::extensions_to_py(py, lease.0.reader.root_extensions())
+    }
+    #[getter]
     fn entry_count(&self) -> PyResult<u64> {
         Ok(self.lease()?.0.reader.entry_count())
     }
@@ -221,12 +226,13 @@ impl AsyncArchive {
     }
     /// Open an immutable encoded byte snapshot.
     #[staticmethod]
-    #[pyo3(signature=(data,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(data,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_bytes<'py>(
         py: Python<'py>,
         data: &Bound<'py, PyAny>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -243,6 +249,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -264,12 +271,13 @@ impl AsyncArchive {
     }
     /// Open an immutable local archive using bounded positional file reads.
     #[staticmethod]
-    #[pyo3(signature=(path,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(path,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -286,6 +294,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -310,12 +319,13 @@ impl AsyncArchive {
     }
     /// Borrow a seekable Python file object; sizing and reads run off-loop.
     #[staticmethod]
-    #[pyo3(signature=(fileobj,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(fileobj,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_fileobj(
         py: Python<'_>,
         fileobj: Py<PyAny>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -332,6 +342,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -374,13 +385,14 @@ impl AsyncArchive {
     /// Open an immutable synchronous `read_range(offset, length)` source.
     /// Callbacks run on bounded workers.
     #[staticmethod]
-    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_source(
         py: Python<'_>,
         source: Py<PyAny>,
         size: u64,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -397,6 +409,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -422,7 +435,7 @@ impl AsyncArchive {
     }
 
     #[staticmethod]
-    #[pyo3(signature=(url=None, *, headers=None, provider=None, cache_bytes=16_777_216, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(url=None, *, headers=None, provider=None, cache_bytes=16_777_216, concurrent_chunks=8, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_url(
         py: Python<'_>,
@@ -430,6 +443,7 @@ impl AsyncArchive {
         headers: Option<BTreeMap<String, String>>,
         provider: Option<Py<PyAny>>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -446,6 +460,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -473,7 +488,7 @@ impl AsyncArchive {
         })
     }
     #[staticmethod]
-    #[pyo3(signature=(bucket, key, *, endpoint=None, region=None, object_prefix=None, anon=None,access_key_id=None,secret_access_key=None,session_token=None, cache_bytes=16_777_216, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
+    #[pyo3(signature=(bucket, key, *, endpoint=None, region=None, object_prefix=None, anon=None,access_key_id=None,secret_access_key=None,session_token=None, cache_bytes=16_777_216, concurrent_chunks=8, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
     #[allow(clippy::too_many_arguments)]
     fn from_s3(
         py: Python<'_>,
@@ -487,6 +502,7 @@ impl AsyncArchive {
         secret_access_key: Option<String>,
         session_token: Option<String>,
         cache_bytes: usize,
+        concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -503,6 +519,7 @@ impl AsyncArchive {
         let (options, shared_cache) = reader_options(
             py,
             cache_bytes,
+            concurrent_chunks,
             verify_external,
             memory_bytes,
             max_encoded_bytes,
@@ -524,7 +541,7 @@ impl AsyncArchive {
             access_key_id,
             secret_access_key,
             session_token,
-        );
+        )?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut options = options;
             let source = super::s3::source(builder, key, object_prefix, &mut options)
@@ -791,7 +808,7 @@ impl AsyncArchive {
 }
 
 /// An async cursor over owned entry metadata. Closing its archive invalidates it.
-#[pyclass(module = "zstar", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncEntries {
     archive: Py<AsyncArchive>,
     prefix: Option<String>,

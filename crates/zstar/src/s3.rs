@@ -23,11 +23,141 @@ use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 use tokio::sync::{OnceCell, Semaphore};
 
 pub use object_store;
-pub use object_store::{
-    aws::{AmazonS3, AmazonS3Builder},
-    buffered::BufWriter,
-    path::Path,
-};
+pub use object_store::{aws::AmazonS3, buffered::BufWriter, path::Path};
+
+/// Explicit S3 configuration for the core adapter.
+///
+/// This deliberately has no `from_env` constructor. Region and either static
+/// credentials or anonymous access must be supplied by the caller; the core
+/// library never consults environment variables, profiles, metadata services,
+/// or other ambient configuration.
+pub struct AmazonS3Builder {
+    inner: object_store::aws::AmazonS3Builder,
+    region: Option<String>,
+    credentials: bool,
+    anonymous: bool,
+}
+
+#[allow(clippy::must_use_candidate, clippy::return_self_not_must_use)]
+impl AmazonS3Builder {
+    pub fn new() -> Self {
+        Self {
+            inner: object_store::aws::AmazonS3Builder::new(),
+            region: None,
+            credentials: false,
+            anonymous: false,
+        }
+    }
+
+    pub fn with_bucket_name(mut self, value: impl Into<String>) -> Self {
+        self.inner = self.inner.with_bucket_name(value);
+        self
+    }
+
+    pub fn with_region(mut self, value: impl Into<String>) -> Self {
+        self.region = Some(value.into());
+        self.inner = self.inner.with_region(self.region.as_ref().unwrap());
+        self
+    }
+
+    pub fn with_endpoint(mut self, value: impl Into<String>) -> Self {
+        self.inner = self.inner.with_endpoint(value);
+        self
+    }
+
+    pub fn with_allow_http(mut self, value: bool) -> Self {
+        self.inner = self.inner.with_allow_http(value);
+        self
+    }
+
+    pub fn with_virtual_hosted_style_request(mut self, value: bool) -> Self {
+        self.inner = self.inner.with_virtual_hosted_style_request(value);
+        self
+    }
+
+    pub fn with_access_key_id(mut self, value: impl Into<String>) -> Self {
+        self.credentials = true;
+        self.inner = self.inner.with_access_key_id(value);
+        self
+    }
+
+    pub fn with_secret_access_key(mut self, value: impl Into<String>) -> Self {
+        self.credentials = true;
+        self.inner = self.inner.with_secret_access_key(value);
+        self
+    }
+
+    pub fn with_token(mut self, value: impl Into<String>) -> Self {
+        self.inner = self.inner.with_token(value);
+        self
+    }
+
+    pub fn with_skip_signature(mut self, value: bool) -> Self {
+        self.anonymous = value;
+        self.inner = self.inner.with_skip_signature(value);
+        self
+    }
+
+    pub fn build(self) -> std::result::Result<AmazonS3, object_store::Error> {
+        if self.region.as_deref().is_none_or(str::is_empty) {
+            return Err(object_store::Error::Generic {
+                store: "S3 configuration",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "region is required",
+                )),
+            });
+        }
+        if !self.credentials && !self.anonymous {
+            return Err(object_store::Error::Generic {
+                store: "S3 configuration",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "explicit credentials or anonymous access are required",
+                )),
+            });
+        }
+        self.inner.build()
+    }
+}
+
+impl Default for AmazonS3Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::AmazonS3Builder;
+
+    #[test]
+    fn requires_explicit_configuration() {
+        assert!(
+            AmazonS3Builder::new()
+                .with_bucket_name("bucket")
+                .build()
+                .is_err()
+        );
+        assert!(
+            AmazonS3Builder::new()
+                .with_bucket_name("bucket")
+                .with_region("us-east-1")
+                .with_skip_signature(true)
+                .build()
+                .is_ok()
+        );
+        assert!(
+            AmazonS3Builder::new()
+                .with_bucket_name("bucket")
+                .with_region("us-east-1")
+                .with_access_key_id("key")
+                .with_secret_access_key("secret")
+                .build()
+                .is_ok()
+        );
+    }
+}
 
 // Backend errors can contain full signed URLs, so retain the category without
 // forwarding their source chains or credential-bearing Display/Debug output.

@@ -5,7 +5,8 @@ import threading
 
 import pytest
 import zstar
-import zstar.format
+import zstar._native
+from zstar import _native
 
 
 class Cache:
@@ -25,7 +26,7 @@ class Cache:
 
 @pytest.fixture
 def open_reader(source_factory, inline_data):
-    def open(cache, identity=b"fixture-v1", cls=zstar.format.ManifestArchive):
+    def open(cache, identity=b"fixture-v1", cls=zstar._native.ManifestArchive):
         source = source_factory()
         reader = cls(source, len(inline_data), shared_cache=cache, shared_cache_identity=identity)
         return reader, source
@@ -33,7 +34,7 @@ def open_reader(source_factory, inline_data):
     return open
 
 
-@pytest.mark.parametrize("cls", [zstar.format.ManifestArchive, zstar.format.IndexedArchive])
+@pytest.mark.parametrize("cls", [zstar._native.ManifestArchive, zstar._native.IndexedArchive])
 def test_custom_cache_reuse_ownership_and_version_keys(cls, open_reader):
     cache = Cache()
     for payload_reads in (1, 0):
@@ -45,11 +46,11 @@ def test_custom_cache_reuse_ownership_and_version_keys(cls, open_reader):
     assert cache.gets == 2
     assert cache.puts == 1
     token = next(iter(cache.values.values()))
-    assert isinstance(token, zstar.DecodedChunk)
+    assert isinstance(token, _native.DecodedChunk)
     assert isinstance(token.data, bytes)
     assert token.weight >= len(token.data)
     with pytest.raises(TypeError):
-        zstar.DecodedChunk()
+        _native.DecodedChunk()
     with pytest.raises(AttributeError):
         token.key = "forged"
     reader, source = open_reader(cache, identity=b"fixture-v2", cls=cls)
@@ -138,17 +139,17 @@ def test_memory_archive_accepts_custom_cache(inline_data):
 def test_invalid_custom_cache_contract_rejected_before_source_io(inline_data, source_factory):
     source = source_factory()
     with pytest.raises((TypeError, AttributeError)):
-        zstar.format.IndexedArchive(
+        zstar._native.IndexedArchive(
             source, len(inline_data), shared_cache=object(), shared_cache_identity=b"v1"
         )
     assert source.calls == 0
 
 
 def test_shared_decoded_cache_reuses_content_between_readers(inline_data, source_factory):
-    shared = zstar.DecodedMemoryCache(1 << 20)
+    shared = _native.DecodedMemoryCache(1 << 20)
     for identity, payload_reads in [(b"v1", 1), (b"v1", 0), (b"v2", 1)]:
         source = source_factory()
-        with zstar.format.ManifestArchive(
+        with zstar._native.ManifestArchive(
             source, len(inline_data), shared_cache=shared, shared_cache_identity=identity
         ) as archive:
             before = source.calls

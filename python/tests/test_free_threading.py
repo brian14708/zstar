@@ -11,10 +11,13 @@ import io
 import sys
 import sysconfig
 import threading
+from tarfile import TarInfo
 
 import pytest
 import zstar
-from zstar.format import EntryArchiveWriter, ManifestArchive
+from zstar import ArchiveWriter, _native
+from zstar._fsspec import ZstarFileSystem
+from zstar._native import EntryArchiveWriter, ManifestArchive
 
 pytestmark = pytest.mark.free_threading
 
@@ -24,9 +27,9 @@ TIMEOUT = 60
 
 def build(files):
     out = io.BytesIO()
-    with zstar.ArchiveWriter(out, frame_size=4096) as writer:
+    with ArchiveWriter(out, frame_size=4096) as writer:
         for name, body in files.items():
-            info = zstar.TarInfo(name)
+            info = TarInfo(name)
             info.size = len(body)
             writer.addfile(info, io.BytesIO(body))
     return out.getvalue()
@@ -60,7 +63,7 @@ def run_threads(function, count=THREADS):
 def test_native_module_does_not_re_enable_the_gil():
     # Importing the extension must not turn the GIL back on (gil_used = false).
     assert not sys._is_gil_enabled()
-    assert zstar.pack_file("a", b"x")
+    assert _native.pack_file("a", b"x")
 
 
 def test_shared_archive_concurrent_reads_and_metadata():
@@ -72,14 +75,14 @@ def test_shared_archive_concurrent_reads_and_metadata():
             for round_ in range(20):
                 name = f"f{(index * 7 + round_) % len(files):03d}"
                 assert archive.read(name) == files[name]
-                assert archive.getmember(name).size == len(files[name])
-                with archive.extractfile(name) as stream:
+                assert archive.getinfo(name).size == len(files[name])
+                with archive.open(name) as stream:
                     stream.seek(3)
                     assert stream.read(100) == files[name][3:103]
                 assert archive.read_many([(name, 0, 10)]) == [files[name][:10]]
                 assert archive.entry_count == len(files)
                 assert archive.cache_bytes >= 0
-            assert sum(1 for _ in archive.getnames()) == len(files)
+            assert sum(1 for _ in archive.names()) == len(files)
 
         run_threads(work)
 
@@ -140,15 +143,15 @@ def test_shared_async_archive_used_from_many_threads_with_their_own_loops():
         for round_ in range(10):
             name = f"f{(index + round_) % 16:03d}"
             assert await archive.read(name) == files[name]
-            assert (await archive.getmember(name)).size == len(files[name])
-        assert [n async for n in archive.getnames()] == sorted(files)
+            assert (await archive.getinfo(name)).size == len(files[name])
+        assert [n async for n in archive.names()] == sorted(files)
 
     run_threads(lambda index: asyncio.run(use(index)), 4)
     asyncio.run(archive.close())
 
 
 def test_concurrent_fsspec_load_failures_do_not_wedge(monkeypatch):
-    fs = zstar.ZstarFileSystem(fo=io.BytesIO(build({"x": b"ok"})))
+    fs = ZstarFileSystem(fo=io.BytesIO(build({"x": b"ok"})))
     original = fs._open_archive
 
     async def fail():
@@ -172,7 +175,7 @@ def test_concurrent_fsspec_load_failures_do_not_wedge(monkeypatch):
 def test_shared_decoded_memory_cache_between_archives_and_threads():
     files = bodies(16)
     data = build(files)
-    cache = zstar.DecodedMemoryCache(1 << 20)
+    cache = _native.DecodedMemoryCache(1 << 20)
     archives = [
         zstar.Archive(data, shared_cache=cache, shared_cache_identity=b"snapshot", cache_bytes=0)
         for _ in range(3)

@@ -1,16 +1,21 @@
 """Tar-style archive writing without wire-format tuples."""
 
+import asyncio
 import os
 from collections.abc import Callable
 from contextlib import ExitStack, suppress
+from functools import partial
+from io import BytesIO
 from pathlib import Path
 from tarfile import TarInfo as _TarInfo
 from types import TracebackType
-from typing import BinaryIO, Self, Unpack
+from typing import Self, TypeVar, Unpack
+
+from typing_extensions import Reader
 
 from . import _native
 from ._info import _to_entry
-from .types import SpillStore, WriterOptions
+from .types import BinaryWriter, CborValue, EntryTuple, SpillStore, WriterOptions
 
 
 def _open_no_follow(path: str | os.PathLike[str], flags: int, mode: int = 0o666) -> int:
@@ -26,7 +31,7 @@ class ArchiveWriter:
 
     def __init__(
         self,
-        fileobj: BinaryIO,
+        fileobj: BinaryWriter,
         *,
         frame_size: int = 1 << 20,
         compression_level: int = 3,
@@ -34,6 +39,8 @@ class ArchiveWriter:
         block_target: int = 64 << 10,
         max_spool_bytes: int = 4 << 30,
         create_spill_store: Callable[[], SpillStore] | None = None,
+        workers: int = 0,
+        root_extensions: dict[str, CborValue] | None = None,
     ) -> None:
         self._writer = _native.EntryArchiveWriter(
             fileobj,
@@ -43,32 +50,51 @@ class ArchiveWriter:
             block_target=block_target,
             max_spool_bytes=max_spool_bytes,
             create_spill_store=create_spill_store,
+            workers=workers,
+            root_extensions=root_extensions,
         )
         self._owned: ExitStack | None = None
         self._path: str | os.PathLike[str] | None = None
 
     @classmethod
-    def open(
-        cls, name: str | os.PathLike[str], mode: str = "w", **options: Unpack[WriterOptions]
+    def from_file(
+        cls,
+        file: str | os.PathLike[str] | BinaryWriter,
+        mode: str = "w",
+        **options: Unpack[WriterOptions],
     ) -> Self:
         if mode not in ("w", "x"):
             raise ValueError("writer mode must be 'w' or 'x'")
-        with ExitStack() as owner:
+        if not isinstance(file, (str, os.PathLike)):
             if mode == "x":
-                fd = os.open(os.fspath(name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-            else:
-                fd = _open_no_follow(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-            output = owner.enter_context(os.fdopen(fd, "wb"))
-            writer = cls(output, **options)
+                raise ValueError("exclusive creation requires a path")
+            return cls(file, **options)
+        name = file
+        cleanup_path = os.path.abspath(os.fspath(name))
+        with ExitStack() as owner:
+            created = False
+            try:
+                if mode == "x":
+                    fd = os.open(os.fspath(name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                else:
+                    fd = _open_no_follow(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+                created = True
+                output = owner.enter_context(os.fdopen(fd, "wb"))
+                writer = cls(output, **options)
+            except BaseException:
+                if created:
+                    with suppress(OSError):
+                        os.unlink(cleanup_path)
+                raise
             writer._owned = owner.pop_all()
-            writer._path = name
+            writer._path = cleanup_path
         return writer
 
     @property
     def closed(self) -> bool:
         return self._writer.closed
 
-    def addfile(self, tarinfo: _TarInfo, fileobj: BinaryIO | None = None) -> None:
+    def addfile(self, tarinfo: _TarInfo, fileobj: Reader[bytes] | None = None) -> None:
         """Add a regular file, directory, or symlink using its TarInfo metadata.
 
         Supply a binary body for a nonempty regular file. Include ancestor
@@ -82,6 +108,30 @@ class ArchiveWriter:
         if tarinfo.isfile() and tarinfo.size and fileobj is None:
             raise ValueError("nonempty regular file requires fileobj")
         self._writer.add(entry, fileobj, tarinfo.size if tarinfo.isfile() else 0)
+
+    def add_entry(
+        self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0
+    ) -> None:
+        """Write lossless manifest metadata, optionally with a sized file body.
+
+        File bodies receive new inline extents. Without a body, a regular-file
+        entry may reference external objects; inline archive offsets cannot be
+        copied between archives. Directories and symlinks have no body.
+        """
+        if self.closed:
+            raise ValueError("writer closed")
+        if size and body is None:
+            raise ValueError("size requires a body")
+        if body is not None and entry[1] != 0:
+            raise ValueError("body requires a regular file")
+        self._writer.add(entry, body, size)
+
+    def write_bytes(self, name: str, data: bytes, *, mode: int = 0o644) -> None:
+        """Write bytes with normalized metadata; ancestor directories must exist."""
+        info = _TarInfo(name)
+        info.size = len(data)
+        info.mode = mode
+        self.addfile(info, BytesIO(data))
 
     def add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
         """Add an explicitly externalized body, preserving its v1 chunk references."""
@@ -127,8 +177,18 @@ class ArchiveWriter:
     def close(self) -> None:
         try:
             self._writer.close()
+            self._path = None
+        except BaseException:
+            self._discard_output()
+            raise
         finally:
             self._close_owned()
+
+    def _discard_output(self) -> None:
+        path, self._path = self._path, None
+        if path is not None:
+            with suppress(OSError):
+                os.unlink(path)
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -142,14 +202,142 @@ class ArchiveWriter:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        owned_path = self._path
         try:
             self._writer.__exit__(exc_type, exc_value, traceback)
+            if exc_type is None:
+                self._path = None
+        except BaseException:
+            self._discard_output()
+            raise
         finally:
             try:
                 self._close_owned()
             finally:
-                if exc_type is not None and owned_path is not None:
+                if exc_type is not None:
                     # Partial output is not a valid archive; remove files we created.
-                    with suppress(OSError):
-                        os.unlink(owned_path)
+                    self._discard_output()
+
+
+_T = TypeVar("_T")
+
+
+async def _writer_call(
+    operation: Callable[[], _T], *, discard: Callable[[_T], None] | None = None
+) -> _T:
+    """Join native work before propagating cancellation or releasing ownership."""
+    future = asyncio.ensure_future(_native._writer_call(operation))
+    cancelled: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as error:
+            cancelled = error
+        except BaseException:
+            break
+    if cancelled is not None:
+        try:
+            result = future.result()
+        except BaseException:
+            pass
+        else:
+            if discard is not None:
+                await _writer_call(partial(discard, result))
+        raise cancelled
+    return future.result()
+
+
+def _discard_writer(writer: ArchiveWriter) -> None:
+    writer.__exit__(asyncio.CancelledError, None, None)
+
+
+class AsyncArchiveWriter:
+    """Async writer with the same operations as ArchiveWriter.
+
+    File access, compression, and synchronous body/sink/spill callbacks run on
+    Rust workers. Operations serialize per writer. Cancellation waits for the
+    active worker before propagating; exceptional context exit discards output.
+    Borrowed sinks remain open. Use an async with block to guarantee cleanup.
+    """
+
+    _writer: ArchiveWriter
+    _lock: asyncio.Lock
+
+    def __init__(self) -> None:
+        raise TypeError("use await AsyncArchiveWriter.from_file()")
+
+    @classmethod
+    async def from_file(
+        cls,
+        file: str | os.PathLike[str] | BinaryWriter,
+        mode: str = "w",
+        **options: Unpack[WriterOptions],
+    ) -> Self:
+        writer = await _writer_call(
+            partial(ArchiveWriter.from_file, file, mode, **options),
+            discard=_discard_writer,
+        )
+        result = cls.__new__(cls)
+        result._writer = writer
+        result._lock = asyncio.Lock()
+        return result
+
+    @property
+    def closed(self) -> bool:
+        return self._writer.closed
+
+    async def addfile(self, tarinfo: _TarInfo, fileobj: Reader[bytes] | None = None) -> None:
+        async with self._lock:
+            await _writer_call(partial(self._writer.addfile, tarinfo, fileobj))
+
+    async def add_entry(
+        self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0
+    ) -> None:
+        """Write lossless entry metadata and an optional sized body on a worker."""
+        async with self._lock:
+            await _writer_call(partial(self._writer.add_entry, entry, body, size))
+
+    async def write_bytes(self, name: str, data: bytes, *, mode: int = 0o644) -> None:
+        """Write bytes on a native worker, serializing with other operations."""
+        async with self._lock:
+            await _writer_call(partial(self._writer.write_bytes, name, data, mode=mode))
+
+    async def add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
+        async with self._lock:
+            await _writer_call(partial(self._writer.add_external, tarinfo, body))
+
+    async def add(
+        self,
+        name: str | os.PathLike[str],
+        arcname: str | None = None,
+        *,
+        recursive: bool = True,
+        preserve_metadata: bool = False,
+    ) -> None:
+        async with self._lock:
+            await _writer_call(
+                partial(
+                    self._writer.add,
+                    name,
+                    arcname,
+                    recursive=recursive,
+                    preserve_metadata=preserve_metadata,
+                )
+            )
+
+    async def close(self) -> None:
+        async with self._lock:
+            await _writer_call(self._writer.close)
+
+    async def __aenter__(self) -> Self:
+        async with self._lock:
+            await _writer_call(self._writer.__enter__, discard=_discard_writer)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        async with self._lock:
+            await _writer_call(partial(self._writer.__exit__, exc_type, exc_value, traceback))

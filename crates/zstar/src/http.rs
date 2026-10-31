@@ -326,6 +326,7 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> std::io::Result<Self> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .no_gzip()
             .no_brotli()
             .no_deflate()

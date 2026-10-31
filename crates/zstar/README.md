@@ -54,6 +54,10 @@ Enable adapters through Cargo features, for example
 `zstar = { version = "0.0.1", features = ["fs"] }`.
 See the module documentation for `zstar::fs`, `zstar::http`, and `zstar::s3`
 for configuration, ownership, resource limits, and cancellation behavior.
+The core S3 builder requires an explicit region and either static credentials or
+anonymous access. It never reads environment variables, profiles, credential
+files, metadata services, or proxy settings; applications can resolve those
+policies before constructing the builder.
 `ReaderOptions`, `WriterOptions`, and `ManifestOptions` configure reader,
 writer, and metadata budgets. Keep caller-owned sources immutable while a
 reader or its cached bytes are in use.

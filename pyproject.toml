@@ -13,3 +13,4 @@ zstar-py = { "maturin.build-args" = ["--profile", "release", "--locked"] }
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
+faulthandler_timeout = 30

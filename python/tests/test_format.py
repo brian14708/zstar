@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 import zstar
-import zstar.format
-from zstar import ZstarError
-from zstar.format import (
+import zstar._native
+from zstar import ZstarError, _native
+from zstar._native import (
     EntryArchiveWriter,
     ManifestArchive,
     decode_manifest_block,
@@ -82,10 +82,10 @@ def test_metadata_hash_and_read_budget_are_mandatory(inline_data, open_manifest)
 
 
 def test_indexed_open_fetches_metadata_then_payload(source_factory):
-    data = zstar.pack_file("x", b"hello")
+    data = _native.pack_file("x", b"hello")
 
     source = source_factory(data)
-    archive = zstar.format.IndexedArchive(source, len(data))
+    archive = zstar._native.IndexedArchive(source, len(data))
     assert source.calls == 2  # footer, TOC
     assert archive.paths() == ["x"]
     assert archive.read("x", 5, 0) == b""
@@ -100,10 +100,10 @@ def test_source_short_reads_are_rejected():
             return b""
 
     with pytest.raises(ValueError, match="short range response"):
-        zstar.format.IndexedArchive(ShortSource(), 100)
+        zstar._native.IndexedArchive(ShortSource(), 100)
 
 
-@pytest.mark.parametrize("archive_type", [ManifestArchive, zstar.format.IndexedArchive])
+@pytest.mark.parametrize("archive_type", [ManifestArchive, zstar._native.IndexedArchive])
 def test_resolver_errors_preserve_the_original_exception(archive_type, source_factory, thin_data):
     cause = RuntimeError("private resolver details")
 
@@ -122,10 +122,10 @@ def test_resolver_errors_preserve_the_original_exception(archive_type, source_fa
 
 
 def test_indexed_cache_and_python_external_resolver(object_resolver, source_factory, thin_data):
-    data = bytes(zstar.pack_file("x", b"hello"))
+    data = bytes(_native.pack_file("x", b"hello"))
 
     source = source_factory(data)
-    archive = zstar.format.IndexedArchive(source, len(data), cache_bytes=65536)
+    archive = zstar._native.IndexedArchive(source, len(data), cache_bytes=65536)
     assert archive.read("x", 0, 2) == b"he"
     assert archive.read("x", 2, 3) == b"llo"
     assert source.calls == 3
@@ -133,7 +133,7 @@ def test_indexed_cache_and_python_external_resolver(object_resolver, source_fact
 
     data = thin_data
     source = source_factory(data)
-    archive = zstar.format.IndexedArchive(source, len(data))
+    archive = zstar._native.IndexedArchive(source, len(data))
     # The corpus object merges a prefix, the member, and a suffix.
     expected = b"hello\n"
 
@@ -151,7 +151,7 @@ def test_indexed_external_policy_cannot_skip_archive_checksums(
 ):
     data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
 
-    archive = zstar.format.IndexedArchive(
+    archive = zstar._native.IndexedArchive(
         source_factory(data), len(data), verify_external=verify_external
     )
     archive.validate_metadata()
@@ -169,7 +169,7 @@ def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
     data = thin_data
 
     resolver = object_resolver
-    archive = zstar.format.IndexedArchive(source_factory(data), len(data), verify_external=False)
+    archive = zstar._native.IndexedArchive(source_factory(data), len(data), verify_external=False)
     payload, report = archive.read_with_report("hello.txt", 0, 6, resolver=resolver)
     assert payload == b"hello\n"
     assert report["metadata_authenticated"]
@@ -194,10 +194,10 @@ def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
 
 def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(source_factory):
     payload = bytes(range(251)) * 53
-    data = zstar.pack_file("x", payload)
+    data = _native.pack_file("x", payload)
 
     source = source_factory(data)
-    archive = zstar.format.IndexedArchive(source, len(data), cache_bytes=0)
+    archive = zstar._native.IndexedArchive(source, len(data), cache_bytes=0)
     requests = [("x", 10, 4), ("x", 0, len(payload)), ("x", len(payload), 0), ("x", 10, 4)]
     assert archive.read_many(requests) == [payload[10:14], payload, b"", payload[10:14]]
     assert source.calls == 3  # metadata + one shared payload frame, no frame cache
@@ -225,7 +225,7 @@ def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(sour
 
 
 def test_indexed_open_releases_spool_and_close_preserves_borrowed_source(source_factory):
-    data = zstar.pack_file("x", b"hello")
+    data = _native.pack_file("x", b"hello")
 
     def temporary_descriptors():
         directory = Path("/proc/self/fd")
@@ -243,7 +243,7 @@ def test_indexed_open_releases_spool_and_close_preserves_borrowed_source(source_
 
     source = source_factory(data)
     before = temporary_descriptors()
-    with zstar.format.IndexedArchive(source, len(data), memory_bytes=1) as archive:
+    with zstar._native.IndexedArchive(source, len(data), memory_bytes=1) as archive:
         assert archive.read("x") == b"hello"
         assert not archive.closed
         assert archive.cache_bytes > 0
@@ -272,7 +272,7 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
-    data = zstar.pack_file("x", b"hello")
+    data = _native.pack_file("x", b"hello")
     started, release = threading.Event(), threading.Event()
 
     class Source:
@@ -282,7 +282,7 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
                 assert release.wait(5), "read was not released"
             return data[offset : offset + length]
 
-    archive = zstar.format.IndexedArchive(Source(), len(data), memory_bytes=1, cache_bytes=0)
+    archive = zstar._native.IndexedArchive(Source(), len(data), memory_bytes=1, cache_bytes=0)
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(archive.read, "x")
         try:
@@ -296,16 +296,13 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
         assert future.result(timeout=5) == b"hello"
 
 
-@pytest.mark.parametrize(
-    "operation", ["close", "closed", "entry_count", "cache_bytes", "getmembers"]
-)
+@pytest.mark.parametrize("operation", ["close", "closed", "entry_count", "cache_bytes", "members"])
 def test_bytes_reader_locking_releases_gil_while_waiting_for_a_resolver(operation, corpus_dir):
     script = """
 import threading
 from pathlib import Path
 import sys
 import zstar
-import zstar.format
 root = Path(sys.argv[1])
 archive = zstar.Archive((root / 'thin.zstar').read_bytes())
 started, release = threading.Event(), threading.Event()
@@ -325,7 +322,7 @@ timer.start()
 operation = getattr(archive, sys.argv[2])
 if callable(operation):
     result = operation()
-    if sys.argv[2] == 'getmembers':
+    if sys.argv[2] == 'members':
         next(result)
 archive.close()
 worker.join(5)

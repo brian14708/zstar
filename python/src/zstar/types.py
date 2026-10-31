@@ -1,7 +1,30 @@
 """Structural interfaces for custom storage and typed reader options."""
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Literal, NotRequired, TypeAlias, TypedDict
+
+from typing_extensions import Protocol, Reader, Writer
+
+__all__ = [
+    "BinaryWriter",
+    "CborValue",
+    "DecodedCache",
+    "EntryFields",
+    "EntryTuple",
+    "ErrorCategory",
+    "ExtentTuple",
+    "ManifestOptions",
+    "ObjectResolver",
+    "RangeSource",
+    "ReadReport",
+    "ReaderOptions",
+    "RequestProvider",
+    "SeekableReader",
+    "SignedRequest",
+    "SpillStore",
+    "VerificationReport",
+    "WriterOptions",
+]
 
 if TYPE_CHECKING:
     from ._native import DecodedChunk, DecodedMemoryCache
@@ -42,6 +65,19 @@ ErrorCategory: TypeAlias = Literal[
 ]
 
 
+class SeekableReader(Reader[bytes], Protocol):
+    """Borrowed binary input with a cursor; no write or close method required."""
+
+    def seek(self, offset: int, whence: int = 0, /) -> int: ...
+    def tell(self) -> int: ...
+
+
+class BinaryWriter(Writer[bytes], Protocol):
+    """Borrowed binary output; only write and flush are required."""
+
+    def flush(self) -> None: ...
+
+
 class RangeSource(Protocol):
     """Immutable, concurrently readable byte-range source."""
 
@@ -61,13 +97,10 @@ class DecodedCache(Protocol):
     def put(self, token: "DecodedChunk", /) -> None: ...
 
 
-class SpillStore(Protocol):
+class SpillStore(Reader[bytes], BinaryWriter, Protocol):
     """Exclusive temporary binary store used by bounded metadata spools."""
 
-    def read(self, size: int = -1, /) -> bytes: ...
-    def write(self, data: bytes, /) -> int: ...
     def seek(self, offset: int, whence: int = 0, /) -> int: ...
-    def flush(self) -> None: ...
 
 
 class SignedRequest(TypedDict):
@@ -80,6 +113,8 @@ RequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], Awaitable[S
 
 
 class WriterOptions(TypedDict, total=False):
+    workers: int
+    root_extensions: dict[str, CborValue] | None
     frame_size: int
     compression_level: int
     memory_bytes: int
@@ -103,6 +138,7 @@ class ManifestOptions(TypedDict, total=False):
 
 
 class ReaderOptions(ManifestOptions, total=False):
+    concurrent_chunks: int
     verify_external: bool
     resolver: ObjectResolver | None
 

@@ -179,6 +179,17 @@ pub(crate) fn to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     })
 }
 
+pub(crate) fn extensions_to_py(
+    py: Python<'_>,
+    extensions: &zstar::Extensions,
+) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    for (key, value) in extensions {
+        dict.set_item(key, to_py(py, value)?)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
 struct Source {
     object: Py<PyAny>,
     size: u64,
@@ -296,7 +307,7 @@ impl<T: Send> Gate<T> {
 ///
 /// Thread safety: operations serialize; waiting threads release the GIL. A
 /// callback must not call back into the same archive (it raises `ZstarError`).
-#[pyclass(module = "zstar.format", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 pub struct ManifestArchive {
     inner: Arc<Gate<BlockingArchive<Source>>>,
     entry_count: u64,
@@ -452,7 +463,7 @@ impl ManifestArchive {
 }
 
 /// Entry cursor over a [`ManifestArchive`]. Concurrent `next()` calls serialize.
-#[pyclass(module = "zstar.format", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 pub struct ManifestEntries {
     inner: Arc<Gate<BlockingArchive<Source>>>,
     cursor: Mutex<EntryCursor>,
@@ -497,7 +508,7 @@ impl Read for Body {
 /// `ValueError("writer failed")`. A sink, body, or spill-store callback must not
 /// call back into the same writer (it raises `ZstarError`). Calls racing a
 /// `close` observe a closed writer.
-#[pyclass(module = "zstar.format", frozen)]
+#[pyclass(module = "zstar._native", frozen)]
 pub struct EntryArchiveWriter {
     inner: Gate<BlockingBuilder<Sink>>,
     failed: AtomicBool,
@@ -538,7 +549,7 @@ impl EntryArchiveWriter {
         }
     }
     #[new]
-    #[pyo3(signature=(output,*,frame_size=1<<20,compression_level=3,memory_bytes=8<<20,block_target=64<<10,max_spool_bytes=4<<30,create_spill_store=None))]
+    #[pyo3(signature=(output,*,frame_size=1<<20,compression_level=3,memory_bytes=8<<20,block_target=64<<10,max_spool_bytes=4<<30,create_spill_store=None,workers=0,root_extensions=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -549,6 +560,8 @@ impl EntryArchiveWriter {
         block_target: usize,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
+        workers: usize,
+        root_extensions: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let writer = BlockingBuilder::with_options(
             Sink(output),
@@ -563,6 +576,16 @@ impl EntryArchiveWriter {
             },
         )
         .map_err(core_error)?;
+        let extensions = root_extensions
+            .into_iter()
+            .flat_map(PyDictMethods::iter)
+            .map(|(key, value)| Ok((key.extract()?, from_py(&value, 1)?)))
+            .collect::<PyResult<zstar::Extensions>>()?;
+        let writer = writer
+            .with_workers(workers)
+            .map_err(core_error)?
+            .with_root_extensions(extensions)
+            .map_err(core_error)?;
         Ok(Self {
             inner: Gate::new(writer),
             failed: AtomicBool::new(false),
@@ -622,8 +645,11 @@ impl EntryArchiveWriter {
         let writer = self.inner.take(py)?;
         self.check_failed()?;
         if let Some(writer) = writer {
-            py.detach(|| writer.finish().map(|_| ()))
-                .map_err(core_error)?;
+            py.detach(|| {
+                let mut sink = writer.finish()?;
+                sink.flush().map_err(Error::Io)
+            })
+            .map_err(core_error)?;
         }
         Ok(())
     }
@@ -640,11 +666,26 @@ fn encode_manifest_block<'py>(
     let bytes = zstar::manifest::encode_block(&from_py(value, 0)?).map_err(core_error)?;
     Ok(PyBytes::new(py, &bytes))
 }
+/// Run a synchronous writer operation away from the Python event loop.
+/// The Python owner serializes operations and joins workers before cleanup.
+#[pyfunction]
+fn _writer_call(py: Python<'_>, operation: Py<PyAny>) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio::task::spawn_blocking(move || Python::attach(|py| operation.call0(py)))
+            .await
+            .map_err(|error| {
+                core_error(Error::Io(std::io::Error::other(format!(
+                    "archive writer worker failed: {error}"
+                ))))
+            })?
+    })
+}
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ManifestArchive>()?;
     module.add_class::<ManifestEntries>()?;
     module.add_class::<EntryArchiveWriter>()?;
     module.add_function(wrap_pyfunction!(decode_manifest_block, module)?)?;
     module.add_function(wrap_pyfunction!(encode_manifest_block, module)?)?;
+    module.add_function(wrap_pyfunction!(_writer_call, module)?)?;
     Ok(())
 }

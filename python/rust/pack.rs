@@ -1,5 +1,5 @@
 //! Native chunking and immutable packed storage; no per-byte Python callbacks.
-use super::core_error;
+use super::{PyCause, core_error};
 use bytes::Bytes;
 use pyo3::{prelude::*, types::PyBytes};
 use std::{
@@ -81,7 +81,7 @@ impl PyStore {
             access_key_id,
             secret_access_key,
             session_token,
-        );
+        )?;
         py.detach(|| {
             let store = builder
                 .build()
@@ -144,7 +144,7 @@ impl PyCatalog {
     }
 }
 #[pyclass(name = "Chunking", module = "zstar", frozen)]
-struct PyChunking {
+pub(crate) struct PyChunking {
     inner: Chunking,
 }
 #[pymethods]
@@ -177,9 +177,70 @@ impl PyChunking {
     }
 }
 #[pyclass(name = "ExternalFile", module = "zstar", frozen)]
-struct PyExternal {
+pub(crate) struct PyExternal {
     extents: Vec<zstar::Extent>,
     size: u64,
+}
+
+struct CallbackWriter {
+    callback: Py<PyAny>,
+    level: i32,
+}
+
+impl zstar::chunking::ObjectWriter for CallbackWriter {
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn put_chunk(&mut self, raw: bytes::Bytes) -> zstar::Result<zstar::Extent> {
+        let digest = *zstar::Digest::sha256(&raw).as_bytes();
+        let encoded = zstar::encode_frame(&raw, self.level)?;
+        let encoded_size = Python::attach(|py| {
+            self.callback
+                .call1(
+                    py,
+                    (
+                        zstar::manifest::object_address(&digest),
+                        PyBytes::new(py, &encoded),
+                        raw.len(),
+                    ),
+                )
+                .and_then(|value| value.extract::<u64>(py))
+                .map_err(|error| {
+                    zstar::Error::Io(PyCause::io("external object upload failed", error))
+                })
+        })?;
+        Ok(zstar::Extent {
+            size: raw.len() as u64,
+            source: zstar::Source::Object(digest),
+            encoded_size,
+            offset: 0,
+        })
+    }
+}
+
+pub(crate) fn externalize_callback(
+    py: Python<'_>,
+    fileobj: Py<PyAny>,
+    size: u64,
+    callback: Py<PyAny>,
+    chunking: PyRef<'_, PyChunking>,
+    compression_level: i32,
+) -> PyResult<PyExternal> {
+    let strategy = chunking.inner;
+    py.detach(|| {
+        pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+            let mut body = Body {
+                object: Arc::new(fileobj),
+                pending: None,
+                buffer: Bytes::new(),
+            };
+            let mut writer = CallbackWriter {
+                callback,
+                level: compression_level,
+            };
+            let extents = external_file(&mut body, size, strategy, &mut writer).await?;
+            Ok(PyExternal { extents, size })
+        })
+    })
+    .map_err(core_error)
 }
 #[pymethods]
 impl PyExternal {

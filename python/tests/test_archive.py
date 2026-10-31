@@ -3,29 +3,30 @@
 import asyncio
 import io
 import os
-import stat
 import subprocess
 import sys
 import tarfile
 from decimal import localcontext
 from pathlib import Path
+from tarfile import TarInfo
 
 import pytest
 import zstar
-import zstar.format
+import zstar._native
+from zstar import ArchiveWriter, AsyncArchiveWriter, _native
+from zstar._info import _nanoseconds
 
 
 @pytest.fixture
 def encoded_archive():
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as archive:
+    with ArchiveWriter(output) as archive:
         directory = tarfile.TarInfo("dir")
         directory.type = tarfile.DIRTYPE
         archive.addfile(directory)
-        info = zstar.TarInfo("dir/file")
+        info = TarInfo("dir/file")
         info.size, info.uid, info.gid = 12, 123, 456
-        info.mtime_ns = -1234567891
-        info.extensions = {"x-label": {"value": b"owned"}}
+        info.pax_headers["mtime"] = "-1.234567891"
         archive.addfile(info, io.BytesIO(b"hello\nworld\n"))
         link = tarfile.TarInfo("dir/link")
         link.type, link.linkname = tarfile.SYMTYPE, "file"
@@ -37,19 +38,25 @@ def encoded_archive():
 def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
     data = encoded_archive
     with zstar.Archive(data) as archive:
-        members = archive.getmembers()
+        members = archive.members()
         assert iter(members) is members
         assert next(members).name == "dir"
         assert [member.name for member in members] == ["dir/file", "dir/link"]
         assert list(members) == []
-        assert list(archive.getnames()) == [member.name for member in archive]
-        info = archive.getmember("dir/file")
+        assert list(archive.names()) == [member.name for member in archive]
+        info = archive.getinfo("dir/file")
         assert isinstance(info, tarfile.TarInfo) and info.isfile()
-        assert (info.size, info.uid, info.gid, info.mtime_ns) == (12, 123, 456, -1234567891)
-        info.extensions["x-label"]["value"] = b"changed"
-        assert archive.getmember(info.name).extensions["x-label"]["value"] == b"owned"
-        assert archive.extractfile("dir") is None
-        with archive.extractfile(info) as member:
+        assert (info.size, info.uid, info.gid, _nanoseconds(info.pax_headers["mtime"])) == (
+            12,
+            123,
+            456,
+            -1234567891,
+        )
+        info.pax_headers["mtime"] = "0"
+        assert archive.getinfo(info.name).pax_headers["mtime"] == "-1.234567891"
+        with pytest.raises(IsADirectoryError):
+            archive.open("dir")
+        with archive.open(info) as member:
             assert isinstance(member, io.RawIOBase)
             assert member.name == "dir/file" and member.mode == "rb"
             assert member.readable() and member.seekable()
@@ -72,10 +79,13 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
         assert member.closed and not archive.closed
         with pytest.raises(ValueError):
             member.read()
-        with archive.extractfile("dir/link") as linked:
+        with archive.open("dir/link") as linked:
             assert linked.read() == b"hello\nworld\n"
+        assert archive.read_link("dir/link") == "file"
+        assert archive.read_range("dir/file", 6, 12) == b"world\n"
+        archive.validate_metadata()
         with pytest.raises(KeyError):
-            archive.getmember("missing")
+            archive.getinfo("missing")
         with pytest.raises(KeyError):
             archive.read("missing")
         report = archive.verify()
@@ -99,19 +109,17 @@ def test_sync_local_open_and_borrowed_file_preserve_ownership_and_cursor(tmp_pat
     data = encoded_archive
     path = tmp_path / "archive.zstar"
     path.write_bytes(data)
-    with zstar.Archive.open(path) as archive:
+    with zstar.Archive.from_file(path) as archive:
         assert archive.read("dir/file") == b"hello\nworld\n"
-        member = archive.extractfile("dir/file")
+        member = archive.open("dir/file")
     with pytest.raises(ValueError, match="closed"):
         member.read()
     borrowed = io.BytesIO(data)
     borrowed.seek(7)
-    with zstar.Archive.open(fileobj=borrowed) as archive:
+    with zstar.Archive.from_file(borrowed) as archive:
         assert archive.read("dir/file", 0, 5) == b"hello"
         assert borrowed.tell() == 7
     assert not borrowed.closed and borrowed.tell() == 7
-    with pytest.raises(TypeError):
-        zstar.Archive.open(path, fileobj=borrowed)
 
 
 def test_sync_and_async_verification_share_one_report_schema(object_resolver, thin_data):
@@ -136,15 +144,15 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
 
     async def exercise():
         for constructor in (
-            lambda: zstar.AsyncArchive.open(path),
-            lambda: zstar.AsyncArchive.open(fileobj=borrowed),
+            lambda: zstar.AsyncArchive.from_file(path),
+            lambda: zstar.AsyncArchive.from_file(borrowed),
         ):
             async with await constructor() as archive:
-                members = archive.getmembers()
+                members = archive.members()
                 assert aiter(members) is members
                 assert (await anext(members)).isdir()
                 assert [member.name async for member in members] == ["dir/file", "dir/link"]
-                assert [name async for name in archive.getnames()] == [
+                assert [name async for name in archive.names()] == [
                     "dir",
                     "dir/file",
                     "dir/link",
@@ -157,7 +165,7 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
                     with pytest.raises(zstar.ZstarError) as caught:
                         await archive.read_with_report("dir/file", 13, length)
                     assert caught.value.category == "invalid-range"
-                async with await archive.extractfile("dir/link") as member:
+                async with archive.open("dir/link") as member:
                     assert await member.read(5) == b"hello"
                     assert await member.tell() == 5
                     assert await member.seek(6) == 6
@@ -173,10 +181,10 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
                     buffer.extend(b"?")
                     assert await member.seek(100) == 100 and await member.read() == b""
                 assert member.closed and not archive.closed
-                pending = await archive.extractfile("dir/file")
-            with pytest.raises(ValueError, match="closed"):
-                await pending.read()
-            await pending.close()
+                async with archive.open("dir/file") as pending:
+                    await archive.close()
+                    with pytest.raises(ValueError, match="closed"):
+                        await pending.read()
         assert not borrowed.closed and borrowed.tell() == 11
 
     asyncio.run(exercise())
@@ -185,23 +193,23 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
 def test_iteration_crosses_metadata_batches_and_close_invalidates_buffered_entries():
     output = io.BytesIO()
     expected = [f"file-{index:03}" for index in range(200)]
-    with zstar.ArchiveWriter(output) as writer:
+    with ArchiveWriter(output) as writer:
         for name in reversed(expected):
             writer.addfile(tarfile.TarInfo(name))
     data = output.getvalue()
     with zstar.Archive(data) as archive:
-        assert list(archive.getnames()) == expected
+        assert list(archive.names()) == expected
         assert [member.name for member in archive] == expected
-        names = archive.getnames()
+        names = archive.names()
         assert next(names) == expected[0]
     with pytest.raises(ValueError, match="closed"):
         next(names)
 
     async def exercise():
         async with await zstar.AsyncArchive.from_bytes(data) as archive:
-            assert [name async for name in archive.getnames()] == expected
+            assert [name async for name in archive.names()] == expected
             assert [member.name async for member in archive] == expected
-            names = archive.getnames()
+            names = archive.names()
             assert await anext(names) == expected[0]
         with pytest.raises(ValueError, match="closed"):
             await anext(names)
@@ -209,230 +217,59 @@ def test_iteration_crosses_metadata_batches_and_close_invalidates_buffered_entri
     asyncio.run(exercise())
 
 
-def test_extractfile_resolves_only_archive_links_and_rejects_cycles():
+def test_open_resolves_only_archive_links_and_rejects_cycles():
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as archive:
+    with ArchiveWriter(output) as archive:
         for name, target in [("a", "b"), ("b", "a"), ("absolute", "/etc/passwd")]:
             info = tarfile.TarInfo(name)
             info.type, info.linkname = tarfile.SYMTYPE, target
             archive.addfile(info)
     with zstar.Archive(output.getvalue()) as archive:
         with pytest.raises(tarfile.ExtractError, match="cyclic"):
-            archive.extractfile("a")
+            archive.open("a")
         with pytest.raises(KeyError):
-            archive.extractfile("absolute")
-
-
-@pytest.mark.skipif(os.name != "posix", reason="Unix file metadata")
-def test_writer_add_recurses_without_following_links_and_supports_owned_output(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "file").write_bytes(b"payload")
-    (source / "link").symlink_to("file")
-    output = tmp_path / "output.zstar"
-    with zstar.ArchiveWriter.open(output, mode="x") as archive:
-        archive.add(source, arcname="root")
-    with zstar.Archive.open(output) as archive:
-        assert list(archive.getnames()) == ["root", "root/file", "root/link"]
-        assert archive.getmember("root/link").issym()
-        assert archive.getmember("root/link").linkname == "file"
-        assert archive.getmember("root/file").mtime_ns == 0
-        archive.verify()
-    with pytest.raises(FileExistsError):
-        zstar.ArchiveWriter.open(output, mode="x")
-
-
-@pytest.mark.skipif(os.name != "posix", reason="requires no-follow symlink support")
-def test_writer_open_refuses_to_truncate_symlink_target(tmp_path):
-    target = tmp_path / "target"
-    target.write_bytes(b"keep")
-    output = tmp_path / "output.zstar"
-    output.symlink_to(target)
-    with pytest.raises(OSError):
-        zstar.ArchiveWriter.open(output)
-    assert target.read_bytes() == b"keep"
-
-
-@pytest.mark.skipif(os.name != "posix", reason="Unix file metadata")
-def test_writer_nonrecursive_directory_preserves_metadata(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir(mode=0o750)
-    (source / "child").write_bytes(b"excluded")
-    os.utime(source, ns=(1700000000000000000, 1700000000123456789))
-    metadata = source.stat()
-    output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
-        writer.add(source, "root", recursive=False, preserve_metadata=True)
-    with zstar.Archive(output.getvalue()) as archive:
-        assert list(archive.getnames()) == ["root"]
-        entry = archive.getmember("root")
-        assert entry.mode == stat.S_IMODE(metadata.st_mode)
-        assert (entry.uid, entry.gid) == (metadata.st_uid, metadata.st_gid)
-        assert entry.mtime_ns == metadata.st_mtime_ns
-        archive.verify()
-
-
-def test_writer_removes_partial_output_even_when_owned_close_fails(tmp_path, monkeypatch):
-    import zstar._writer
-
-    class FailingClose(io.BufferedWriter):
-        def close(self):
-            super().close()
-            raise OSError("owned output close failed")
-
-    monkeypatch.setattr(
-        zstar._writer.os,
-        "fdopen",
-        lambda fd, mode: FailingClose(io.FileIO(fd, mode, closefd=True)),
-    )
-    output = tmp_path / "partial.zstar"
-    with (
-        pytest.raises(OSError, match="owned output close failed"),
-        zstar.ArchiveWriter.open(output) as writer,
-    ):
-        writer.addfile(zstar.TarInfo("empty"))
-        raise RuntimeError("capture failed")
-    assert writer.closed
-    assert not output.exists()
-
-
-@pytest.mark.skipif(os.name != "posix", reason="Unix file metadata")
-def test_capture_normalizes_metadata_sorts_physical_members_and_preserves_on_request(tmp_path):
-    root = tmp_path / "source"
-    (root / "a").mkdir(parents=True)
-    (root / "a/file").write_bytes(b"one")
-    file = root / "a-b"
-    file.write_bytes(b"two")
-    file.chmod(0o6751)
-    os.utime(file, ns=(1700000000000000000, 1700000000123456789))
-    # Filesystems may clear setgid or ignore Unix execute bits (Windows).
-    normalized_mode = 0o755 if file.stat().st_mode & 0o111 else 0o644
-
-    def capture(preserve=False):
-        output = io.BytesIO()
-        with zstar.ArchiveWriter(output) as writer:
-            writer.add(root, "root", preserve_metadata=preserve)
-        return output.getvalue()
-
-    data = capture()
-    data_end = int.from_bytes(data[-56:-48], "little")
-    decoded = zstar.format.decode_object(data[:data_end], 4096)
-    with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
-        assert physical.getnames() == ["root", "root/a", "root/a-b", "root/a/file"]
-    with zstar.Archive(data) as reader:
-        reader.verify()
-        info = reader.getmember("root/a-b")
-        assert (info.mode, info.uid, info.gid, info.mtime_ns) == (normalized_mode, 0, 0, 0)
-    os.utime(file, ns=(1700000000000000000, 1700000000999999999))
-    assert capture() == data
-    metadata = file.stat()
-    with zstar.Archive(capture(True)) as reader:
-        info = reader.getmember("root/a-b")
-        assert (info.mode, info.uid, info.gid, info.mtime_ns) == (
-            stat.S_IMODE(metadata.st_mode),
-            metadata.st_uid,
-            metadata.st_gid,
-            metadata.st_mtime_ns,
-        )
-        reader.verify()
-
-
-def test_capture_deep_directories_without_python_recursion(tmp_path):
-    root = tmp_path / "deep"
-    root.mkdir()
-    child = root
-    # Exceed the Python recursion limit without exceeding macOS's PATH_MAX.
-    recursion_limit = sys.getrecursionlimit()
-    depth = 250
-    try:
-        for _ in range(depth):
-            next_child = child / "d"
-            next_child.mkdir()
-            child = next_child
-        sys.setrecursionlimit(200)
-        output = io.BytesIO()
-        with zstar.ArchiveWriter(output, memory_bytes=1) as writer:
-            writer.add(root, "root")
-        with zstar.Archive(output.getvalue()) as reader:
-            assert reader.entry_count == depth + 1
-            reader.verify()
-    finally:
-        sys.setrecursionlimit(recursion_limit)
-        while child != root:
-            parent = child.parent
-            child.rmdir()
-            child = parent
-
-
-def test_capture_merges_directory_siblings_in_utf8_path_order(tmp_path):
-    root = tmp_path / "source"
-    root.mkdir()
-    directories = ["a", "a.b", "aé", "z", "z/a"]
-    files = ["a/file", "a-b", "a.b/z", "aé/file", "z/a/z", "z/a-"]
-    for name in directories:
-        (root / name).mkdir()
-    for name in files:
-        (root / name).touch()
-    expected = sorted(
-        ["root", *[f"root/{name}" for name in directories + files]],
-        key=lambda name: name.encode("utf-8"),
-    )
-    output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
-        writer.add(root, "root")
-    data = output.getvalue()
-    data_end = int.from_bytes(data[-56:-48], "little")
-    decoded = zstar.format.decode_object(data[:data_end], 512 * len(expected) + 1024)
-    with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
-        assert physical.getnames() == expected
-    with zstar.Archive(data) as reader:
-        reader.verify()
+            archive.open("absolute")
 
 
 @pytest.mark.parametrize("timestamp", ["1e1000000", "-1e1000000"])
 def test_timestamp_range_is_checked_before_integer_conversion(timestamp):
-    info = zstar.TarInfo("file")
+    info = TarInfo("file")
     info.pax_headers["mtime"] = timestamp
-    with pytest.raises(OverflowError, match="timestamp range"):
-        _ = info.mtime_ns
+    with (
+        pytest.raises(OverflowError, match="timestamp range"),
+        ArchiveWriter.from_file(io.BytesIO(), "w") as writer,
+    ):
+        writer.addfile(info)
 
 
 @pytest.mark.parametrize(
     "timestamp", [-(1 << 63), -1234567891, 0, 1700000000123456789, (1 << 63) - 1]
 )
 def test_timestamps_ignore_application_decimal_context(timestamp):
-    info = zstar.TarInfo("file")
-    info.mtime_ns = timestamp
+    info = TarInfo("file")
+    seconds, fraction = divmod(abs(timestamp), 1_000_000_000)
+    info.pax_headers["mtime"] = f"{'-' if timestamp < 0 else ''}{seconds}.{fraction:09d}"
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
+    with ArchiveWriter(output) as writer:
         writer.addfile(info)
     with localcontext() as context:
         context.prec = 3
         context.Emax = 3
         with zstar.Archive(output.getvalue()) as reader:
-            snapshot = reader.getmember("file")
-            assert snapshot.mtime_ns == timestamp
+            snapshot = reader.getinfo("file")
+            assert _nanoseconds(snapshot.pax_headers["mtime"]) == timestamp
             rewritten = io.BytesIO()
-            with zstar.ArchiveWriter(rewritten) as writer:
+            with ArchiveWriter(rewritten) as writer:
                 writer.addfile(snapshot)
         with zstar.Archive(rewritten.getvalue()) as reader:
-            assert reader.getmember("file").mtime_ns == timestamp
-
-
-def test_writer_rejects_duplicates_at_finalization_without_retaining_names():
-    output = io.BytesIO()
-    writer = zstar.ArchiveWriter(output, memory_bytes=1)
-    for _ in range(2):
-        writer.addfile(zstar.TarInfo("file"))
-    with pytest.raises(zstar.ZstarError, match=r"duplicate|order"):
-        writer.close()
+            assert _nanoseconds(reader.getinfo("file").pax_headers["mtime"]) == timestamp
 
 
 def test_main_reader_metadata_open_does_not_certify_unread_content(corpus_dir):
     data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
     with zstar.Archive(data) as archive:
-        assert archive.getmember("a-b").isfile()
-        with archive.extractfile("a-b") as member:
+        assert archive.getinfo("a-b").isfile()
+        with archive.open("a-b") as member:
             buffer = bytearray(b"?" * 5)
             with pytest.raises(zstar.ZstarError):
                 member.readinto(buffer)
@@ -462,9 +299,9 @@ def test_missing_native_extension_reports_installation_guidance(tmp_path):
 
 @pytest.mark.parametrize("ranged", [False, True])
 def test_sync_readers_close_after_context_exception_without_closing_source(ranged, source_factory):
-    data = zstar.pack_file("x", b"hello")
+    data = _native.pack_file("x", b"hello")
     source = source_factory(data)
-    archive = zstar.format.ManifestArchive(source, len(data)) if ranged else zstar.Archive(data)
+    archive = zstar._native.ManifestArchive(source, len(data)) if ranged else zstar.Archive(data)
     with pytest.raises(RuntimeError, match="consumer failed"), archive:
         assert archive.read("x") == b"hello"
         raise RuntimeError("consumer failed")
@@ -472,21 +309,6 @@ def test_sync_readers_close_after_context_exception_without_closing_source(range
     archive.close()
     with pytest.raises(ValueError, match="closed"), archive:
         pass
-
-
-def test_writer_discards_unfinished_output_after_context_exception():
-    partial = io.BytesIO()
-    info = tarfile.TarInfo("x")
-    info.size = 5
-    with (
-        pytest.raises(RuntimeError, match="producer failed"),
-        zstar.ArchiveWriter(partial) as writer,
-    ):
-        writer.addfile(info, io.BytesIO(b"hello"))
-        raise RuntimeError("producer failed")
-    assert writer.closed and not partial.closed
-    with pytest.raises(zstar.ZstarError):
-        zstar.Archive(partial.getvalue())
 
 
 def test_default_bytes_archive_external_reuse_and_bounded_closure_verification(
@@ -518,3 +340,185 @@ def test_encoded_resolver_missing_objects_keep_stable_category(thin_data):
     with pytest.raises(zstar.ZstarError) as caught:
         Archive(encoded).read("hello.txt", resolver=Missing())
     assert caught.value.category == "missing-external-content"
+
+
+def test_write_bytes_and_bounded_chunk_iteration(tmp_path):
+    path = tmp_path / "archive.zstar"
+    body = b"hello world"
+    with ArchiveWriter.from_file(path, "w") as writer:
+        writer.write_bytes("hello.txt", body, mode=0o600)
+    with zstar.Archive.from_file(path, max_read_bytes=3) as archive:
+        assert archive.getinfo("hello.txt").mode == 0o600
+        with archive.open("hello.txt") as member:
+            assert member.read(2) == b"he"
+            chunks = list(member.iter_chunks(100))
+            assert chunks == [b"llo", b" wo", b"rld"]
+            assert list(member.iter_chunks()) == []
+            member.seek(0)
+            for size in (0, -1):
+                with pytest.raises(ValueError, match="positive"):
+                    list(member.iter_chunks(size))
+            with pytest.raises(TypeError):
+                list(member.iter_chunks(1.5))
+        with pytest.raises(ValueError, match="closed"):
+            list(member.iter_chunks())
+
+
+class _ReadOnlyBody:
+    """Structural Reader[bytes], without IOBase inheritance or seek/close."""
+
+    def __init__(self, data: bytes):
+        self._stream = io.BytesIO(data)
+
+    def read(self, size: int = -1, /) -> bytes:
+        return self._stream.read(min(size, 3) if size >= 0 else size)
+
+
+class _SeekableInput(_ReadOnlyBody):
+    def seek(self, offset: int, whence: int = 0, /) -> int:
+        return self._stream.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+
+class _WriteOnlySink:
+    """Structural Writer[bytes] with flush, without read/seek/tell/close."""
+
+    def __init__(self):
+        self.data = bytearray()
+        self.flushed = False
+
+    def write(self, data: bytes, /) -> int:
+        count = min(len(data), 7)
+        self.data.extend(data[:count])
+        return count
+
+    def flush(self) -> None:
+        self.flushed = True
+
+
+def test_minimal_structural_streams():
+    output = _WriteOnlySink()
+    info = TarInfo("hello")
+    info.size = 11
+    with ArchiveWriter.from_file(output, "w") as writer:
+        writer.addfile(info, _ReadOnlyBody(b"hello world"))
+    assert output.flushed
+    source = _SeekableInput(bytes(output.data))
+    source.seek(5)
+    with zstar.Archive.from_file(source) as archive:
+        assert archive.read("hello") == b"hello world"
+    assert source.tell() == 5
+
+    async def exercise():
+        output = _WriteOnlySink()
+        async with await AsyncArchiveWriter.from_file(output, "w") as writer:
+            await writer.addfile(info, _ReadOnlyBody(b"hello world"))
+        assert output.flushed
+        source = _SeekableInput(bytes(output.data))
+        source.seek(9)
+        async with await zstar.AsyncArchive.from_file(source) as archive:
+            assert await archive.read("hello") == b"hello world"
+        assert source.tell() == 9
+
+    asyncio.run(exercise())
+
+
+def test_borrowed_sink_flush_errors_propagate():
+    class BrokenFlush(_WriteOnlySink):
+        def flush(self) -> None:
+            raise OSError("flush failed")
+
+    with (
+        pytest.raises(zstar.ZstarError, match="flush failed"),
+        ArchiveWriter.from_file(BrokenFlush(), "w") as writer,
+    ):
+        writer.write_bytes("hello", b"hello")
+    assert writer.closed
+
+    async def exercise():
+        with pytest.raises(zstar.ZstarError, match="flush failed"):
+            async with await AsyncArchiveWriter.from_file(BrokenFlush(), "w") as writer:
+                await writer.write_bytes("hello", b"hello")
+        assert writer.closed
+
+    asyncio.run(exercise())
+
+
+def test_raw_s3_requires_explicit_configuration(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "environment-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "environment-secret")
+    with pytest.raises(ValueError, match="region is required"):
+        _native.IndexedArchive.from_s3("bucket", "archive")
+    with pytest.raises(ValueError, match="requires access_key_id"):
+        zstar.Archive.from_s3("bucket", "archive", region="us-east-1")
+    with pytest.raises(ValueError, match="cannot include credentials"):
+        zstar.Archive.from_s3(
+            "bucket", "archive", region="us-east-1", anon=True, access_key_id="key"
+        )
+
+    async def exercise():
+        with pytest.raises(ValueError, match="requires access_key_id"):
+            await zstar.AsyncArchive.from_s3("bucket", "archive", region="us-east-1")
+
+    asyncio.run(exercise())
+
+
+def test_prefix_iteration_and_async_metadata(encoded_archive):
+    with zstar.Archive(encoded_archive) as archive:
+        assert list(archive.names("dir/f")) == ["dir/file"]
+        assert [info.name for info in archive.members("dir/l")] == ["dir/link"]
+        with pytest.raises(ValueError):
+            archive.read_range("dir/file", 2, 1)
+
+    async def run():
+        async with await zstar.AsyncArchive.from_bytes(
+            encoded_archive, concurrent_chunks=1
+        ) as archive:
+            assert archive.root_extensions == {}
+            assert await archive.read_link("dir/link") == "file"
+            assert await archive.read_range("dir/file", 0, 5) == b"hello"
+            assert [name async for name in archive.names("dir/f")] == ["dir/file"]
+            await archive.validate_metadata()
+
+    asyncio.run(run())
+
+
+def test_lossless_entry_writing():
+    fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
+    entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
+    output = io.BytesIO()
+    with ArchiveWriter(output, workers=2, root_extensions=fields) as writer:
+        with pytest.raises(ValueError, match="size requires"):
+            writer.add_entry(entry, size=5)
+        writer.add_entry(entry, io.BytesIO(b"hello"), 5)
+    with zstar.Archive(output.getvalue(), concurrent_chunks=2) as archive:
+        assert archive.root_extensions == fields
+        archive.root_extensions.clear()
+        assert archive.root_extensions == fields
+        saved = archive.entry("file")
+        assert list(archive.iter_entries()) == [saved]
+        assert saved[:6] == entry[:6]
+        assert saved[7] == fields
+        assert sum(extent[0] for extent in saved[6]) == 5
+        assert archive.read("file") == b"hello"
+        assert archive.entry("missing") is None
+
+    async def run():
+        output = io.BytesIO()
+        async with await AsyncArchiveWriter.from_file(
+            output, workers=1, root_extensions=fields
+        ) as writer:
+            await writer.add_entry(entry, io.BytesIO(b"hello"), 5)
+        async with await zstar.AsyncArchive.from_bytes(output.getvalue()) as archive:
+            assert archive.root_extensions == fields
+            saved = await archive.entry("file")
+            assert [entry async for entry in archive.iter_entries()] == [saved]
+            assert saved[:6] == entry[:6]
+            assert saved[7] == fields
+            assert await archive.read("file") == b"hello"
+            assert await archive.entry("missing") is None
+
+    asyncio.run(run())

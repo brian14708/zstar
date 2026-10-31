@@ -6,7 +6,7 @@ from tempfile import TemporaryFile
 
 import pytest
 from zstar import Archive, AsyncArchive, ZstarError
-from zstar.format import (
+from zstar._native import (
     EntryArchiveWriter,
     IndexedArchive,
     ManifestArchive,
@@ -70,7 +70,7 @@ def test_reader_factory_temporary_files_and_cold_lookup(kind, inline_data, sourc
             if kind == "indexed":
                 assert reader._entry("link")["kind"] == "symlink"
             elif kind == "bytes":
-                assert reader.getmember("link").linkname == "../a//file"
+                assert reader.getinfo("link").linkname == "../a//file"
             else:
                 assert reader.entry("link")[7]["linkname"] == "../a//file"
             assert stores
