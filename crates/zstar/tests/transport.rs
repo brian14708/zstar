@@ -203,6 +203,10 @@ async fn http_encoded_object_resolver_maps_missing_and_rejects_invalid_limits() 
 struct ChangingSizeTransport(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl HttpTransport for ChangingSizeTransport {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     async fn get_range(
         &self,
         _: PresignedRequest,
@@ -259,6 +263,10 @@ struct CancelFirstTransport {
 }
 #[async_trait::async_trait]
 impl HttpTransport for CancelFirstTransport {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     async fn get_range(
         &self,
         _: PresignedRequest,

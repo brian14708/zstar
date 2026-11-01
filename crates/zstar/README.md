@@ -1,8 +1,9 @@
 # Zstar for Rust
 
 An async Rust library for reading and writing
-[Zstar](https://github.com/brian14708/zstar) indexed tar archives. Readers
-authenticate the complete manifest before using its index and fetch only the
+[Zstar](https://github.com/brian14708/zstar) indexed tar archives.
+
+Readers authenticate the complete manifest before using its index and fetch only the
 frames needed for a requested file range.
 
 ## Read and write an archive

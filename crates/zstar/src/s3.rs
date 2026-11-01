@@ -1,5 +1,7 @@
-//! Native S3-compatible storage, conditional archive ranges, and verified
-//! external objects. Storage keys are adapter policy, never wire-format fields.
+//! Native S3-compatible storage and verified external objects.
+//!
+//! Conditional archive ranges pin snapshots. Storage keys are adapter policy,
+//! never wire-format fields.
 //!
 //! Use [`AmazonS3Builder`](crate::s3::AmazonS3Builder) for credentials, region,
 //! endpoint, retry policy, and connection options. Presigned requests use
@@ -31,6 +33,7 @@ pub use object_store::{aws::AmazonS3, buffered::BufWriter, path::Path};
 /// credentials or anonymous access must be supplied by the caller; the core
 /// library never consults environment variables, profiles, metadata services,
 /// or other ambient configuration.
+#[must_use]
 pub struct AmazonS3Builder {
     inner: object_store::aws::AmazonS3Builder,
     region: Option<String>,
@@ -38,7 +41,6 @@ pub struct AmazonS3Builder {
     anonymous: bool,
 }
 
-#[allow(clippy::must_use_candidate, clippy::return_self_not_must_use)]
 impl AmazonS3Builder {
     pub fn new() -> Self {
         Self {
@@ -54,6 +56,10 @@ impl AmazonS3Builder {
         self
     }
 
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn with_region(mut self, value: impl Into<String>) -> Self {
         self.region = Some(value.into());
         self.inner = self.inner.with_region(self.region.as_ref().unwrap());
@@ -98,6 +104,10 @@ impl AmazonS3Builder {
         self
     }
 
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn build(self) -> std::result::Result<AmazonS3, object_store::Error> {
         if self.region.as_deref().is_none_or(str::is_empty) {
             return Err(object_store::Error::Generic {
@@ -159,6 +169,10 @@ mod builder_tests {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 // Backend errors can contain full signed URLs, so retain the category without
 // forwarding their source chains or credential-bearing Display/Debug output.
 pub(crate) fn storage_error(error: object_store::Error) -> Error {
@@ -198,6 +212,10 @@ pub(crate) fn content_attributes(content_type: &'static str, immutable: bool) ->
     .collect()
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Generate archive content headers and optional discovery metadata from a validated footer.
 /// The digest and decoded length in the actual footer remain authoritative.
 pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<Attributes> {
@@ -234,6 +252,10 @@ pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<At
     Ok(attributes)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Upload completed archive bytes with their optional S3 discovery metadata.
 /// Only the footer is inspected here; readers still authenticate the manifest.
 pub async fn put_archive(
@@ -311,7 +333,7 @@ impl S3RangeSource {
     }
     /// Override the transport allocation bound independently of reader budgets.
     #[must_use]
-    pub fn with_max_range_bytes(mut self, limit: u64) -> Self {
+    pub const fn with_max_range_bytes(mut self, limit: u64) -> Self {
         self.max_range_bytes = limit;
         self
     }
@@ -434,6 +456,7 @@ pub(crate) async fn read_exact(result: GetResult, count: u64) -> Result<Bytes> {
 }
 
 /// One independent Zstandard frame per raw content digest. The default key is
+///
 /// `<prefix>/<lowercase sha256>.zst`; a custom key mapper can implement any
 /// deployment layout. Whole files, file pieces, and merged objects all work.
 pub struct S3BlobStore {
@@ -457,6 +480,10 @@ impl S3BlobStore {
             concurrency,
         )
     }
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn with_key_mapper(
         store: Arc<dyn ObjectStore>,
         key: impl Fn([u8; 32]) -> Path + Send + Sync + 'static,
@@ -473,6 +500,18 @@ impl S3BlobStore {
     pub fn object_path(&self, digest: [u8; 32]) -> Path {
         (self.key)(digest)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     /// Fetch one bounded encoded object. The encoded-size hint does not limit
     /// fetches; decoding and address verification belong to the reader.
     pub async fn get_encoded(&self, digest: [u8; 32], _hint: u64, max_bytes: u64) -> Result<Bytes> {
@@ -509,6 +548,10 @@ impl S3BlobStore {
         }
         Ok(bytes)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub async fn put(&self, raw: Bytes) -> Result<Extent> {
         if raw.is_empty() || raw.len() > crate::DATA_FRAME_MAX {
             return Err(Error::Budget("external object size"));
@@ -598,6 +641,10 @@ pub struct S3RequestProvider {
     lifetime: Duration,
 }
 impl S3RequestProvider {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(store: Arc<AmazonS3>, path: Path, lifetime: Duration) -> std::io::Result<Self> {
         if lifetime <= Duration::from_secs(5) || lifetime > Duration::from_hours(168) {
             return Err(std::io::Error::new(
@@ -660,7 +707,7 @@ impl crate::ObjectResolver for S3BlobStore {
             .is_some_and(crate::http::CachePolicy::allows_reuse)
     }
     async fn get_encoded(&self, digest: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes> {
-        S3BlobStore::get_encoded(self, digest, hint, max_bytes).await
+        Self::get_encoded(self, digest, hint, max_bytes).await
     }
 }
 

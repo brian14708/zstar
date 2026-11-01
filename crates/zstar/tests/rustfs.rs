@@ -14,6 +14,10 @@ use zstar::s3::{
 };
 use zstar::{Archive, AsyncRangeReader, Entry, ReaderOptions, Source};
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered validation or protocol operation together."
+)]
 #[tokio::test]
 #[ignore = "requires disposable local RustFS; set ZSTAR_S3_ENDPOINT and run --ignored"]
 async fn native_s3_presigned_ranges_objects_and_multipart() {
@@ -66,7 +70,8 @@ async fn native_s3_presigned_ranges_objects_and_multipart() {
         .unwrap();
     assert_eq!(zstar::decode_frame(&encoded, object.len()).unwrap(), object);
     let mut writer =
-        BlockingBuilder::with_options(Vec::new(), 1024, 3, Default::default()).unwrap();
+        BlockingBuilder::with_options(Vec::new(), 1024, 3, zstar::ManifestOptions::default())
+            .unwrap();
     writer
         .add_file(Entry::file("inline"), 12, &mut b"hello RustFS".as_slice())
         .unwrap();
@@ -201,6 +206,18 @@ async fn bucket_request(client: &reqwest::Client, store: &AmazonS3, method: reqw
     );
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered validation or protocol operation together."
+)]
 async fn test_packed_generation(store: Arc<AmazonS3>) {
     use zstar::manifest_io::{ManifestOptions, Spool};
     use zstar::pack::{

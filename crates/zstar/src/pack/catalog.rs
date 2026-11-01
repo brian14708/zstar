@@ -12,6 +12,10 @@ pub struct Snapshot {
     pub etag: String,
 }
 impl Snapshot {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn validate(&self) -> Result<()> {
         if !crate::manifest::valid_path(&self.key)
             || self.key.len() > 4096
@@ -94,6 +98,10 @@ pub struct Catalog {
     chunks: BTreeMap<[u8; 32], ChunkRecord>,
 }
 impl Catalog {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(
         packs: Vec<PackRecord>,
         chunks: Vec<ChunkRecord>,
@@ -158,13 +166,17 @@ impl Catalog {
         Ok(catalog)
     }
     #[must_use]
-    pub fn packs(&self) -> &BTreeMap<[u8; 32], PackRecord> {
+    pub const fn packs(&self) -> &BTreeMap<[u8; 32], PackRecord> {
         &self.packs
     }
     #[must_use]
-    pub fn chunks(&self) -> &BTreeMap<[u8; 32], ChunkRecord> {
+    pub const fn chunks(&self) -> &BTreeMap<[u8; 32], ChunkRecord> {
         &self.chunks
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn encode(&self, limits: CatalogLimits) -> Result<Vec<u8>> {
         Self::new(
             self.packs.values().cloned().collect(),
@@ -203,6 +215,10 @@ impl Catalog {
         check_encoded(encoded.len(), limits)?;
         Ok(encoded)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn decode(encoded: &[u8], limits: CatalogLimits) -> Result<Self> {
         check_encoded(encoded.len(), limits)?;
         let value = crate::manifest::decode_block(encoded).map_err(|error| match error {
@@ -253,37 +269,37 @@ impl Catalog {
         Self::new(packs, chunks, limits)
     }
 }
-fn check_encoded(size: usize, limits: CatalogLimits) -> Result<()> {
+const fn check_encoded(size: usize, limits: CatalogLimits) -> Result<()> {
     if size > limits.max_encoded_bytes || size > limits.max_memory_bytes / 128 {
         return Err(Error::Budget("catalog encoded bytes or parsing memory"));
     }
     Ok(())
 }
-pub(crate) fn invalid(reason: &str) -> Error {
+pub fn invalid(reason: &str) -> Error {
     Error::MalformedCatalog(reason.into())
 }
-pub(crate) fn uint(value: u64) -> Value {
+pub fn uint(value: u64) -> Value {
     Value::Integer(value.into())
 }
-pub(crate) fn number(value: &Value) -> Result<u64> {
+pub fn number(value: &Value) -> Result<u64> {
     match value {
         Value::Integer(n) => u64::try_from(*n).map_err(|_| invalid("uint64")),
         _ => Err(invalid("uint64")),
     }
 }
-pub(crate) fn text(value: &Value) -> Result<&str> {
+pub fn text(value: &Value) -> Result<&str> {
     match value {
         Value::Text(s) => Ok(s),
         _ => Err(invalid("text")),
     }
 }
-pub(crate) fn array(value: &Value) -> Result<&[Value]> {
+pub fn array(value: &Value) -> Result<&[Value]> {
     match value {
         Value::Array(values) => Ok(values),
         _ => Err(invalid("array")),
     }
 }
-pub(crate) fn tuple(value: &Value, count: usize) -> Result<&[Value]> {
+pub fn tuple(value: &Value, count: usize) -> Result<&[Value]> {
     let values = array(value)?;
     if values.len() != count {
         return Err(invalid("tuple length"));

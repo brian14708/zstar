@@ -4,7 +4,7 @@ use pyo3::{PyResult, exceptions::PyValueError};
 use std::{num::NonZeroUsize, sync::Arc};
 use zstar::s3::{AmazonS3Builder, Path, S3BlobStore, S3RangeSource};
 
-pub(crate) fn builder(
+pub fn builder(
     bucket: String,
     endpoint: Option<String>,
     region: Option<String>,
@@ -55,7 +55,7 @@ pub(crate) fn builder(
     Ok(builder)
 }
 
-pub(crate) fn source(
+pub fn source(
     builder: AmazonS3Builder,
     key: String,
     object_prefix: Option<String>,

@@ -35,10 +35,19 @@ fn run(
     dest: &Path,
     options: ExtractOptions,
 ) -> zstar::fs::AnyResult<zstar::fs::ExtractReport> {
-    let mut archive = BlockingArchive::open(SliceReader::new(bytes), Default::default()).unwrap();
+    let mut archive =
+        BlockingArchive::open(SliceReader::new(bytes), zstar::ManifestOptions::default()).unwrap();
     extract_with_report(&mut archive, dest, None, options)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "The branch or bounded fixture establishes a nonnegative value."
+)]
 #[test]
 fn deep_and_wide_trees_exceed_the_default_handle_limit() {
     let mut items = vec![];

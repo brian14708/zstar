@@ -1,4 +1,3 @@
-#![allow(clippy::unused_async_trait_impl)] // In-memory fixtures implement the native async storage contract.
 #![cfg(feature = "async")]
 use bytes::Bytes;
 use std::{
@@ -22,6 +21,10 @@ struct Memory {
     puts: Mutex<Vec<String>>,
 }
 impl PackStore for Memory {
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "Fixture implements the async storage contract synchronously."
+    )]
     async fn put(&self, key: String, mut data: Spool) -> zstar::Result<Snapshot> {
         let length = data.len();
         let bytes = Bytes::from(data.read(0, length)?);
@@ -38,6 +41,14 @@ impl PackStore for Memory {
             version: String::new(),
         })
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "Fixture implements the async storage contract synchronously."
+    )]
     async fn get_range(&self, snapshot: &Snapshot, range: Range<u64>) -> zstar::Result<Bytes> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         let bytes = self
@@ -86,7 +97,7 @@ fn cancelling_queued_chunk_work_poisons_session() {
         let mut writer = PackWriter::new(
             Arc::new(Memory::default()),
             Catalog::default(),
-            Default::default(),
+            PackWriterOptions::default(),
         )
         .unwrap();
         let mut work = Box::pin(writer.put_chunk(Bytes::from_static(b"queued")));
@@ -106,6 +117,10 @@ fn cancelling_queued_chunk_work_poisons_session() {
     });
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "The branch or bounded fixture establishes a nonnegative value."
+)]
 #[tokio::test]
 async fn reused_compressor_preserves_independent_frames_across_pack_flushes() {
     let chunks = [
@@ -149,6 +164,10 @@ async fn reused_compressor_preserves_independent_frames_across_pack_flushes() {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[tokio::test]
 async fn packs_deduplicate_coalesce_and_reconstruct_unchanged_v1() {
     let store = Arc::new(Memory::default());
@@ -572,7 +591,12 @@ async fn global_requests_are_bounded_and_cancellation_releases_shared_flights() 
 async fn sequential_streams_coalesce_and_seeks_reset_read_ahead() {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let store = Arc::new(Memory::default());
-    let mut packs = PackWriter::new(store.clone(), Catalog::default(), Default::default()).unwrap();
+    let mut packs = PackWriter::new(
+        store.clone(),
+        Catalog::default(),
+        PackWriterOptions::default(),
+    )
+    .unwrap();
     let mut entry = Entry::file("stream");
     let mut expected = Vec::new();
     for n in 0..8 {
@@ -583,8 +607,9 @@ async fn sequential_streams_coalesce_and_seeks_reset_read_ahead() {
             .push(packs.put_chunk(Bytes::from(raw)).await.unwrap());
     }
     let catalog = packs.finish().await.unwrap();
-    let resolver =
-        Arc::new(PackedObjectResolver::new(store.clone(), catalog, Default::default()).unwrap());
+    let resolver = Arc::new(
+        PackedObjectResolver::new(store.clone(), catalog, ResolverOptions::default()).unwrap(),
+    );
     let mut b = zstar::backend::BlockingBuilder::new(Vec::new()).unwrap();
     b.add_metadata(entry).unwrap();
     let archive = zstar::Archive::open_with_options(
@@ -718,7 +743,7 @@ async fn repacking_changes_storage_without_changing_v1_references() {
     let bytes = Bytes::from(builder.finish().unwrap());
     for catalog in [old, new] {
         let resolver = Arc::new(
-            PackedObjectResolver::new(store.clone(), catalog, Default::default()).unwrap(),
+            PackedObjectResolver::new(store.clone(), catalog, ResolverOptions::default()).unwrap(),
         );
         let archive = zstar::Archive::open_with_options(
             Arc::new(bytes.clone()),
@@ -736,8 +761,12 @@ async fn repacking_changes_storage_without_changing_v1_references() {
 #[tokio::test]
 async fn reader_windows_preserve_physical_pack_order() {
     let store = Arc::new(Memory::default());
-    let mut writer =
-        PackWriter::new(store.clone(), Catalog::default(), Default::default()).unwrap();
+    let mut writer = PackWriter::new(
+        store.clone(),
+        Catalog::default(),
+        PackWriterOptions::default(),
+    )
+    .unwrap();
     let mut entry = Entry::file("ordered");
     let mut expected = Vec::new();
     for n in 0..32 {
@@ -748,8 +777,9 @@ async fn reader_windows_preserve_physical_pack_order() {
             .push(writer.put_chunk(Bytes::from(data)).await.unwrap());
     }
     let catalog = writer.finish().await.unwrap();
-    let resolver =
-        Arc::new(PackedObjectResolver::new(store.clone(), catalog, Default::default()).unwrap());
+    let resolver = Arc::new(
+        PackedObjectResolver::new(store.clone(), catalog, ResolverOptions::default()).unwrap(),
+    );
     let mut builder = zstar::backend::BlockingBuilder::new(Vec::new()).unwrap();
     builder.add_metadata(entry).unwrap();
     let archive = zstar::Archive::open_with_options(
@@ -784,7 +814,7 @@ async fn shared_packed_fixtures_and_generation_roundtrip() {
             PackedObjectResolver::new(
                 Arc::new(LocalPackStore::open(&root).unwrap()),
                 catalog,
-                Default::default(),
+                ResolverOptions::default(),
             )
             .unwrap(),
         );

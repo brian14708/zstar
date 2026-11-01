@@ -30,6 +30,10 @@ pub struct LocalPackStore {
     permits: Arc<Semaphore>,
 }
 impl LocalPackStore {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             root: Arc::new(Dir::open_ambient_dir(root, cap_std::ambient_authority())?),
@@ -61,6 +65,10 @@ impl Drop for RemoveTemporary {
     }
 }
 impl PackStore for LocalPackStore {
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
     async fn put(&self, key: String, mut data: Spool) -> Result<Snapshot> {
         if !crate::manifest::valid_path(&key) || data.is_empty() {
             return Err(Error::Unsupported("invalid artifact key or length"));
@@ -130,6 +138,10 @@ impl PackStore for LocalPackStore {
         .await
         .map_err(|_| Error::Unsupported("local pack worker failed"))?
     }
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
     async fn get_range(&self, snapshot: &Snapshot, range: Range<u64>) -> Result<Bytes> {
         snapshot.validate()?;
         let length = range.end.checked_sub(range.start).ok_or(Error::Range)?;

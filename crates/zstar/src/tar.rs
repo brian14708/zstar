@@ -3,7 +3,7 @@
 use crate::{EntryKind, Error, Result};
 use std::collections::BTreeMap;
 
-fn malformed(reason: &'static str) -> Error {
+const fn malformed(reason: &'static str) -> Error {
     Error::MalformedTar(reason)
 }
 struct Header<'a> {
@@ -124,6 +124,10 @@ fn pax(records: &[u8]) -> Result<BTreeMap<&str, &str>> {
     }
     Ok(fields)
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 fn mtime(text: &str) -> Result<i64> {
     let negative = text.starts_with('-');
     let unsigned = text.strip_prefix('-').unwrap_or(text);
@@ -166,6 +170,18 @@ pub struct TarHeader {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::or_fun_call,
+    reason = "The fallback is a cheap value conversion with no allocation or I/O."
+)]
 /// Parse complete effective standard tar metadata from a bounded header prefix.
 pub fn parse_header_prefix(bytes: &[u8]) -> Result<Option<TarHeader>> {
     if bytes.len() < 512 {
@@ -293,6 +309,10 @@ mod tests {
         let sum: u64 = bytes.iter().map(|&b| u64::from(b)).sum();
         bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     #[test]
     fn validates_unused_fields_and_pax_header_itself() {
         let headers =
@@ -311,7 +331,7 @@ mod tests {
         checksum(&mut bad[length - 512..]);
         assert!(parse_header_prefix(&bad).is_err());
         let payload_size = header(&headers[..512]).unwrap().size as usize;
-        let mut bad = headers.clone();
+        let mut bad = headers;
         bad[512 + payload_size] = 1;
         assert!(parse_header_prefix(&bad).is_err());
     }
@@ -339,10 +359,10 @@ mod tests {
     #[test]
     fn octal_accepts_full_width_and_zero_fields() {
         // Full-width 12-digit size field has no terminator.
-        assert_eq!(octal(b"777777777777").unwrap(), 0o777777777777);
+        assert_eq!(octal(b"777777777777").unwrap(), 0o777_777_777_777);
         assert!(octal(b"00000000000\0").is_ok());
-        assert_eq!(octal(b"77777777777\0").unwrap(), 0o77777777777);
-        assert_eq!(octal(b"77777777777 ").unwrap(), 0o77777777777);
+        assert_eq!(octal(b"77777777777\0").unwrap(), 0o77_777_777_777);
+        assert_eq!(octal(b"77777777777 ").unwrap(), 0o77_777_777_777);
         assert_eq!(octal(b"0000644").unwrap(), 0o644);
         assert_eq!(octal(b"0000644\0").unwrap(), 0o644);
         assert_eq!(octal(&[0; 8]).unwrap(), 0);

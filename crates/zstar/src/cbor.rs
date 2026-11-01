@@ -6,7 +6,7 @@ fn invalid(message: &str) -> Error {
     Error::MalformedToc(message.into())
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<Value> {
+pub fn decode(bytes: &[u8]) -> Result<Value> {
     let mut parser = SequenceDecoder::<_, true>::new(bytes, bytes.len() as u64);
     let value = parser.next()?.ok_or_else(|| invalid("empty CBOR"))?;
     if parser.next()?.is_some() {
@@ -17,7 +17,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Value> {
 
 // Complete blocks benefit from bounded preallocation. Streaming documents
 // retain Vec's growth policy; exact reservations regress large archive opens.
-pub(crate) struct SequenceDecoder<R, const PREALLOCATE: bool = false> {
+pub struct SequenceDecoder<R, const PREALLOCATE: bool = false> {
     reader: R,
     remaining: u64,
     items: usize,
@@ -29,7 +29,7 @@ pub(crate) struct SequenceDecoder<R, const PREALLOCATE: bool = false> {
     consumed: u64,
 }
 impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> {
-    pub(crate) fn new(reader: R, remaining: u64) -> Self {
+    pub(crate) const fn new(reader: R, remaining: u64) -> Self {
         Self {
             reader,
             remaining,
@@ -41,7 +41,7 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         }
     }
     /// Cap the encoded bytes of the first top-level item and of every later one.
-    pub(crate) fn with_item_limits(mut self, first_max: u64, item_max: u64) -> Self {
+    pub(crate) const fn with_item_limits(mut self, first_max: u64, item_max: u64) -> Self {
         self.first_max = first_max;
         self.item_max = item_max;
         self
@@ -85,7 +85,7 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         Ok(value)
     }
     // Bytes still permitted for the current top-level item.
-    fn item_room(&self) -> u64 {
+    const fn item_room(&self) -> u64 {
         let cap = if self.index == 0 {
             self.first_max
         } else {
@@ -103,6 +103,10 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         self.remaining -= N as u64;
         Ok(bytes)
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     fn item(&mut self, depth: usize) -> Result<Value> {
         if depth > 64 || self.items >= 16_000_000 {
             return Err(Error::Budget("CBOR nesting or item budget"));
@@ -217,7 +221,7 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
 }
 
 #[cfg(test)]
-pub(crate) fn encode(value: &Value) -> Result<Vec<u8>> {
+pub fn encode(value: &Value) -> Result<Vec<u8>> {
     match value {
         Value::Array(items) => {
             let mut out = head(4, items.len() as u64);
@@ -249,10 +253,14 @@ pub(crate) fn encode(value: &Value) -> Result<Vec<u8>> {
 
 // Validate producer values directly. This mirrors the wire parser's restricted
 // types and resource bounds without allocating an encoded/decoded value tree.
-pub(crate) fn encoded_len(value: &Value) -> Result<usize> {
+pub fn encoded_len(value: &Value) -> Result<usize> {
     encoded_len_at(value, 0)
 }
-pub(crate) fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
+pub fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
     fn visit(value: &Value, depth: usize, items: &mut usize) -> Result<usize> {
         if depth > 64 || *items >= 16_000_000 {
             return Err(Error::Budget("CBOR nesting or item budget"));
@@ -305,7 +313,7 @@ pub(crate) fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
     }
     visit(value, depth, &mut 0)
 }
-pub(crate) fn head_len(n: u64) -> usize {
+pub fn head_len(n: u64) -> usize {
     if n < 24 {
         1
     } else if n <= 255 {
@@ -319,7 +327,15 @@ pub(crate) fn head_len(n: u64) -> usize {
     }
 }
 
-pub(crate) fn append_head(out: &mut Vec<u8>, major: u8, n: u64) {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::decimal_bitwise_operands,
+    reason = "Decimal tags match the CBOR wire specification."
+)]
+pub fn append_head(out: &mut Vec<u8>, major: u8, n: u64) {
     match head_len(n) {
         1 => out.push((major << 5) | n as u8),
         2 => out.extend([(major << 5) | 24, n as u8]),
@@ -337,7 +353,7 @@ pub(crate) fn append_head(out: &mut Vec<u8>, major: u8, n: u64) {
         }
     }
 }
-pub(crate) fn append_text(out: &mut Vec<u8>, text: &str) {
+pub fn append_text(out: &mut Vec<u8>, text: &str) {
     append_head(out, 3, text.len() as u64);
     out.extend_from_slice(text.as_bytes());
 }
@@ -346,7 +362,7 @@ fn text_order(a: &str, b: &str) -> std::cmp::Ordering {
 }
 // Only values accepted by encoded_len or the restricted wire parser may be
 // passed here. Map ordering includes the encoded text-key length heads.
-pub(crate) fn append_validated(out: &mut Vec<u8>, value: &Value) {
+pub fn append_validated(out: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Integer(n) if i128::from(*n) >= 0 => {
             append_head(
@@ -408,11 +424,19 @@ pub(crate) fn append_validated(out: &mut Vec<u8>, value: &Value) {
     }
 }
 
-pub(crate) fn encode_checked(value: &Value) -> Result<Vec<u8>> {
+pub fn encode_checked(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(encoded_len(value)?);
     append_validated(&mut out, value);
     Ok(out)
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::decimal_bitwise_operands,
+    reason = "Decimal tags match the CBOR wire specification."
+)]
 #[cfg(test)]
 fn head(major: u8, n: u64) -> Vec<u8> {
     let mut out = Vec::new();

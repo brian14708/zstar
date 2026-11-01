@@ -22,7 +22,12 @@ fn header(entry: &Entry, size: u64) -> Header {
     header.set_attributes(entry.attributes.clone());
     header
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Rewrite logical members into explicit external objects. Files reset chunking;
+///
 /// metadata and root extensions survive. The caller finalizes the object writer
 /// before publishing the resulting archive/catalog generation.
 pub async fn externalize_archive<R, W, O>(
@@ -61,6 +66,10 @@ where
     }
     builder.finish().await
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Reconstruct an ordinary portable v1 archive using the configured resolver.
 pub async fn materialize_archive<R, W>(
     archive: &Archive<R>,
@@ -93,6 +102,14 @@ where
     }
     builder.finish().await
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Export complete verified catalog frames to the standalone `<digest>.zst` layout.
 /// Completed keys remain caller-owned even if a later object fails.
 pub async fn export_objects<S: PackStore>(

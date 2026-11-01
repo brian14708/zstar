@@ -14,8 +14,11 @@ fn content_cache_reuses_objects_across_files_and_enforces_verification_policy() 
         }
     }
     let bytes = include_bytes!("../../../testdata/entry-manifest/thin.zstar");
-    let mut reader =
-        BlockingArchive::open(zstar::SliceReader::new(bytes), Default::default()).unwrap();
+    let mut reader = BlockingArchive::open(
+        zstar::SliceReader::new(bytes),
+        zstar::ManifestOptions::default(),
+    )
+    .unwrap();
     reader.set_content_cache_bytes(1024);
     let mut objects = Objects {
         bytes: zstar::encode_frame(b"hello\nworld\n", 3).unwrap(),
@@ -98,7 +101,7 @@ fn content_cache_reuses_archive_frames_and_evicts_with_a_byte_budget() {
             source: SliceReader::new(bytes),
             calls: 0,
         },
-        Default::default(),
+        zstar::ManifestOptions::default(),
     )
     .unwrap();
     reader.set_content_cache_bytes(1 << 20);
@@ -112,7 +115,7 @@ fn content_cache_reuses_archive_frames_and_evicts_with_a_byte_budget() {
             source: SliceReader::new(bytes),
             calls: 0,
         },
-        Default::default(),
+        zstar::ManifestOptions::default(),
     )
     .unwrap();
     reader.set_content_cache_bytes(1); // No complete frame fits.
@@ -123,6 +126,10 @@ fn content_cache_reuses_archive_frames_and_evicts_with_a_byte_budget() {
     assert_eq!(reader.into_source().calls, reads + 4);
 }
 
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
 #[test]
 fn content_cache_evicts_least_recently_used_complete_frames() {
     use std::sync::{
@@ -135,7 +142,8 @@ fn content_cache_evicts_least_recently_used_complete_frames() {
         manifest::{Entry, EntryKind},
     };
     let mut writer =
-        BlockingBuilder::with_options(Vec::new(), 1024, 3, Default::default()).unwrap();
+        BlockingBuilder::with_options(Vec::new(), 1024, 3, zstar::ManifestOptions::default())
+            .unwrap();
     for name in ["a", "b"] {
         writer
             .add_file(
@@ -148,7 +156,7 @@ fn content_cache_evicts_least_recently_used_complete_frames() {
                     mtime_ns: 0,
                     extents: vec![],
                     linkname: None,
-                    attributes: Default::default(),
+                    attributes: std::collections::BTreeMap::default(),
                 },
                 128,
                 &mut [7; 128].as_slice(),
@@ -175,7 +183,7 @@ fn content_cache_evicts_least_recently_used_complete_frames() {
             bytes: SliceReader::new(&bytes),
             calls: calls.clone(),
         },
-        Default::default(),
+        zstar::ManifestOptions::default(),
     )
     .unwrap();
     reader.set_content_cache_bytes(1280); // One 1 KiB frame plus bookkeeping.

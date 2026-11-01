@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 /// The source identity must identify an immutable encoded archive snapshot.
+///
 /// Metadata hashes alone cannot identify inline bytes. Object keys identify
 /// complete SHA-256-verified decoded content and omit recompression size hints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -22,7 +23,7 @@ pub enum DecodedCacheKey {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum DecodedBody {
+pub enum DecodedBody {
     Shared(Arc<[u8]>),
     #[cfg(feature = "async")]
     Async {
@@ -76,6 +77,7 @@ impl Deref for DecodedBody {
 }
 
 /// Only readers can create these values, after framing/checksum validation and
+///
 /// (for objects) complete decoded SHA-256 verification. Backend implementations
 /// may retain/clone them but cannot safely forge or mutate their provenance.
 #[derive(Clone, Debug)]
@@ -85,7 +87,7 @@ pub struct CachedChunk {
 }
 impl CachedChunk {
     #[must_use]
-    pub fn key(&self) -> &DecodedCacheKey {
+    pub const fn key(&self) -> &DecodedCacheKey {
         &self.key
     }
     #[must_use]
@@ -97,18 +99,27 @@ impl CachedChunk {
     pub fn weight(&self) -> usize {
         self.body.allocated().saturating_add(512)
     }
-    pub(crate) fn validated(key: DecodedCacheKey, body: DecodedBody) -> Self {
+    pub(crate) const fn validated(key: DecodedCacheKey, body: DecodedBody) -> Self {
         Self { key, body }
     }
 }
 
 /// Errors are advisory: a failed get is a miss, a failed put does not fail a
+///
 /// read. Implementations must bound their storage and must not re-enter readers.
 /// Reader close does not close a caller-owned cache. Native async readers run
 /// custom callbacks on bounded blocking workers; canceled work retains its
 /// permit. The built-in memory backend uses a direct bounded lookup.
 pub trait DecodedCache: Any + Send + Sync {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     fn get(&self, key: &DecodedCacheKey) -> io::Result<Option<CachedChunk>>;
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     fn put(&self, value: CachedChunk) -> io::Result<()>;
 }
 
@@ -118,7 +129,7 @@ pub struct SharedDecodedCache {
     backend: Arc<dyn DecodedCache>,
 }
 #[cfg(feature = "async")]
-pub(crate) enum BuiltinLookup {
+pub enum BuiltinLookup {
     Unavailable,
     Result(Option<DecodedBody>),
 }
@@ -130,6 +141,10 @@ impl std::fmt::Debug for SharedDecodedCache {
     }
 }
 impl SharedDecodedCache {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Supply an immutable source version (e.g. qualified object version/ETag,
     /// or a complete archive digest). Different snapshots need different IDs.
     pub fn new(identity: &[u8], backend: Arc<dyn DecodedCache>) -> Result<Self> {
@@ -146,7 +161,7 @@ impl SharedDecodedCache {
             backend,
         })
     }
-    pub(crate) fn archive_key(
+    pub(crate) const fn archive_key(
         &self,
         metadata: [u8; 32],
         offset: u64,
@@ -204,9 +219,17 @@ impl MemoryDecodedCache {
             }),
         }
     }
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn used(&self) -> usize {
         self.state.lock().unwrap().used
     }
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn clear(&self) {
         let mut state = self.state.lock().unwrap();
         state.values.clear();
@@ -215,6 +238,10 @@ impl MemoryDecodedCache {
     }
 }
 impl DecodedCache for MemoryDecodedCache {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     fn get(&self, key: &DecodedCacheKey) -> io::Result<Option<CachedChunk>> {
         let mut state = self.state.lock().unwrap();
         let Some((value, previous)) = state.values.get(key).cloned() else {
@@ -230,6 +257,10 @@ impl DecodedCache for MemoryDecodedCache {
         state.values.get_mut(key).unwrap().1 = age;
         Ok(Some(value))
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     fn put(&self, value: CachedChunk) -> io::Result<()> {
         let weight = value.weight();
         if weight > self.capacity {
@@ -284,6 +315,10 @@ mod tests {
         fn len(&self) -> u64 {
             self.raw.len() as u64
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+        )]
         fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>> {
             if range.start < self.data_end {
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -299,14 +334,20 @@ mod tests {
         let memory = Arc::new(MemoryDecodedCache::new(1 << 20));
         let binding = SharedDecodedCache::new(b"immutable-version-1", memory.clone()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut first =
-            BlockingArchive::open(Source::new(INLINE, calls.clone()), Default::default()).unwrap();
+        let mut first = BlockingArchive::open(
+            Source::new(INLINE, calls.clone()),
+            crate::ManifestOptions::default(),
+        )
+        .unwrap();
         first.set_shared_decoded_cache(Some(binding.clone()));
         assert_eq!(first.read("a-b", 0, 5, None, true).unwrap(), b"hello");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(first);
-        let mut second =
-            BlockingArchive::open(Source::new(INLINE, calls.clone()), Default::default()).unwrap();
+        let mut second = BlockingArchive::open(
+            Source::new(INLINE, calls.clone()),
+            crate::ManifestOptions::default(),
+        )
+        .unwrap();
         second.set_shared_decoded_cache(Some(binding.clone()));
         second.set_content_cache_bytes(0);
         assert_eq!(second.read("a-b", 0, 5, None, true).unwrap(), b"hello");
@@ -370,9 +411,11 @@ mod tests {
             Arc::new(WrongKey(memory.get(&key).unwrap().unwrap())),
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
-            let mut reader =
-                BlockingArchive::open(Source::new(INLINE, calls.clone()), Default::default())
-                    .unwrap();
+            let mut reader = BlockingArchive::open(
+                Source::new(INLINE, calls.clone()),
+                crate::ManifestOptions::default(),
+            )
+            .unwrap();
             reader.set_shared_decoded_cache(Some(
                 SharedDecodedCache::new(b"version-a", backend).unwrap(),
             ));
@@ -450,7 +493,9 @@ mod tests {
             puts: AtomicUsize::new(0),
         });
         let binding = SharedDecodedCache::new(b"snapshot-a", cache.clone()).unwrap();
-        let mut reader = BlockingArchive::open(SliceReader::new(THIN), Default::default()).unwrap();
+        let mut reader =
+            BlockingArchive::open(SliceReader::new(THIN), crate::ManifestOptions::default())
+                .unwrap();
         reader.set_shared_decoded_cache(Some(binding));
         let mut wrong = Objects {
             encoded: crate::encode_frame(b"wrong\nbytes\n", 3).unwrap(),
@@ -479,7 +524,9 @@ mod tests {
             .unwrap();
         assert_eq!(cache.puts.load(Ordering::SeqCst), 1);
         drop(reader);
-        let mut second = BlockingArchive::open(SliceReader::new(THIN), Default::default()).unwrap();
+        let mut second =
+            BlockingArchive::open(SliceReader::new(THIN), crate::ManifestOptions::default())
+                .unwrap();
         second.set_shared_decoded_cache(Some(
             SharedDecodedCache::new(b"other-archive", cache.clone()).unwrap(),
         ));

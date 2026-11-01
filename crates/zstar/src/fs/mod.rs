@@ -1,4 +1,5 @@
 //! Filesystem capture, restoration, and materialization without following links.
+//!
 //! Paths are exact UTF-8 identities; filesystem authority is held by directory
 //! handles. Ownership is captured but is never applied by restoration; use
 //! [`extract_with_report`](crate::fs::extract_with_report) to learn exactly which metadata was not applied.
@@ -57,7 +58,7 @@ impl Default for ExtractOptions {
             allow_special_bits: false,
             verify_external: true,
             max_directory_handles: 64,
-            manifest: Default::default(),
+            manifest: ManifestOptions::default(),
         }
     }
 }
@@ -81,7 +82,7 @@ impl Default for PackOptions {
             workers: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZero::get)
                 .min(2),
-            manifest: Default::default(),
+            manifest: ManifestOptions::default(),
         }
     }
 }
@@ -92,6 +93,10 @@ pub struct LocalObjects {
     dir: Dir,
 }
 impl LocalObjects {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn open(path: &Path) -> AnyResult<Self> {
         Ok(Self {
             dir: Dir::open_ambient_dir(path, cap_std::ambient_authority())?,
@@ -126,6 +131,10 @@ impl EncodedObjectResolver for LocalObjects {
         Ok(encoded)
     }
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[cfg(unix)]
 fn time(entry: &Entry) -> AnyResult<std::time::SystemTime> {
     let value = i128::from(entry.mtime_ns);
@@ -178,7 +187,7 @@ impl ExtractReport {
     pub const EXAMPLES: usize = 8;
     /// True when every recorded standard metadata field was applied.
     #[must_use]
-    pub fn is_lossless(&self) -> bool {
+    pub const fn is_lossless(&self) -> bool {
         self.omitted.is_empty()
     }
     /// Count of entries affected by `field`.
@@ -210,9 +219,13 @@ impl ExtractReport {
     }
 }
 #[cfg(unix)]
-fn special_mask(allow_special_bits: bool) -> u64 {
+const fn special_mask(allow_special_bits: bool) -> u64 {
     if allow_special_bits { 0o7777 } else { 0o1777 }
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[cfg(unix)]
 fn metadata(
     file: &std::fs::File,
@@ -335,6 +348,10 @@ impl DirCache {
     }
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Every descendant operation uses a captured directory plus one leaf name.
 /// Failure leaves no new entries; see [`extract_with_report`].
 pub fn extract<R: RangeReader>(
@@ -382,6 +399,10 @@ impl Drop for Staged {
 }
 #[cfg(unix)]
 impl Target {
+    #[expect(
+        clippy::or_fun_call,
+        reason = "The fallback is a cheap value conversion with no allocation or I/O."
+    )]
     fn open(destination: &Path) -> AnyResult<Self> {
         let Some(name) = destination.file_name() else {
             let path = if destination.as_os_str().is_empty() {
@@ -621,6 +642,10 @@ fn finish_destination(
     Ok(())
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn extract_file(
     archive: &Path,
     destination: &Path,
@@ -637,6 +662,10 @@ pub fn extract_file(
         },
     )
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn extract_file_with_options(
     archive: &Path,
     destination: &Path,
@@ -648,6 +677,14 @@ pub fn extract_file_with_options(
     extract_with_options(&mut reader, destination, objects, options)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 /// Extract and report which recorded metadata could not be applied.
 ///
 /// A destination that does not yet exist is created atomically: the tree is
@@ -796,6 +833,10 @@ pub fn extract_with_report<R: RangeReader>(
 ) -> AnyResult<ExtractReport> {
     Err("extraction requires a Unix filesystem".into())
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn extract_with_options<R: RangeReader>(
     reader: &mut BlockingArchive<R>,
     destination: &Path,
@@ -804,6 +845,10 @@ pub fn extract_with_options<R: RangeReader>(
 ) -> AnyResult<()> {
     extract_with_report(reader, destination, objects, options).map(|_| ())
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Open a local archive file and [`extract_with_report`] it.
 pub fn extract_file_with_report(
     archive: &Path,
@@ -816,15 +861,23 @@ pub fn extract_file_with_report(
     extract_with_report(&mut reader, destination, objects, options)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Explicit in-memory convenience. Use `materialize_to` for large output archives.
 pub fn materialize<R: RangeReader>(
     archive: &mut BlockingArchive<R>,
     objects: Option<LocalObjects>,
 ) -> AnyResult<Vec<u8>> {
     let mut output = Vec::new();
-    materialize_to(archive, &mut output, objects, true, Default::default())?;
+    materialize_to(archive, &mut output, objects, true, PackOptions::default())?;
     Ok(output)
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Validate the physical archive, resolve external objects once per adjacent
 /// extent group, and stream a portable archive preserving entry/root extensions.
 pub fn materialize_to<R: RangeReader>(
@@ -902,6 +955,10 @@ mod tests {
     }
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Capture a directory tree and each link's own metadata. The root itself must
 /// be a real directory. Only the encoded archive is retained in memory.
 pub fn pack(input: &Path) -> AnyResult<Vec<u8>> {
@@ -910,10 +967,22 @@ pub fn pack(input: &Path) -> AnyResult<Vec<u8>> {
     Ok(archive)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Pack with disk-spooled capture records; no whole namespace or archive buffer.
 pub fn pack_to(input: &Path, output: &mut impl Write) -> AnyResult<()> {
-    pack_to_with_options(input, output, Default::default())
+    pack_to_with_options(input, output, PackOptions::default())
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::or_fun_call,
+    reason = "The fallback is a cheap value conversion with no allocation or I/O."
+)]
 pub fn pack_to_with_options(
     input: &Path,
     output: &mut impl Write,
@@ -945,6 +1014,14 @@ pub fn pack_to_with_options(
     Ok(())
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::or_fun_call,
+    reason = "The fallback is a cheap value conversion with no allocation or I/O."
+)]
 /// Append a captured directory, including its root entry, to an existing
 /// archive builder. Filesystem traversal and reopening stay relative to
 /// captured no-follow directory handles.
@@ -970,7 +1047,7 @@ pub fn append_directory<W: Write>(
         Dir::open_ambient_dir(input, cap_std::ambient_authority())?
     };
     let meta = root.dir_metadata()?;
-    let mut entries = CaptureSpool::new(Default::default());
+    let mut entries = CaptureSpool::new(ManifestOptions::default());
     let mut root_entry = Entry::directory(archive_name);
     root_entry.mode = if preserve_metadata {
         permissions(&meta)
@@ -1034,6 +1111,14 @@ fn capture_metadata(
     Ok(())
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::or_fun_call,
+    reason = "The fallback is a cheap value conversion with no allocation or I/O."
+)]
 /// Append one filesystem path, without following the path's final symlink.
 pub fn append_path<W: Write>(
     input: &Path,
@@ -1162,7 +1247,7 @@ fn collect_entries(
             (0, 0, 0)
         };
         let mut entry = Entry {
-            attributes: Default::default(),
+            attributes: BTreeMap::default(),
             path: relative.clone(),
             kind: EntryKind::File,
             mode,
@@ -1203,7 +1288,7 @@ fn collect_entries(
     }
     Ok(())
 }
-fn normalized_mode(kind: EntryKind, source: u64) -> u64 {
+const fn normalized_mode(kind: EntryKind, source: u64) -> u64 {
     match kind {
         EntryKind::Symlink => 0o777,
         EntryKind::Directory => 0o755,

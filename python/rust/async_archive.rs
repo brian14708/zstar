@@ -168,7 +168,12 @@ impl AsyncArchive {
         })
     }
     /// Verify every physical frame and tar member, optionally including external objects.
-    #[pyo3(signature=(*,external=false))]
+    #[pyo3(
+        signature = (
+            *,
+            external = false,
+        )
+    )]
     fn verify<'py>(&self, py: Python<'py>, external: bool) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         let scope = if external {
@@ -215,7 +220,11 @@ impl AsyncArchive {
         Ok(self.lease()?.0.reader.entry_count())
     }
     /// Lazily yield owned entry tuples in path order with async iteration.
-    #[pyo3(signature=(prefix=None))]
+    #[pyo3(
+        signature = (
+            prefix = None,
+        )
+    )]
     fn iter_entries(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<AsyncEntries> {
         slf.lease()?;
         Ok(AsyncEntries {
@@ -226,8 +235,30 @@ impl AsyncArchive {
     }
     /// Open an immutable encoded byte snapshot.
     #[staticmethod]
-    #[pyo3(signature=(data,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            data,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_bytes<'py>(
         py: Python<'py>,
         data: &Bound<'py, PyAny>,
@@ -271,8 +302,30 @@ impl AsyncArchive {
     }
     /// Open an immutable local archive using bounded positional file reads.
     #[staticmethod]
-    #[pyo3(signature=(path,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            path,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
@@ -319,8 +372,30 @@ impl AsyncArchive {
     }
     /// Borrow a seekable Python file object; sizing and reads run off-loop.
     #[staticmethod]
-    #[pyo3(signature=(fileobj,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            fileobj,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_fileobj(
         py: Python<'_>,
         fileobj: Py<PyAny>,
@@ -385,8 +460,31 @@ impl AsyncArchive {
     /// Open an immutable synchronous `read_range(offset, length)` source.
     /// Callbacks run on bounded workers.
     #[staticmethod]
-    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            source,
+            size,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_source(
         py: Python<'_>,
         source: Py<PyAny>,
@@ -435,8 +533,32 @@ impl AsyncArchive {
     }
 
     #[staticmethod]
-    #[pyo3(signature=(url=None, *, headers=None, provider=None, cache_bytes=16_777_216, concurrent_chunks=8, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            url = None,
+            *,
+            headers = None,
+            provider = None,
+            cache_bytes = 16_777_216,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_url(
         py: Python<'_>,
         url: Option<String>,
@@ -488,8 +610,38 @@ impl AsyncArchive {
         })
     }
     #[staticmethod]
-    #[pyo3(signature=(bucket, key, *, endpoint=None, region=None, object_prefix=None, anon=None,access_key_id=None,secret_access_key=None,session_token=None, cache_bytes=16_777_216, concurrent_chunks=8, verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            bucket,
+            key,
+            *,
+            endpoint = None,
+            region = None,
+            object_prefix = None,
+            anon = None,
+            access_key_id = None,
+            secret_access_key = None,
+            session_token = None,
+            cache_bytes = 16_777_216,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_s3(
         py: Python<'_>,
         bucket: String,
@@ -550,7 +702,13 @@ impl AsyncArchive {
         })
     }
     /// Batch logical ranges with chunk sharing and cancellation propagation.
-    #[pyo3(signature=(requests,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            requests,
+            *,
+            resolver = None,
+        )
+    )]
     fn read_many<'py>(
         &self,
         py: Python<'py>,
@@ -606,7 +764,15 @@ impl AsyncArchive {
                 .await
         })
     }
-    #[pyo3(signature=(path,offset,length,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            path,
+            offset,
+            length,
+            *,
+            resolver = None,
+        )
+    )]
     fn read_with_report<'py>(
         &self,
         py: Python<'py>,
@@ -737,7 +903,15 @@ impl AsyncArchive {
     ) -> PyResult<Bound<'py, PyAny>> {
         self.close(py)
     }
-    #[pyo3(signature=(path,offset=0,length=None,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            path,
+            offset = 0,
+            length = None,
+            *,
+            resolver = None,
+        )
+    )]
     fn read<'py>(
         &self,
         py: Python<'py>,
@@ -816,7 +990,7 @@ pub struct AsyncEntries {
 }
 #[pymethods]
 impl AsyncEntries {
-    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    const fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -838,6 +1012,10 @@ impl AsyncEntries {
     }
 }
 impl AsyncEntries {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     async fn next_batch(
         lease: Lease,
         cursor: Arc<tokio::sync::Mutex<(Option<zstar::EntryCursor>, bool)>>,

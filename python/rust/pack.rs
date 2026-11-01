@@ -58,8 +58,25 @@ impl PyStore {
             .map_err(core_error)
     }
     #[staticmethod]
-    #[pyo3(signature=(bucket,*,prefix=String::new(),endpoint=None,region=None,anon=None,access_key_id=None,secret_access_key=None,session_token=None,part_size=8<<20,concurrency=4))]
-    #[allow(clippy::too_many_arguments)] // Standard S3 configuration keyword API.
+    #[pyo3(
+        signature = (
+            bucket,
+            *,
+            prefix = String::new(),
+            endpoint = None,
+            region = None,
+            anon = None,
+            access_key_id = None,
+            secret_access_key = None,
+            session_token = None,
+            part_size = 8 << 20,
+            concurrency = 4,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Standard S3 configuration keyword API."
+    )]
     fn s3(
         py: Python<'_>,
         bucket: String,
@@ -105,8 +122,21 @@ struct PyCatalog {
 }
 #[pymethods]
 impl PyCatalog {
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
     #[new]
-    #[pyo3(signature=(data=None,*,max_encoded_bytes=16<<20,max_memory_bytes=512<<20,max_packs=65536,max_chunks=262144))]
+    #[pyo3(
+        signature = (
+            data = None,
+            *,
+            max_encoded_bytes = 16 << 20,
+            max_memory_bytes = 512 << 20,
+            max_packs = 65536,
+            max_chunks = 262_144,
+        )
+    )]
     fn new(
         py: Python<'_>,
         data: Option<Vec<u8>>,
@@ -144,13 +174,21 @@ impl PyCatalog {
     }
 }
 #[pyclass(name = "Chunking", module = "zstar", frozen)]
-pub(crate) struct PyChunking {
+pub struct PyChunking {
     inner: Chunking,
 }
 #[pymethods]
 impl PyChunking {
     #[new]
-    #[pyo3(signature=(kind="fixed",*,target_bytes=None,min_bytes=64<<10,max_bytes=1<<20))]
+    #[pyo3(
+        signature = (
+            kind = "fixed",
+            *,
+            target_bytes = None,
+            min_bytes = 64 << 10,
+            max_bytes = 1 << 20,
+        )
+    )]
     fn new(
         kind: &str,
         target_bytes: Option<usize>,
@@ -177,7 +215,7 @@ impl PyChunking {
     }
 }
 #[pyclass(name = "ExternalFile", module = "zstar", frozen)]
-pub(crate) struct PyExternal {
+pub struct PyExternal {
     extents: Vec<zstar::Extent>,
     size: u64,
 }
@@ -188,7 +226,10 @@ struct CallbackWriter {
 }
 
 impl zstar::chunking::ObjectWriter for CallbackWriter {
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "The implementation conforms to an async trait boundary."
+    )]
     async fn put_chunk(&mut self, raw: bytes::Bytes) -> zstar::Result<zstar::Extent> {
         let digest = *zstar::Digest::sha256(&raw).as_bytes();
         let encoded = zstar::encode_frame(&raw, self.level)?;
@@ -216,7 +257,11 @@ impl zstar::chunking::ObjectWriter for CallbackWriter {
     }
 }
 
-pub(crate) fn externalize_callback(
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
+pub fn externalize_callback(
     py: Python<'_>,
     fileobj: Py<PyAny>,
     size: u64,
@@ -245,11 +290,11 @@ pub(crate) fn externalize_callback(
 #[pymethods]
 impl PyExternal {
     #[getter]
-    fn size(&self) -> u64 {
+    const fn size(&self) -> u64 {
         self.size
     }
     #[getter]
-    fn chunk_count(&self) -> usize {
+    const fn chunk_count(&self) -> usize {
         self.extents.len()
     }
     fn _entry(&self, py: Python<'_>, entry: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -330,9 +375,31 @@ struct PyWriter {
 }
 #[pymethods]
 impl PyWriter {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     #[new]
-    #[pyo3(signature=(store,*,base=None,prefix="objects".to_string(),target_bytes=64<<20,compression_level=3,memory_bytes=8<<20,max_spool_bytes=4<<30,max_chunks=262144,max_packs=65536,max_catalog_bytes=16<<20,max_index_bytes=512<<20))]
-    #[allow(clippy::too_many_arguments)] // Independently configurable resource budgets.
+    #[pyo3(
+        signature = (
+            store,
+            *,
+            base = None,
+            prefix = "objects".to_string(),
+            target_bytes = 64 << 20,
+            compression_level = 3,
+            memory_bytes = 8 << 20,
+            max_spool_bytes = 4 << 30,
+            max_chunks = 262_144,
+            max_packs = 65536,
+            max_catalog_bytes = 16 << 20,
+            max_index_bytes = 512 << 20,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independently configurable resource budgets."
+    )]
     fn new(
         store: PyRef<'_, PyStore>,
         base: Option<PyRef<'_, PyCatalog>>,
@@ -372,7 +439,14 @@ impl PyWriter {
         })
         .map_err(core_error)
     }
-    #[pyo3(signature=(fileobj,size,*,chunking=None))]
+    #[pyo3(
+        signature = (
+            fileobj,
+            size,
+            *,
+            chunking = None,
+        )
+    )]
     fn externalize(
         &self,
         py: Python<'_>,
@@ -388,7 +462,14 @@ impl PyWriter {
         })
         .map_err(core_error)
     }
-    #[pyo3(signature=(fileobj,size,*,chunking=None))]
+    #[pyo3(
+        signature = (
+            fileobj,
+            size,
+            *,
+            chunking = None,
+        )
+    )]
     fn externalize_async<'py>(
         &self,
         py: Python<'py>,
@@ -431,7 +512,7 @@ impl PyWriter {
                 .map_err(core_error)
         })
     }
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    const fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
     fn __exit__(
@@ -488,6 +569,10 @@ impl PyWriter {
         })
     }
 }
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "The guard intentionally covers this short state update."
+)]
 async fn externalize(
     inner: Arc<tokio::sync::Mutex<PackWriter<Store>>>,
     object: Py<PyAny>,
@@ -506,14 +591,28 @@ async fn externalize(
     Ok(PyExternal { extents, size })
 }
 #[pyclass(name = "PackedObjectResolver", module = "zstar", frozen)]
-pub(crate) struct PyResolver {
+pub struct PyResolver {
     pub(crate) inner: Arc<dyn zstar::ObjectResolver>,
 }
 #[pymethods]
 impl PyResolver {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     #[new]
-    #[pyo3(signature=(store,catalog,*,max_range_bytes=8<<20,max_overfetch_bytes=0,max_batch_bytes=64<<20,cache_bytes=0,concurrency=8))]
-    #[allow(clippy::too_many_arguments)] // Independent range and retention budgets.
+    #[pyo3(
+        signature = (
+            store,
+            catalog,
+            *,
+            max_range_bytes = 8 << 20,
+            max_overfetch_bytes = 0,
+            max_batch_bytes = 64 << 20,
+            cache_bytes = 0,
+            concurrency = 8,
+        )
+    )]
     fn new(
         store: PyRef<'_, PyStore>,
         catalog: PyRef<'_, PyCatalog>,
@@ -554,14 +653,14 @@ impl PyResolver {
         Ok(PyBytes::new(py, &data))
     }
 }
-pub(crate) fn binding(py: Python<'_>, object: Py<PyAny>) -> Arc<dyn zstar::ObjectResolver> {
+pub fn binding(py: Python<'_>, object: Py<PyAny>) -> Arc<dyn zstar::ObjectResolver> {
     if let Ok(native) = object.bind(py).extract::<PyRef<'_, PyResolver>>() {
         native.inner.clone()
     } else {
         Arc::new(super::PythonResolver(Arc::new(object)))
     }
 }
-pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStore>()?;
     m.add_class::<PyCatalog>()?;
     m.add_class::<PyWriter>()?;
@@ -579,6 +678,10 @@ struct PyGeneration {
 }
 #[pymethods]
 impl PyGeneration {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     #[new]
     fn new(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
         py.detach(|| Generation::decode(&data))
@@ -655,8 +758,21 @@ async fn publish(
         error
     })
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
-#[pyo3(signature=(store,archive,catalog,*,prefix="objects".to_string(),chunking=None))]
+#[pyo3(
+    signature = (
+        store,
+        archive,
+        catalog,
+        *,
+        prefix = "objects".to_string(),
+        chunking = None,
+    )
+)]
 fn publish_packed_generation(
     py: Python<'_>,
     store: PyRef<'_, PyStore>,
@@ -673,8 +789,21 @@ fn publish_packed_generation(
             .block_on(publish(store, archive, prefix, catalog, strategy))
     })
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
-#[pyo3(signature=(store,archive,catalog,*,prefix="objects".to_string(),chunking=None))]
+#[pyo3(
+    signature = (
+        store,
+        archive,
+        catalog,
+        *,
+        prefix = "objects".to_string(),
+        chunking = None,
+    )
+)]
 fn publish_packed_generation_async<'py>(
     py: Python<'py>,
     store: PyRef<'_, PyStore>,

@@ -44,23 +44,23 @@ impl Header {
     }
     /// Returns the declared payload length in bytes.
     #[must_use]
-    pub fn size(&self) -> u64 {
+    pub const fn size(&self) -> u64 {
         self.size
     }
     /// Sets the Unix permission bits.
-    pub fn set_mode(&mut self, mode: u64) {
+    pub const fn set_mode(&mut self, mode: u64) {
         self.entry.mode = mode;
     }
     /// Sets the user ID recorded in the archive.
-    pub fn set_uid(&mut self, uid: u64) {
+    pub const fn set_uid(&mut self, uid: u64) {
         self.entry.uid = uid;
     }
     /// Sets the group ID recorded in the archive.
-    pub fn set_gid(&mut self, gid: u64) {
+    pub const fn set_gid(&mut self, gid: u64) {
         self.entry.gid = gid;
     }
     /// Sets modification time as signed nanoseconds since the Unix epoch.
-    pub fn set_mtime_ns(&mut self, timestamp: i64) {
+    pub const fn set_mtime_ns(&mut self, timestamp: i64) {
         self.entry.mtime_ns = timestamp;
     }
     /// Replaces the entry's `x-*` CBOR extension values.
@@ -151,6 +151,10 @@ pub struct Builder<W> {
     writer: Option<BlockingBuilder<Sink>>,
     worker: Option<tokio::task::JoinHandle<Option<BlockingBuilder<Sink>>>>,
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 // Completion sends the error once through the output stream. No worker waits
 // for the next append: codec state returns to the async owner between jobs.
 fn complete(
@@ -308,11 +312,23 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         operation.complete = true;
         Ok(())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Appends a regular file from a byte slice with default metadata.
     pub async fn append_bytes(&mut self, path: impl Into<String>, bytes: &[u8]) -> Result<()> {
         self.append_data(Header::file(path, bytes.len() as u64), bytes)
             .await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     /// Appends a regular file using its header and an exact-size input.
     ///
     /// Reads through EOF to detect inputs shorter or longer than [`Header::size`].
@@ -394,6 +410,10 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         operation.complete = result.is_ok();
         result
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Appends metadata for a directory, symlink or empty regular file.
     pub async fn append_header(&mut self, header: Header) -> Result<()> {
         if header.size != 0 {
@@ -402,10 +422,18 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         }
         self.append(header.entry).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Appends a directory with default metadata.
     pub async fn append_dir(&mut self, path: impl Into<String>) -> Result<()> {
         self.append(Header::directory(path).entry).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Appends a symlink with default metadata and an exact target string.
     pub async fn append_symlink(
         &mut self,
@@ -414,6 +442,10 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
     ) -> Result<()> {
         self.append(Header::symlink(path, target).entry).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Appends file metadata that references already encoded external objects.
     pub async fn append_external(&mut self, entry: Entry) -> Result<()> {
         if !entry.is_external() {
@@ -422,6 +454,14 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         }
         self.append(entry).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     /// Writes the manifest and footer, flushes, and returns the output sink.
     ///
     /// Rejects duplicate paths and missing ancestor directories. Does not shut

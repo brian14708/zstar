@@ -36,7 +36,7 @@ enum ContentKey {
     Object([u8; 32]),
 }
 impl ContentKey {
-    fn of(extent: &Extent) -> Self {
+    const fn of(extent: &Extent) -> Self {
         match extent.source {
             Source::Archive(at) => Self::Archive(at, extent.encoded_size),
             Source::Object(hash) => Self::Object(hash),
@@ -172,6 +172,7 @@ fn load_content<R: RangeReader>(
 }
 
 /// A bounded logical file stream. Complete selected frames/objects are decoded
+///
 /// and validated before any bytes from them are returned. Only external objects
 /// require SHA-256 verification; a zero-length read performs no content I/O.
 pub struct ContentReader<'a, R: RangeReader> {
@@ -186,6 +187,10 @@ pub struct ContentReader<'a, R: RangeReader> {
     failed: bool,
 }
 impl<R: RangeReader> ContentReader<'_, R> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     fn read_content(&mut self, buffer: &mut [u8]) -> Result<usize> {
         if self.failed {
             return Err(Error::Unsupported("content reader failed"));
@@ -267,11 +272,11 @@ pub struct BlockingBuilder<W: Write> {
 }
 impl<W: Write> BlockingBuilder<W> {
     #[cfg(feature = "async")]
-    pub(crate) fn output(&self) -> &W {
+    pub(crate) const fn output(&self) -> &W {
         &self.output
     }
     pub fn new(output: W) -> Result<Self> {
-        Self::with_options(output, 1 << 20, 3, Default::default())
+        Self::with_options(output, 1 << 20, 3, ManifestOptions::default())
     }
     pub fn with_options(
         output: W,
@@ -467,6 +472,14 @@ impl<W: Write> BlockingBuilder<W> {
         self.failed = result.is_err();
         result
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     fn add(&mut self, entry: Entry, size: u64, mut payload: Option<&mut dyn Read>) -> Result<()> {
         // Archive positions are resolved after compression; validate caller metadata separately.
         entry.validate(u64::MAX)?;
@@ -728,7 +741,7 @@ impl<R: RangeReader> BlockingArchive<R> {
         };
     }
     /// Charged retained bytes; selected frames held by streams are additional.
-    pub fn content_cache_bytes(&self) -> usize {
+    pub const fn content_cache_bytes(&self) -> usize {
         self.content_cache.bytes
     }
     pub fn entry(&mut self, path: &str) -> Result<Option<Entry>> {
@@ -766,6 +779,10 @@ impl<R: RangeReader> BlockingArchive<R> {
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     pub fn read(
         &mut self,
         path: &str,
@@ -871,6 +888,22 @@ impl<R: RangeReader> BlockingArchive<R> {
     ) -> Result<()> {
         self.visit_payloads_with_report(visitor).map(|_| ())
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
+    #[expect(
+        clippy::suspicious_operation_groupings,
+        reason = "The parsed tar link target corresponds to the manifest linkname field."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     pub(crate) fn visit_payloads_with_report(
         &mut self,
         mut visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
@@ -1117,6 +1150,14 @@ pub(crate) fn decode_object(encoded: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
 /// Determine one frame's boundary without assuming a content-size field exists.
 pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Result<Vec<u8>> {
     // Fetch a bounded read-ahead window once; block headers are scanned in memory.
@@ -1238,13 +1279,14 @@ mod tests {
             .unwrap();
         let bytes = writer.finish().unwrap();
         let reader =
-            BlockingArchive::open(crate::SliceReader::new(&bytes), Default::default()).unwrap();
+            BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
+                .unwrap();
         assert_eq!(reader.manifest().root().extensions, extensions);
     }
     #[test]
     fn shared_and_split_frames_without_a_frame_table() {
         let mut writer =
-            BlockingBuilder::with_options(Vec::new(), 2048, 3, Default::default()).unwrap();
+            BlockingBuilder::with_options(Vec::new(), 2048, 3, ManifestOptions::default()).unwrap();
         writer
             .add_file(Entry::file("a"), 5, &mut b"hello".as_slice())
             .unwrap();
@@ -1257,7 +1299,8 @@ mod tests {
             .unwrap();
         let bytes = writer.finish().unwrap();
         let mut reader =
-            BlockingArchive::open(crate::SliceReader::new(&bytes), Default::default()).unwrap();
+            BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
+                .unwrap();
         assert_eq!(reader.read("a", 1, 3, None, true).unwrap(), b"ell");
         assert_eq!(reader.read("b", 0, 5, None, true).unwrap(), b"world");
         assert_eq!(reader.read("c", 0, 10_000, None, true).unwrap(), large);
@@ -1294,6 +1337,10 @@ mod tests {
             Err(Error::MissingEntry(_))
         ));
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
     #[test]
     fn file_stream_reuses_adjacent_objects_and_failure_cannot_skip_an_extent() {
         let bytes = include_bytes!("../../../testdata/entry-manifest/thin.zstar");
@@ -1308,7 +1355,8 @@ mod tests {
             }
         }
         let mut reader =
-            BlockingArchive::open(crate::SliceReader::new(bytes), Default::default()).unwrap();
+            BlockingArchive::open(crate::SliceReader::new(bytes), ManifestOptions::default())
+                .unwrap();
         reader.validate().unwrap();
         let mut objects = Objects {
             encoded: crate::encode_frame(b"hello\nworld\n", 3).unwrap(),
@@ -1364,28 +1412,38 @@ mod tests {
                 .set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))
                 .unwrap();
             let mut encoded = compressor.compress(&tar).unwrap();
-            let mut manifest =
-                ManifestEncoder::new(Vec::new(), encoded.len() as u64, 3, Default::default());
+            let mut manifest = ManifestEncoder::new(
+                Vec::new(),
+                encoded.len() as u64,
+                3,
+                ManifestOptions::default(),
+            );
             for path in ["a", "b"] {
                 manifest.add_entry(Entry::file(path)).unwrap();
             }
-            let (metadata, _) = manifest.finish(vec![], Default::default()).unwrap();
+            let (metadata, _) = manifest.finish(vec![], BTreeMap::default()).unwrap();
             encoded.extend(metadata);
             encoded
         }
         for paths in [["a", "b"], ["b", "a"]] {
             let bytes = archive(&paths);
             let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&bytes), Default::default()).unwrap();
+                BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
+                    .unwrap();
             reader.validate().unwrap();
         }
         for paths in [&["a"][..], &["a", "a"], &["b", "b"], &["a", "b", "c"]] {
             let bytes = archive(paths);
             let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&bytes), Default::default()).unwrap();
+                BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
+                    .unwrap();
             assert!(reader.validate().is_err(), "accepted {paths:?}");
         }
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
     #[test]
     fn external_hint_can_be_stale_and_only_objects_are_hashed() {
         let raw = b"some shared object";
@@ -1409,7 +1467,8 @@ mod tests {
         writer.add_metadata(entry.clone()).unwrap();
         let bytes = writer.finish().unwrap();
         let mut reader =
-            BlockingArchive::open(crate::SliceReader::new(&bytes), Default::default()).unwrap();
+            BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
+                .unwrap();
         assert_eq!(
             reader
                 .read("external", 0, 6, Some(&mut Objects(encoded)), true)
@@ -1426,10 +1485,11 @@ mod tests {
     #[test]
     fn parallel_frames_preserve_serial_bytes() {
         fn encode(workers: usize) -> Vec<u8> {
-            let mut writer = BlockingBuilder::with_options(Vec::new(), 2048, 3, Default::default())
-                .unwrap()
-                .with_workers(workers)
-                .unwrap();
+            let mut writer =
+                BlockingBuilder::with_options(Vec::new(), 2048, 3, ManifestOptions::default())
+                    .unwrap()
+                    .with_workers(workers)
+                    .unwrap();
             let bytes = vec![13; 20_000];
             for path in ["a", "b", "c"] {
                 writer
@@ -1442,7 +1502,7 @@ mod tests {
         for workers in [1, 2, 4] {
             assert_eq!(encode(workers), serial);
             let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&serial), Default::default())
+                BlockingArchive::open(crate::SliceReader::new(&serial), ManifestOptions::default())
                     .unwrap();
             reader.validate().unwrap();
         }
@@ -1456,17 +1516,25 @@ mod tests {
         fn len(&self) -> u64 {
             self.bytes.len() as u64
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+        )]
         fn read_range(&mut self, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
             self.requests += 1;
             let end = (range.end as usize).min(self.bytes.len());
             Ok(self.bytes[range.start as usize..end].to_vec())
         }
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     #[test]
     fn fetch_frame_uses_constant_requests_per_frame() {
         // Incompressible data forces many blocks of up to 128 KiB.
         let mut data = vec![0_u8; 3 << 20];
-        let mut x = 0x9e3779b97f4a7c15_u64;
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
         for b in &mut data {
             x ^= x << 13;
             x ^= x >> 7;

@@ -19,7 +19,7 @@ pub struct SpoolBudget {
 }
 impl SpoolBudget {
     #[must_use]
-    pub fn new(limit: u64) -> Self {
+    pub const fn new(limit: u64) -> Self {
         Self {
             limit,
             used: AtomicU64::new(0),
@@ -30,7 +30,7 @@ impl SpoolBudget {
         self.used.load(Ordering::Acquire)
     }
     #[must_use]
-    pub fn limit(&self) -> u64 {
+    pub const fn limit(&self) -> u64 {
         self.limit
     }
     fn reserve(&self, size: u64) -> Result<()> {
@@ -102,6 +102,10 @@ impl Spool {
             charged: 0,
         }
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn with_store(options: ManifestOptions, store: Box<dyn SpillStore>) -> Result<Self> {
         let mut spool = Self {
             store,
@@ -116,17 +120,21 @@ impl Spool {
         Ok(spool)
     }
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub const fn len(&self) -> u64 {
         self.len
     }
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
     #[must_use]
-    pub fn spilled(&self) -> bool {
+    pub const fn spilled(&self) -> bool {
         self.spilled
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         self.append_parts(bytes, &[])
     }
@@ -182,6 +190,10 @@ impl Spool {
         self.len = end;
         Ok(start)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn read(&mut self, offset: u64, size: u64) -> Result<Vec<u8>> {
         crate::checked_range(offset, size, self.len)?;
         let mut out = vec![0; usize::try_from(size).map_err(|_| Error::Budget("spool range"))?];
@@ -223,9 +235,13 @@ impl Drop for Spool {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 /// Eight-way external merge sort. Both the records and run directory spill;
 /// no vector proportional to the complete input is retained.
-pub(crate) fn sort_records(
+pub fn sort_records(
     mut input: Spool,
     options: ManifestOptions,
     key: fn(&Value) -> Result<String>,

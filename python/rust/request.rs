@@ -24,7 +24,7 @@ use zstar::http::{
 /// `ZstarError`. Best effort: with several concurrent failures the most recent
 /// exception wins.
 #[derive(Default)]
-pub(crate) struct FailureSlot(std::sync::Mutex<Option<PyErr>>);
+pub struct FailureSlot(std::sync::Mutex<Option<PyErr>>);
 impl FailureSlot {
     fn record(&self, error: PyErr) {
         let previous = crate::lock_state(&self.0).replace(error);
@@ -122,7 +122,7 @@ impl RequestProvider for PythonProvider {
                 .filter(|v| !v.is_none())
                 .map(|v| -> PyResult<_> {
                     let seconds = v.extract::<f64>()?;
-                    if !seconds.is_finite() || !(0.0..=604800.0).contains(&seconds) {
+                    if !seconds.is_finite() || !(0.0..=604_800.0).contains(&seconds) {
                         return Err(pyo3::exceptions::PyValueError::new_err("invalid expiry"));
                     }
                     Ok(Instant::now() + Duration::from_secs_f64(seconds))
@@ -197,7 +197,15 @@ pub fn source(
 
 /// Bounded async presigned PUT. The caller supplies the encoded archive/object.
 #[pyfunction]
-#[pyo3(signature=(data,url=None,*,headers=None,provider=None))]
+#[pyo3(
+    signature = (
+        data,
+        url = None,
+        *,
+        headers = None,
+        provider = None,
+    )
+)]
 pub fn put_presigned<'py>(
     py: Python<'py>,
     data: &[u8],

@@ -80,7 +80,8 @@ impl ObjectStore for TestStore {
                         GetResultPayload::Stream(Box::pin(stream::iter([Ok(Bytes::new())])));
                 }
                 Some(Response::Oversized) => {
-                    let bytes = Bytes::from(vec![0; result.meta.size as usize + 1]);
+                    let bytes =
+                        Bytes::from(vec![0; usize::try_from(result.meta.size).unwrap() + 1]);
                     result.payload = GetResultPayload::Stream(Box::pin(stream::iter([Ok(bytes)])));
                 }
                 Some(Response::BackendError) => {
@@ -252,7 +253,7 @@ async fn blob_put_skips_upload_when_content_addressed_object_exists() {
     assert_eq!(second.source, first.source);
     assert_eq!(second.size, first.size);
     let after = store.head(&path).await.unwrap();
-    assert_eq!(after.size as usize, alt.len());
+    assert_eq!(after.size, alt.len() as u64);
     assert_eq!(second.encoded_size, after.size);
     // A missing object is still uploaded.
     let other = blobs.put(Bytes::from_static(b"other")).await.unwrap();

@@ -3,11 +3,11 @@ use pyo3::prelude::*;
 use std::sync::Arc;
 use zstar::ReaderOptions;
 
-pub(crate) type Reader = zstar::Archive<dyn zstar::AsyncRangeReader>;
+pub type Reader = zstar::Archive<dyn zstar::AsyncRangeReader>;
 
 /// Owned metadata/active chunk only: the archive lease is supplied per read.
 #[pyclass(module = "zstar._native", frozen)]
-pub(crate) struct MemberCursor {
+pub struct MemberCursor {
     pub(crate) inner: Arc<tokio::sync::Mutex<zstar::FileCursor>>,
 }
 impl MemberCursor {
@@ -19,7 +19,7 @@ impl MemberCursor {
     }
 }
 
-pub(crate) async fn open_reader(
+pub async fn open_reader(
     source: Arc<dyn zstar::AsyncRangeReader>,
     options: ReaderOptions,
     shared_cache: Option<zstar::SharedDecodedCache>,
@@ -34,8 +34,11 @@ pub(crate) async fn open_reader(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // Shared Python constructor keyword options.
-pub(crate) fn reader_options(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shared Python constructor keyword options."
+)]
+pub fn reader_options(
     py: Python<'_>,
     cache_bytes: usize,
     concurrent_chunks: usize,

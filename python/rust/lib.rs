@@ -211,6 +211,10 @@ fn local_source_error(error: zstar::Error) -> PyErr {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 fn core_error(error: zstar::Error) -> PyErr {
     if let zstar::Error::MissingEntry(path) = &error {
         return pyo3::exceptions::PyKeyError::new_err(path.clone());
@@ -245,6 +249,10 @@ async fn read_length(
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 fn filesystem_error(error: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     // Streaming body readers preserve format errors inside std::io::Error.
     // Inspect those payloads as well as ordinary source chains before falling
@@ -310,6 +318,10 @@ fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo3::t
     Ok(result.unbind())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 fn verification_dict(
     py: Python<'_>,
     report: zstar::VerificationReport,
@@ -460,6 +472,10 @@ fn resolve_encoded(
 struct PythonResolver(Arc<Py<PyAny>>);
 #[async_trait::async_trait]
 impl zstar::ObjectResolver for PythonResolver {
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
     async fn get_encoded(
         &self,
         digest: [u8; 32],
@@ -597,7 +613,11 @@ impl IndexedArchive {
     fn entry_count(&self) -> PyResult<u64> {
         Ok(self.reader()?.reader.entry_count())
     }
-    #[pyo3(signature=(prefix=None))]
+    #[pyo3(
+        signature = (
+            prefix = None,
+        )
+    )]
     fn iter_entries(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<IndexedEntries> {
         slf.reader()?;
         Ok(IndexedEntries {
@@ -610,7 +630,12 @@ impl IndexedArchive {
             }),
         })
     }
-    #[pyo3(signature=(*,external=false))]
+    #[pyo3(
+        signature = (
+            *,
+            external = false,
+        )
+    )]
     fn verify(&self, py: Python<'_>, external: bool) -> PyResult<Py<pyo3::types::PyDict>> {
         let reader = self.reader()?;
         let scope = if external {
@@ -628,8 +653,30 @@ impl IndexedArchive {
 
     /// Open an immutable encoded byte snapshot.
     #[staticmethod]
-    #[pyo3(signature=(data,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            data,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_bytes(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
@@ -678,8 +725,31 @@ impl IndexedArchive {
 
     /// Open a strong-ETag-pinned HTTP archive.
     #[staticmethod]
-    #[pyo3(signature=(url,*,headers=None,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            url,
+            *,
+            headers = None,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_url(
         py: Python<'_>,
         url: String,
@@ -735,8 +805,38 @@ impl IndexedArchive {
 
     /// Open an immutable native S3 archive.
     #[staticmethod]
-    #[pyo3(signature=(bucket,key,*,endpoint=None,region=None,object_prefix=None,anon=None,access_key_id=None,secret_access_key=None,session_token=None,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            bucket,
+            key,
+            *,
+            endpoint = None,
+            region = None,
+            object_prefix = None,
+            anon = None,
+            access_key_id = None,
+            secret_access_key = None,
+            session_token = None,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_s3(
         py: Python<'_>,
         bucket: String,
@@ -803,8 +903,30 @@ impl IndexedArchive {
 
     /// Open a local archive using native positional reads.
     #[staticmethod]
-    #[pyo3(signature=(path,*,cache_bytes=16<<20,concurrent_chunks=8,verify_external=true,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            path,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            verify_external = true,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
@@ -853,8 +975,31 @@ impl IndexedArchive {
     }
 
     #[new]
-    #[pyo3(signature=(source,size,*,cache_bytes=16<<20,concurrent_chunks=8,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,verify_external=true,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None,resolver=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            source,
+            size,
+            *,
+            cache_bytes = 16 << 20,
+            concurrent_chunks = 8,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            verify_external = true,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+            resolver = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn new(
         py: Python<'_>,
         source: Py<PyAny>,
@@ -921,7 +1066,15 @@ impl IndexedArchive {
         })
         .map_err(core_error)
     }
-    #[pyo3(signature=(path,offset,length,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            path,
+            offset,
+            length,
+            *,
+            resolver = None,
+        )
+    )]
     fn read_with_report(
         &self,
         py: Python<'_>,
@@ -957,7 +1110,13 @@ impl IndexedArchive {
             report_dict(py, report)?,
         ))
     }
-    #[pyo3(signature=(requests,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            requests,
+            *,
+            resolver = None,
+        )
+    )]
     fn read_many(
         &self,
         py: Python<'_>,
@@ -1031,7 +1190,15 @@ impl IndexedArchive {
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(path.to_owned()))?;
         entry_info(py, &entry)
     }
-    #[pyo3(signature=(path,offset=0,length=None,*,resolver=None))]
+    #[pyo3(
+        signature = (
+            path,
+            offset = 0,
+            length = None,
+            *,
+            resolver = None,
+        )
+    )]
     fn read(
         &self,
         py: Python<'_>,
@@ -1106,9 +1273,13 @@ struct IndexedEntries {
 }
 #[pymethods]
 impl IndexedEntries {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    const fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let reader = self.archive.get().reader()?;
         // Wait for the cursor and do all blocking work detached from Python;
@@ -1167,6 +1338,10 @@ fn entry_info(py: Python<'_>, entry: &zstar::manifest::Entry) -> PyResult<Py<pyo
     Ok(info.unbind())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 /// Decode one independent external Zstandard object under the format limit.
 #[pyfunction]
 fn decode_object(
@@ -1187,7 +1362,16 @@ fn decode_object(
 
 /// Externalize one file and call a Python function for each encoded object.
 #[pyfunction]
-#[pyo3(signature=(fileobj,size,callback,*,chunking,compression_level=3))]
+#[pyo3(
+    signature = (
+        fileobj,
+        size,
+        callback,
+        *,
+        chunking,
+        compression_level = 3,
+    )
+)]
 fn _externalize(
     py: Python<'_>,
     fileobj: Py<PyAny>,
@@ -1199,6 +1383,10 @@ fn _externalize(
     pack::externalize_callback(py, fileobj, size, callback, chunking, compression_level)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
 fn pack_file(py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<Py<pyo3::types::PyBytes>> {
     let bytes = py
@@ -1214,7 +1402,7 @@ fn pack_file(py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<Py<pyo3::typ
                     mtime_ns: 0,
                     extents: vec![],
                     linkname: None,
-                    attributes: Default::default(),
+                    attributes: std::collections::BTreeMap::default(),
                 },
                 data.len() as u64,
                 &mut data.as_slice(),
@@ -1225,8 +1413,18 @@ fn pack_file(py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<Py<pyo3::typ
     Ok(pyo3::types::PyBytes::new(py, &bytes).unbind())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
-#[pyo3(signature=(path,*,preserve_metadata=false))]
+#[pyo3(
+    signature = (
+        path,
+        *,
+        preserve_metadata = false,
+    )
+)]
 fn pack_directory(
     py: Python<'_>,
     path: std::path::PathBuf,
@@ -1248,8 +1446,21 @@ fn pack_directory(
         .map_err(filesystem_error)?;
     Ok(pyo3::types::PyBytes::new(py, &bytes).unbind())
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
-#[pyo3(signature=(data,destination,*,objects=None,allow_special_bits=false,verify_external=true))]
+#[pyo3(
+    signature = (
+        data,
+        destination,
+        *,
+        objects = None,
+        allow_special_bits = false,
+        verify_external = true,
+    )
+)]
 fn extract(
     py: Python<'_>,
     data: Vec<u8>,
@@ -1261,7 +1472,7 @@ fn extract(
     py.detach(|| -> zstar::fs::AnyResult<()> {
         let mut archive = zstar::backend::BlockingArchive::open(
             zstar::SliceReader::new(&data),
-            Default::default(),
+            zstar::ManifestOptions::default(),
         )?;
         let objects = objects
             .as_deref()
@@ -1280,8 +1491,19 @@ fn extract(
     })
     .map_err(filesystem_error)
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 #[pyfunction]
-#[pyo3(signature=(data,*,objects=None,verify_external=true))]
+#[pyo3(
+    signature = (
+        data,
+        *,
+        objects = None,
+        verify_external = true,
+    )
+)]
 fn materialize(
     py: Python<'_>,
     data: Vec<u8>,
@@ -1292,7 +1514,7 @@ fn materialize(
         .detach(|| -> zstar::fs::AnyResult<Vec<u8>> {
             let mut archive = zstar::backend::BlockingArchive::open(
                 zstar::SliceReader::new(&data),
-                Default::default(),
+                zstar::ManifestOptions::default(),
             )?;
             let objects = objects
                 .as_deref()
@@ -1304,7 +1526,7 @@ fn materialize(
                 &mut output,
                 objects,
                 verify_external,
-                Default::default(),
+                zstar::fs::PackOptions::default(),
             )?;
             Ok(output)
         })

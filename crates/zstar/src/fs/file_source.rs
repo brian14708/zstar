@@ -5,6 +5,7 @@ use std::{fs::File, io, ops::Range, path::Path};
 const DEFAULT_MAX_RANGE: usize = 64 << 20;
 
 /// Open-handle local archive source. Replacing the path does not retarget it.
+///
 /// Callers keep file contents immutable for the lifetime of an indexed reader
 /// and its cached values. Content digests are checked by the reader, not here.
 pub struct LocalFileSource {
@@ -13,9 +14,17 @@ pub struct LocalFileSource {
     max_range_bytes: usize,
 }
 impl LocalFileSource {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_file(File::open(path)?)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn from_file(file: File) -> Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -27,6 +36,10 @@ impl LocalFileSource {
             max_range_bytes: DEFAULT_MAX_RANGE,
         })
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Set a per-range allocation limit before placing the source in a reader.
     /// The default is 64 MiB; larger permitted TOCs may need a larger limit.
     pub fn with_max_range_bytes(mut self, limit: usize) -> Result<Self> {
@@ -37,11 +50,11 @@ impl LocalFileSource {
         Ok(self)
     }
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub const fn len(&self) -> u64 {
         self.size
     }
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.size == 0
     }
     fn range_len(&self, range: &Range<u64>) -> Result<usize> {
@@ -53,6 +66,10 @@ impl LocalFileSource {
         }
         Ok(count)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Exact positional read. Truncation/short reads fail instead of returning
     /// partial data. No cursor lock is needed for concurrent distinct ranges.
     pub fn read_range(&self, range: Range<u64>) -> Result<Vec<u8>> {
@@ -112,6 +129,7 @@ mod asynchronous {
     use tokio::sync::Semaphore;
 
     /// Bounded blocking positional reads, safe for cold files on async runtimes.
+    ///
     /// Cancellation while waiting for a slot starts no I/O. Once submitted,
     /// blocking work retains its permit and buffers until completion, even if
     /// the awaiting future is dropped. Clones share the concurrency bound.
@@ -121,6 +139,10 @@ mod asynchronous {
         slots: Arc<Semaphore>,
     }
     impl AsyncLocalFileSource {
+        #[expect(
+            clippy::missing_errors_doc,
+            reason = "Errors follow the documented operation contract and crate error types."
+        )]
         /// Open file/metadata off the runtime thread, with eight read slots.
         pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
             let path = path.as_ref().to_path_buf();
@@ -129,6 +151,10 @@ mod asynchronous {
                 .map_err(join_error)??;
             Self::new(source, 8)
         }
+        #[expect(
+            clippy::missing_errors_doc,
+            reason = "Errors follow the documented operation contract and crate error types."
+        )]
         /// Configure an existing source; concurrency must be in 1..=1024.
         pub fn new(source: LocalFileSource, concurrency: usize) -> Result<Self> {
             if !(1..=1024).contains(&concurrency) {
@@ -188,8 +214,13 @@ mod asynchronous {
         async fn indexed_reads_are_exact_concurrent_and_verified() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("archive");
-            let mut writer =
-                BlockingBuilder::with_options(Vec::new(), 1024, 3, Default::default()).unwrap();
+            let mut writer = BlockingBuilder::with_options(
+                Vec::new(),
+                1024,
+                3,
+                crate::ManifestOptions::default(),
+            )
+            .unwrap();
             writer
                 .add_file(Entry::file("a"), 16_384, &mut vec![7; 16_384].as_slice())
                 .unwrap();
@@ -273,6 +304,10 @@ pub use asynchronous::AsyncLocalFileSource;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "The branch or bounded fixture establishes a nonnegative value."
+    )]
     #[test]
     fn exact_ranges_budgets_truncation_and_independent_offsets() {
         let file = tempfile::NamedTempFile::new().unwrap();

@@ -159,6 +159,10 @@ mod asynchronous {
         async fn size(&self) -> Result<u64> {
             Ok(self.0.len() as u64)
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+        )]
         async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
             Ok(self.0.slice(range.start as usize..range.end as usize))
         }

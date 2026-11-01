@@ -36,6 +36,14 @@ impl CaptureSpool {
             encoded: Vec::new(),
         }
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     pub fn add(&mut self, entry: Entry, payload_size: u64) -> Result<()> {
         entry.validate(u64::MAX)?;
         if !entry.extents.is_empty()
@@ -51,6 +59,10 @@ impl CaptureSpool {
         crate::cbor::append_head(&mut self.encoded, 0, payload_size);
         self.records.append_encoded_record(&self.encoded)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn sorted(self) -> Result<CapturedEntries> {
         Ok(CapturedEntries {
             records: sort_records(self.records, self.options, key)?,
@@ -106,7 +118,7 @@ mod tests {
     use crate::manifest::EntryKind;
     #[test]
     fn typed_capture_records_preserve_canonical_bytes_and_optional_metadata() {
-        let mut spool = CaptureSpool::new(Default::default());
+        let mut spool = CaptureSpool::new(ManifestOptions::default());
         let mut at = 0;
         for (kind, size) in [
             (EntryKind::File, u64::MAX),
@@ -166,7 +178,7 @@ mod tests {
                 mtime_ns: 0,
                 extents: vec![],
                 linkname: None,
-                attributes: Default::default(),
+                attributes: std::collections::BTreeMap::default(),
             };
             spool.add(entry, index).unwrap();
             expected.push((path, index));
@@ -185,7 +197,7 @@ mod tests {
     }
     #[test]
     fn corrupt_last_capture_record_errors_instead_of_ending_iteration() {
-        let mut spool = CaptureSpool::new(Default::default());
+        let mut spool = CaptureSpool::new(ManifestOptions::default());
         spool
             .records
             .append_record(&Value::Text("bad record".into()))

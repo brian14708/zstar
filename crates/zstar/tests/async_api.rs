@@ -22,7 +22,7 @@ fn payload() -> Vec<u8> {
     let mut state = 7_u32;
     (0..8193)
         .map(|_| {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (state >> 24) as u8
         })
         .collect()
@@ -206,6 +206,10 @@ async fn enumeration_is_lazy_and_file_retains_its_active_chunk_without_cache() {
     assert_eq!(archive.cache_len_bytes(), 0);
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[tokio::test]
 async fn verify_finds_corruption_outside_a_selected_read() {
     let mut builder = Builder::with_options(

@@ -136,12 +136,12 @@ pub struct ReadReport {
     pub external_objects_unchecked: Vec<[u8; 32]>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Key {
+pub enum Key {
     Archive(u64, u64),
     Object([u8; 32]),
 }
 impl Key {
-    pub(crate) fn of(extent: &Extent) -> Self {
+    pub(crate) const fn of(extent: &Extent) -> Self {
         match extent.source {
             crate::manifest::Source::Archive(at) => Self::Archive(at, extent.encoded_size),
             crate::manifest::Source::Object(hash) => Self::Object(hash),
@@ -188,7 +188,7 @@ struct Cleanup<'a> {
     flight: Option<Arc<Flight>>,
 }
 impl Cleanup<'_> {
-    fn flight(&self) -> &Arc<Flight> {
+    const fn flight(&self) -> &Arc<Flight> {
         self.flight.as_ref().unwrap()
     }
 }
@@ -229,6 +229,10 @@ struct MetadataSource<'a, R: AsyncRangeReader + ?Sized> {
     buffer: Bytes,
 }
 impl<R: AsyncRangeReader + ?Sized> MetadataSource<'_, R> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     async fn read(&mut self, range: Range<u64>) -> Result<Bytes> {
         crate::checked_range(range.start, range.end - range.start, self.end)?;
         if range.start >= self.start && range.end - self.start <= self.buffer.len() as u64 {
@@ -309,6 +313,10 @@ pub struct Archive<R: AsyncRangeReader + ?Sized> {
     shared_cache: Option<SharedDecodedCache>,
 }
 impl Archive<Bytes> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Opens in-memory archive bytes with default [`ReaderOptions`].
     pub async fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self> {
         Self::open(Arc::new(bytes.into())).await
@@ -331,6 +339,10 @@ impl<R: AsyncRangeReader + ?Sized> Clone for Archive<R> {
     }
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Opens an immutable source with default [`ReaderOptions`].
     pub async fn open(source: Arc<R>) -> Result<Self> {
         Self::open_with_options(source, ReaderOptions::default()).await
@@ -345,7 +357,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     }
     /// Maximum bytes returned by a single allocating read operation.
     #[must_use]
-    pub fn max_read_bytes(&self) -> u64 {
+    pub const fn max_read_bytes(&self) -> u64 {
         self.options.manifest.max_read_bytes
     }
     /// Returns the archive-level extension values.
@@ -353,6 +365,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub fn root_extensions(&self) -> &crate::Extensions {
         &self.manifest.root().extensions
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads an entire regular file within the configured returned-read budget.
     ///
     /// Use [`Self::open_file`] to stream files larger than that budget.
@@ -363,6 +379,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
         self.read_range(path, 0..entry.size()?).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads a half-open byte range from a regular file.
     ///
     /// Returns an error for a missing entry, an invalid range, or an exceeded budget.
@@ -371,6 +391,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         self.read_range_with_resolver(path, range.start, length, self.resolver())
             .await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads an entire file and reports the integrity checks completed.
     pub async fn read_with_report(&self, path: &str) -> Result<(Bytes, ReadReport)> {
         let entry = self
@@ -379,6 +403,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
         self.read_range_with_report(path, 0..entry.size()?).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads a half-open file range and reports the integrity checks completed.
     pub async fn read_range_with_report(
         &self,
@@ -389,6 +417,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         self.read_range_with_report_and_resolver(path, range.start, length, self.resolver())
             .await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Opens an owned regular-file handle implementing Tokio async I/O traits.
     ///
     /// Returns an error if the path is missing or identifies a directory or symlink.
@@ -402,6 +434,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         }
         self.file(entry).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Opens a reusable cursor without retaining this archive's ownership.
     pub async fn open_cursor(&self, path: &str) -> Result<crate::FileCursor> {
         let entry = self
@@ -453,6 +489,18 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         })
         .fuse()
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     /// Verifies the complete physical archive and the requested external scope.
     ///
     /// Cancellation drops pending transport futures; worker permits remain held
@@ -532,6 +580,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         Ok(report)
     }
 
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Opens and authenticates an immutable source using the supplied policies.
     pub async fn open_with_options(source: Arc<R>, options: ReaderOptions) -> Result<Self> {
         if !(1..=1024).contains(&options.concurrent_chunks) {
@@ -660,6 +712,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     fn cached_entry(&self, path: &str) -> EntryLookup {
         self.manifest.entry_cached(path)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Returns owned metadata, or `None` if the path is absent.
     pub async fn entry(&self, path: &str) -> Result<Option<Entry>> {
         if let EntryLookup::Ready(entry) = self.cached_entry(path) {
@@ -668,24 +724,40 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let path = path.to_owned();
         self.metadata(move |manifest| manifest.entry(&path)).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Collects all owned entry metadata into a vector.
     ///
     /// Use [`Self::entries`] to enumerate without allocating a second complete list.
     pub async fn collect_entries(&self) -> Result<Vec<Entry>> {
         self.metadata(ManifestReader::collect_entries).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Creates a cursor for bounded metadata batches.
     ///
     /// Prefer [`Self::entries`] for ordinary enumeration.
     pub async fn cursor(&self) -> Result<EntryCursor> {
         self.metadata(|manifest| Ok(manifest.cursor())).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Creates a bounded cursor over paths beginning with `prefix`.
     pub async fn cursor_prefix(&self, prefix: &str) -> Result<EntryCursor> {
         let prefix = prefix.to_owned();
         self.metadata(move |manifest| Ok(manifest.cursor_prefix(&prefix)))
             .await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Returns the advanced cursor with at most `limit` owned entries.
     pub async fn next_entries(
         &self,
@@ -711,6 +783,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub async fn validate_metadata(&self) -> Result<()> {
         self.metadata(ManifestReader::validate_metadata).await
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Returns a symlink target verbatim, without resolving or following it.
     pub async fn read_link(&self, path: &str) -> Result<String> {
         self.entry(path)
@@ -719,6 +795,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
     }
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     /// Returns charged bytes retained by this archive's decoded cache.
     #[must_use]
     pub fn cache_len_bytes(&self) -> usize {
@@ -735,6 +815,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     ) -> Result<Bytes> {
         self.content_prefetched(key, hint, resolver, None).await
     }
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
     async fn content_prefetched(
         &self,
         key: &Key,
@@ -751,15 +835,8 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 .await?
                 .into_bytes());
         }
-        if let Some(raw) = self
-            .cache
-            .lock()
-            .unwrap()
-            .entries
-            .get(key)
-            .cloned()
-            .filter(|_| self.cache_allowed(key, resolver))
-        {
+        let cached = self.cache.lock().unwrap().entries.get(key).cloned();
+        if let Some(raw) = cached.filter(|_| self.cache_allowed(key, resolver)) {
             return Ok(raw.into_bytes());
         }
         let flight = {
@@ -783,21 +860,15 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         };
         let flight = cleanup.flight();
         let _guard = flight.gate.lock().await;
-        if let Some(raw) = flight.value.lock().unwrap().clone() {
+        let cached = flight.value.lock().unwrap().clone();
+        if let Some(raw) = cached {
             return Ok(raw.into_bytes());
         }
         if let Some(error) = flight.failure.lock().unwrap().as_ref() {
             return Err(error.duplicate());
         }
-        if let Some(raw) = self
-            .cache
-            .lock()
-            .unwrap()
-            .entries
-            .get(key)
-            .cloned()
-            .filter(|_| self.cache_allowed(key, resolver))
-        {
+        let cached = self.cache.lock().unwrap().entries.get(key).cloned();
+        if let Some(raw) = cached.filter(|_| self.cache_allowed(key, resolver)) {
             return Ok(raw.into_bytes());
         }
         let raw = match self.load_content(key, hint, resolver, encoded).await {
@@ -987,6 +1058,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .await?;
         Ok((outputs.pop().unwrap(), report))
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads file ranges in request order, sharing loads of common content.
     pub async fn read_many(&self, requests: &[ReadRequest<'_>]) -> Result<Vec<Bytes>> {
         self.read_many_with_resolver(requests, self.options.resolver.as_deref())
@@ -1095,6 +1170,14 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         }
         Ok(outputs.into_iter().map(BytesMut::freeze).collect())
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     async fn prefetch_window(
         &self,
         window: &[(Key, Group)],
@@ -1209,6 +1292,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         Ok(output)
     }
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 fn build_plan<'a, 'm>(
     requests: impl Iterator<Item = (&'a str, u64, u64)>,
     budget: u64,
@@ -1302,7 +1389,7 @@ mod tests {
 
     fn fixture() -> Vec<u8> {
         let mut writer =
-            BlockingBuilder::with_options(Vec::new(), 2048, 3, Default::default()).unwrap();
+            BlockingBuilder::with_options(Vec::new(), 2048, 3, ManifestOptions::default()).unwrap();
         for (path, raw) in [
             ("a", b"hello".to_vec()),
             ("b", b"world".to_vec()),
@@ -1319,7 +1406,7 @@ mod tests {
                         mtime_ns: 0,
                         extents: vec![],
                         linkname: None,
-                        attributes: Default::default(),
+                        attributes: BTreeMap::default(),
                     },
                     raw.len() as u64,
                     &mut raw.as_slice(),
@@ -1366,6 +1453,10 @@ mod tests {
         async fn size(&self) -> Result<u64> {
             Ok(self.bytes.len() as u64)
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+        )]
         async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if range.start < self.data_end {
@@ -1626,11 +1717,19 @@ mod tests {
         ];
         assert!(matches!(reader.read_many(&bad).await, Err(Error::Range)));
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "The branch or bounded fixture establishes a nonnegative value."
+    )]
     #[tokio::test]
     async fn fragmented_range_reads_do_not_wait_for_metadata_workers() {
         let payload: Vec<_> = (0..100_000).map(|i| (i % 251) as u8).collect();
         let mut writer =
-            BlockingBuilder::with_options(Vec::new(), 512, 3, Default::default()).unwrap();
+            BlockingBuilder::with_options(Vec::new(), 512, 3, ManifestOptions::default()).unwrap();
         writer
             .add_file(
                 Entry::file("file"),
@@ -1703,7 +1802,7 @@ mod tests {
         let binding = SharedDecodedCache::new(b"snapshot-one", memory.clone()).unwrap();
         let mut sync = crate::backend::BlockingArchive::open(
             crate::SliceReader::new(&raw),
-            Default::default(),
+            ManifestOptions::default(),
         )
         .unwrap();
         sync.set_shared_decoded_cache(Some(binding.clone()));
@@ -1767,6 +1866,10 @@ mod tests {
         released: (Mutex<bool>, std::sync::Condvar),
     }
     impl crate::DecodedCache for BlockedCache {
+        #[expect(
+            clippy::significant_drop_tightening,
+            reason = "The guard intentionally covers this short state update."
+        )]
         fn get(&self, _: &crate::DecodedCacheKey) -> std::io::Result<Option<crate::CachedChunk>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
@@ -1781,6 +1884,10 @@ mod tests {
             Ok(())
         }
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
     #[tokio::test]
     async fn cancelled_cache_callbacks_keep_their_worker_permit_until_completion() {
         let cache = Arc::new(BlockedCache {
@@ -1972,9 +2079,12 @@ mod tests {
         assert_eq!(reader.cache_len_bytes(), 0);
         let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/metadata-hash.zstar");
         assert!(
-            Archive::open_with_options(Arc::new(Source::new(bytes.to_vec())), Default::default())
-                .await
-                .is_err()
+            Archive::open_with_options(
+                Arc::new(Source::new(bytes.to_vec())),
+                ReaderOptions::default()
+            )
+            .await
+            .is_err()
         );
     }
 

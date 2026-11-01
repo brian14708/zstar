@@ -16,6 +16,10 @@ pub struct Generation {
     pub provenance: crate::Extensions,
 }
 impl Generation {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.archive.validate()?;
         self.catalog.validate()?;
@@ -36,6 +40,10 @@ impl Generation {
         }
         Ok(bytes)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > 64 << 10 {
             return Err(Error::Budget("generation descriptor"));
@@ -87,6 +95,10 @@ impl crate::RangeReader for SpoolBorrow<'_> {
         self.0.read(range.start, range.end - range.start)
     }
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Publish dependencies before the final descriptor. A later failure leaves
 /// completed immutable artifacts orphaned; shared objects are never deleted.
 pub async fn publish_generation<S: PackStore>(

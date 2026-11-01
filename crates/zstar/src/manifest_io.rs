@@ -104,6 +104,14 @@ impl<W: Write> ManifestEncoder<W> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     pub fn add_entry(&mut self, entry: Entry) -> Result<()> {
         self.validate_target()?;
         entry.validate(self.start)?;
@@ -117,6 +125,10 @@ impl<W: Write> ManifestEncoder<W> {
         self.external |= entry.is_external();
         Ok(())
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     fn flush_segment(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -165,6 +177,18 @@ impl<W: Write> ManifestEncoder<W> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "Keep local helpers next to the operation that uses them."
+    )]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     pub fn finish(
         mut self,
         mut required_features: Vec<String>,
@@ -331,10 +355,10 @@ impl ManifestIngest {
             hash: Sha256::new(),
         })
     }
-    pub(crate) fn complete(&self) -> bool {
+    pub(crate) const fn complete(&self) -> bool {
         self.at == self.end
     }
-    pub(crate) fn position(&self) -> u64 {
+    pub(crate) const fn position(&self) -> u64 {
         self.at
     }
     pub(crate) fn header_range(&self) -> Result<std::ops::Range<u64>> {
@@ -449,13 +473,17 @@ impl ManifestIngest {
 impl ManifestReader {
     /// Immutable, authenticated root metadata.
     #[must_use]
-    pub fn root(&self) -> &ManifestRoot {
+    pub const fn root(&self) -> &ManifestRoot {
         &self.root
     }
     /// Borrow immutable entries in path order using standard iterator adapters.
     pub fn iter(&self) -> std::slice::Iter<'_, Entry> {
         self.entries.iter()
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn open<R: RangeReader>(
         source: &mut R,
         footer: &Footer,
@@ -463,6 +491,10 @@ impl ManifestReader {
     ) -> Result<Self> {
         Self::open_with_spool(source, footer, Spool::new(options))
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn open_with_spool<R: RangeReader>(
         source: &mut R,
         footer: &Footer,
@@ -479,7 +511,7 @@ impl ManifestReader {
         ingest.finish()
     }
     #[must_use]
-    pub fn spilled(&self) -> bool {
+    pub const fn spilled(&self) -> bool {
         self.spilled
     }
     /// Retained decoded entries, including owned paths, extents and attributes.
@@ -511,6 +543,10 @@ impl ManifestReader {
             end,
         }
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn next_entry(&self, cursor: &mut EntryCursor) -> Result<Option<Entry>> {
         if !Arc::ptr_eq(&self.cursor_owner, &cursor.owner) {
             return Err(Error::Unsupported("cursor belongs to another manifest"));
@@ -523,6 +559,10 @@ impl ManifestReader {
         }
         Ok(entry)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn entry(&self, path: &str) -> Result<Option<Entry>> {
         if !valid_path(path) {
             return Ok(None);
@@ -561,18 +601,26 @@ impl ManifestReader {
         }
         EntryLookup::Ready(selected.cloned())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn visit_entries(&self, mut visitor: impl FnMut(Entry) -> Result<()>) -> Result<()> {
         for entry in &self.entries {
             visitor(entry.clone())?;
         }
         Ok(())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn collect_entries(&self) -> Result<Vec<Entry>> {
         Ok(self.entries.clone())
     }
     /// Authentication, schema and namespace validation happen before open returns.
     #[doc(hidden)]
-    pub fn validate_metadata(&self) -> Result<()> {
+    pub const fn validate_metadata(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -591,6 +639,10 @@ mod tests {
     use crate::manifest::EntryKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     #[test]
     fn typed_root_preserves_canonical_bytes_across_segments() {
         let extensions: BTreeMap<String, Value> = BTreeMap::from([
@@ -682,6 +734,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::needless_collect,
+        reason = "Spawn all workers before joining; lazy iteration would deadlock the barrier."
+    )]
     #[test]
     fn concurrent_spools_cannot_overbook_shared_storage() {
         let budget = Arc::new(SpoolBudget::new(4));
@@ -1025,7 +1081,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let (metadata, footer) = writer.finish(vec![], Default::default()).unwrap();
+        let (metadata, footer) = writer.finish(vec![], BTreeMap::default()).unwrap();
         let mut archive = vec![0; 1000];
         archive.extend(&metadata);
         let mut source = crate::SliceReader::new(&archive);
@@ -1041,7 +1097,7 @@ mod tests {
         let mut bad = footer;
         bad.toc_sha256[0] ^= 1;
         assert!(matches!(
-            ManifestReader::open(&mut source, &bad, Default::default()),
+            ManifestReader::open(&mut source, &bad, ManifestOptions::default()),
             Err(Error::Integrity)
         ));
     }
@@ -1073,7 +1129,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let (metadata, footer) = writer.finish(vec![], Default::default()).unwrap();
+        let (metadata, footer) = writer.finish(vec![], BTreeMap::default()).unwrap();
         assert!(footer.toc_decoded_len > METADATA_BLOCK_MAX as u64);
         let mut archive = vec![0];
         archive.extend(metadata);
@@ -1104,13 +1160,14 @@ mod tests {
     }
     #[test]
     fn empty_manifest_and_memory_budget() {
-        let (metadata, footer) = ManifestEncoder::new(Vec::new(), 1, 3, Default::default())
-            .finish(vec![], Default::default())
+        let (metadata, footer) = ManifestEncoder::new(Vec::new(), 1, 3, ManifestOptions::default())
+            .finish(vec![], BTreeMap::default())
             .unwrap();
         let mut archive = vec![0];
         archive.extend(metadata);
         let mut source = crate::SliceReader::new(&archive);
-        let reader = ManifestReader::open(&mut source, &footer, Default::default()).unwrap();
+        let reader =
+            ManifestReader::open(&mut source, &footer, ManifestOptions::default()).unwrap();
         assert!(reader.entry("anything").unwrap().is_none());
         assert_eq!(reader.collect_entries().unwrap(), Vec::<Entry>::new());
         let options = ManifestOptions {

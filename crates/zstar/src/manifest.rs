@@ -50,10 +50,18 @@ fn field<'a>(m: &'a [(Value, Value)], key: &str) -> Result<&'a Value> {
         .ok_or_else(|| malformed(&format!("missing {key}")))
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Codec-independent primitives used by native and WebAssembly SDKs.
 pub fn decode_block(bytes: &[u8]) -> Result<Value> {
     crate::cbor::decode(bytes)
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn encode_block(value: &Value) -> Result<Vec<u8>> {
     crate::cbor::encode_checked(value)
 }
@@ -82,6 +90,10 @@ pub fn object_address(digest: &[u8; 32]) -> String {
     }
     out
 }
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn parse_object_address(s: &str) -> Result<[u8; 32]> {
     let hash = s
         .strip_prefix("sha256:")
@@ -101,6 +113,10 @@ pub fn parse_object_address(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 impl Extent {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn validate(&self, data_end: u64) -> Result<()> {
         if self.size == 0 || self.size > crate::DATA_FRAME_MAX as u64 || self.encoded_size == 0 {
             return Err(malformed("extent size"));
@@ -134,6 +150,10 @@ impl Extent {
         }
         Value::Array(values)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn from_value(value: &Value, data_end: u64) -> Result<Self> {
         let v = array(value)?;
         if !(3..=4).contains(&v.len()) {
@@ -173,7 +193,7 @@ pub enum EntryKind {
 }
 impl EntryKind {
     #[must_use]
-    pub fn code(self) -> u64 {
+    pub const fn code(self) -> u64 {
         match self {
             Self::File => 0,
             Self::Symlink => 2,
@@ -224,6 +244,10 @@ impl Entry {
         }
     }
 
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn size(&self) -> Result<u64> {
         self.extents.iter().try_fold(0_u64, |sum, e| {
             sum.checked_add(e.size)
@@ -236,6 +260,10 @@ impl Entry {
             .first()
             .is_some_and(|e| matches!(e.source, Source::Object(_)))
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn validate(&self, data_end: u64) -> Result<()> {
         if !valid_path(&self.path) || self.mode > 4095 || self.extents.len() > EXTENTS_MAX {
             return Err(malformed("entry metadata"));
@@ -268,6 +296,14 @@ impl Entry {
         }
         Ok(())
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "The branch or bounded fixture establishes a nonnegative value."
+    )]
     /// Exact wire length without allocating an encoded tuple or object address.
     pub(crate) fn encoded_len(&self) -> Result<usize> {
         use crate::cbor::{encoded_len_at, head_len};
@@ -314,6 +350,14 @@ impl Entry {
         self.append_encoded(&mut out)?;
         Ok(out)
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "The branch or bounded fixture establishes a nonnegative value."
+    )]
     pub(crate) fn append_encoded(&self, out: &mut Vec<u8>) -> Result<()> {
         use crate::cbor::{append_head, append_text, append_validated};
         let attrs = !self.attributes.is_empty() || self.linkname.is_some();
@@ -383,6 +427,10 @@ impl Entry {
         }
         Value::Array(values)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn from_value(value: &Value, data_end: u64) -> Result<Self> {
         let v = array(value)?;
         if !(7..=8).contains(&v.len()) {
@@ -476,6 +524,10 @@ impl ManifestRoot {
     }
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Decode and validate a complete manifest sequence. Storage segment
 /// boundaries are deliberately absent from this codec-independent operation.
 pub fn decode_document(bytes: &[u8], data_end: u64) -> Result<(ManifestRoot, Vec<Entry>)> {
@@ -510,6 +562,10 @@ pub(crate) fn ancestor_retained(dir: &str, entry: &str) -> bool {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered validation or protocol operation together."
+)]
 pub(crate) fn decode_sequence_budgeted(
     reader: impl std::io::Read,
     len: u64,
@@ -651,6 +707,10 @@ fn valid_feature(name: &str) -> bool {
     !separator
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Serialize the portable external reference. No whole-file identity is stored.
 pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     if extents.is_empty()
@@ -673,6 +733,10 @@ pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     ]))
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn decode_external_reference(bytes: &[u8]) -> Result<Vec<Extent>> {
     let value = crate::cbor::decode(bytes)?;
     let m = map(&value)?;
@@ -687,6 +751,10 @@ pub fn decode_external_reference(bytes: &[u8]) -> Result<Vec<Extent>> {
     Ok(extents)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
     use std::fmt::Write as _;
     encode_external_reference(extents)?;
@@ -714,6 +782,10 @@ pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
     let parse = || -> Result<Vec<Extent>> {
         if bytes.len() > 16 << 20 {

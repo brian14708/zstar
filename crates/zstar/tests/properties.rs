@@ -14,7 +14,7 @@ fn entry(path: String) -> Entry {
         mtime_ns: 0,
         extents: vec![],
         linkname: None,
-        attributes: Default::default(),
+        attributes: std::collections::BTreeMap::default(),
     }
 }
 proptest! {
@@ -26,14 +26,14 @@ proptest! {
         picks in prop::collection::vec((any::<usize>(), any::<usize>(), any::<usize>()), 1..20),
         timestamp in any::<i64>(), uid in any::<u64>(), gid in any::<u64>(),
     ) {
-        let mut writer = BlockingBuilder::with_options(Vec::new(), frame_size, 3, Default::default()).unwrap();
+        let mut writer = BlockingBuilder::with_options(Vec::new(), frame_size, 3, zstar::ManifestOptions::default()).unwrap();
         for (index, bytes) in files.iter().enumerate() {
             let mut e = entry(format!("file-{index:02}-雪"));
             e.uid = uid; e.gid = gid; e.mtime_ns = timestamp;
             writer.add_file(e, bytes.len() as u64, &mut bytes.as_slice()).unwrap();
         }
         let encoded = writer.finish().unwrap();
-        let mut reader = BlockingArchive::open(SliceReader::new(&encoded), Default::default()).unwrap();
+        let mut reader = BlockingArchive::open(SliceReader::new(&encoded), zstar::ManifestOptions::default()).unwrap();
         reader.validate().unwrap();
         for (choice, offset, length) in picks {
             if files.is_empty() { break; }
@@ -49,11 +49,11 @@ proptest! {
     }
     #[test]
     fn exact_long_symlink_targets_round_trip(target in "[a-zA-Z0-9./雪_-]{1,500}", frame_size in 512usize..4097) {
-        let mut writer = BlockingBuilder::with_options(Vec::new(), frame_size, 3, Default::default()).unwrap();
+        let mut writer = BlockingBuilder::with_options(Vec::new(), frame_size, 3, zstar::ManifestOptions::default()).unwrap();
         let mut e = entry("link".into()); e.kind = EntryKind::Symlink; e.linkname = Some(target.clone());
         writer.add_metadata(e).unwrap();
         let encoded = writer.finish().unwrap();
-        let mut reader = BlockingArchive::open(SliceReader::new(&encoded), Default::default()).unwrap();
+        let mut reader = BlockingArchive::open(SliceReader::new(&encoded), zstar::ManifestOptions::default()).unwrap();
         reader.validate().unwrap();
         prop_assert_eq!(reader.read_link("link").unwrap(), target);
     }
@@ -66,7 +66,7 @@ proptest! {
     }
     #[test]
     fn mutated_valid_archives_never_panic(changes in prop::collection::vec((any::<usize>(), any::<u8>()), 1..12), truncate in prop::option::of(any::<usize>())) {
-        let mut writer = BlockingBuilder::with_options(Vec::new(), 1024, 3, Default::default()).unwrap();
+        let mut writer = BlockingBuilder::with_options(Vec::new(), 1024, 3, zstar::ManifestOptions::default()).unwrap();
         writer.add_file(entry("payload".into()), 255, &mut (0..255u8).collect::<Vec<_>>().as_slice()).unwrap();
         let mut encoded = writer.finish().unwrap(); let len = encoded.len();
         for (at, mask) in changes { encoded[at % len] ^= mask; }

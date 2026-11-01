@@ -19,7 +19,7 @@ impl<J, O> Drop for Worker<J, O> {
     }
 }
 
-pub(crate) struct OrderedWorkers<J, O> {
+pub struct OrderedWorkers<J, O> {
     workers: Vec<Worker<J, O>>,
     pending: VecDeque<usize>,
     next: usize,
@@ -86,7 +86,7 @@ impl<J: Send + 'static, O: Send + 'static> OrderedWorkers<J, O> {
     }
 }
 
-pub(crate) type ChecksummedFrameWorkers = OrderedWorkers<(Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)>;
+pub type ChecksummedFrameWorkers = OrderedWorkers<(Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)>;
 
 impl ChecksummedFrameWorkers {
     pub fn checksummed(count: usize, level: i32) -> Result<Self> {

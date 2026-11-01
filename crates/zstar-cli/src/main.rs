@@ -15,6 +15,10 @@ use zstar::manifest_io::ManifestOptions;
 use zstar::s3::object_store::client::CredentialProvider;
 use zstar::s3::object_store::{ObjectStoreExt, aws::AwsCredential, path::Path as ObjectPath};
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 fn s3_error(operation: &str, error: zstar::s3::object_store::Error) -> std::io::Error {
     use zstar::s3::object_store::Error as E;
     let message = match error {
@@ -180,6 +184,10 @@ enum Command {
         metadata: MetadataLimits,
     },
 }
+#[expect(
+    clippy::or_fun_call,
+    reason = "The fallback is a cheap value conversion with no allocation or I/O."
+)]
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -313,6 +321,10 @@ async fn download(path: &Path) -> restore::AnyResult<tempfile::NamedTempFile> {
     Ok(file)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the ordered validation or protocol operation together."
+)]
 #[tokio::main]
 async fn main() -> restore::AnyResult<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

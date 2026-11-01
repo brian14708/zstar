@@ -20,6 +20,14 @@ pub struct S3PackStore {
     policies: std::sync::Mutex<lru::LruCache<String, crate::http::CachePolicy>>,
 }
 impl S3PackStore {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn new(
         store: Arc<AmazonS3>,
         root: Path,
@@ -101,7 +109,7 @@ fn completion_succeeded(body: &[u8]) -> bool {
         match reader.read_event() {
             Ok(Event::Start(root)) => {
                 if depth == 0
-                    && (finished || root.local_name().as_ref() != b"CompleteMultipartUploadResult")
+                    && (finished || root.local_name().as_ref() != "CompleteMultipartUploadResult")
                 {
                     return false;
                 }
@@ -119,7 +127,7 @@ fn completion_succeeded(body: &[u8]) -> bool {
             Ok(Event::Eof) => return finished && depth == 0,
             Ok(Event::Empty(_)) if depth == 0 => return false,
             Ok(Event::Text(text))
-                if depth == 0 && text.as_ref().iter().any(|b| !b.is_ascii_whitespace()) =>
+                if depth == 0 && text.as_ref().bytes().any(|b| !b.is_ascii_whitespace()) =>
             {
                 return false;
             }
@@ -143,6 +151,10 @@ impl PackStore for S3PackStore {
             .get(&snapshot.key)
             .is_some_and(crate::http::CachePolicy::allows_reuse)
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     async fn put(&self, key: String, mut data: Spool) -> Result<Snapshot> {
         let length = data.len();
         let path = self.path(&key);
@@ -177,7 +189,7 @@ impl PackStore for S3PackStore {
                     crate::s3::object_store::PutResult {
                         e_tag: meta.e_tag,
                         version: meta.version,
-                        extensions: Default::default(),
+                        extensions: object_store::Extensions::default(),
                     }
                 }
                 Err(error) => return Err(storage_error(error)),
@@ -299,7 +311,7 @@ impl PackStore for S3PackStore {
             crate::s3::object_store::PutResult {
                 e_tag: meta.e_tag,
                 version: meta.version,
-                extensions: Default::default(),
+                extensions: object_store::Extensions::default(),
             }
         };
         let snapshot = Snapshot {
@@ -311,6 +323,10 @@ impl PackStore for S3PackStore {
         snapshot.validate()?;
         Ok(snapshot)
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     async fn get_range(&self, snapshot: &Snapshot, range: Range<u64>) -> Result<Bytes> {
         snapshot.validate()?;
         let size = range.end.checked_sub(range.start).ok_or(Error::Range)?;

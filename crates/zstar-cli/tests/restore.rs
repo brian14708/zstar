@@ -25,7 +25,7 @@ fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
 }
 struct FixtureArchive(BTreeMap<String, (Entry, Vec<u8>)>);
 impl FixtureArchive {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self(BTreeMap::new())
     }
     fn add_directory(&mut self, path: &str, mode: u64) {
@@ -69,6 +69,10 @@ fn extract(archive: &Path, dest: &Path) -> Output {
     run(&[Path::new("extract"), archive, dest])
 }
 
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
 #[test]
 fn pack_rejects_output_inside_source_and_preserves_existing_output_on_failure() {
     let temp = tempfile::tempdir().unwrap();
@@ -356,7 +360,8 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
         String::from_utf8_lossy(&result.stderr)
     );
     let bytes = fs::read(output).unwrap();
-    let mut archive = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut archive =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     archive.validate().unwrap();
     let link = archive.entry("link").unwrap().unwrap();
     assert_eq!(link.linkname.as_deref(), Some("/missing/.././target"));
@@ -372,6 +377,10 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
     );
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[test]
 fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validity() {
     use std::io::{Seek, SeekFrom, Write};
@@ -396,7 +405,7 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
     assert!(String::from_utf8_lossy(&inspection.stdout).contains("entries=0"));
     let mut archive = BlockingArchive::open(
         zstar::fs::LocalFileSource::open(&input).unwrap(),
-        Default::default(),
+        zstar::ManifestOptions::default(),
     )
     .unwrap();
     assert!(archive.validate().is_err());
@@ -432,7 +441,8 @@ fn capture_controls_and_destination_handle_limits_are_local_policies() {
         String::from_utf8_lossy(&packed.stderr)
     );
     let bytes = fs::read(&archive).unwrap();
-    let mut parsed = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut parsed =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     parsed.validate().unwrap();
     let limited = root.path().join("limited");
     let result = run(&[
@@ -525,7 +535,8 @@ fn packed_capture_materialize_generation_and_standalone_export() {
         fs::read(from_generation).unwrap()
     );
     let bytes = fs::read(&portable).unwrap();
-    let mut archive = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut archive =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     archive.validate().unwrap();
     assert_eq!(
         archive

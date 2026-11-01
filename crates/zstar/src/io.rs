@@ -44,7 +44,11 @@ impl AsyncRangeReader for Bytes {
     async fn size(&self) -> Result<u64> {
         Ok(self.len() as u64)
     }
-    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    async fn read_range(&self, range: Range<u64>) -> Result<Self> {
         let length = range
             .end
             .checked_sub(range.start)

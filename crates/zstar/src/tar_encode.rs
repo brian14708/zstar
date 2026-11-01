@@ -4,7 +4,7 @@ use crate::{Error, Result};
 const USTAR_SIZE_MAX: u64 = 0o77_777_777_777;
 const USTAR_SECONDS_MAX: i64 = 0o77_777_777_777;
 const USTAR_ID_MAX: u64 = 0o7_777_777;
-fn decimal_bytes(mut value: u128) -> ([u8; 39], usize) {
+const fn decimal_bytes(mut value: u128) -> ([u8; 39], usize) {
     let mut bytes = [0; 39];
     let mut at = bytes.len();
     loop {
@@ -65,8 +65,15 @@ fn append_pax_record(output: &mut Vec<u8>, key: &str, value: &[u8]) {
         length = next;
     }
 }
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn member_header_full(
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "The branch or bounded fixture establishes a nonnegative value."
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Independent wire fields or Python keyword options form this API."
+)]
+pub fn member_header_full(
     path: &str,
     size: u64,
     mode: u64,
@@ -138,7 +145,10 @@ pub(crate) fn member_header_full(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Independent wire fields or Python keyword options form this API."
+)]
 fn tar_header(
     path: &str,
     size: u64,

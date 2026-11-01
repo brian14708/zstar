@@ -87,7 +87,7 @@ async fn persist(staged: tempfile::NamedTempFile, path: PathBuf) -> AnyResult<()
     .await??;
     Ok(())
 }
-pub(super) async fn capture(
+pub async fn capture(
     input: PathBuf,
     output: PathBuf,
     catalog_output: PathBuf,
@@ -115,7 +115,11 @@ pub(super) async fn capture(
     }
     let portable = tokio::task::spawn_blocking(move || -> AnyResult<_> {
         let mut staged = tempfile::NamedTempFile::new()?;
-        zstar::fs::pack_to_with_options(&input, staged.as_file_mut(), Default::default())?;
+        zstar::fs::pack_to_with_options(
+            &input,
+            staged.as_file_mut(),
+            zstar::fs::PackOptions::default(),
+        )?;
         Ok(staged)
     })
     .await??;
@@ -134,8 +138,14 @@ pub(super) async fn capture(
     )?;
     let staged = tempfile::NamedTempFile::new_in(super::parent(&output))?;
     let sink = tokio::fs::File::from_std(staged.reopen()?);
-    if let Err(error) =
-        externalize_archive(&archive, sink, strategy, &mut packs, Default::default()).await
+    if let Err(error) = externalize_archive(
+        &archive,
+        sink,
+        strategy,
+        &mut packs,
+        zstar::WriterOptions::default(),
+    )
+    .await
     {
         eprintln!("unpublished packs: {:?}", packs.completed_packs());
         return Err(error.into());
@@ -180,7 +190,7 @@ async fn catalog(path: PathBuf) -> AnyResult<Catalog> {
     let data = tokio::fs::read(path).await?;
     Ok(Catalog::decode(&data, CatalogLimits::default())?)
 }
-pub(super) async fn materialize(
+pub async fn materialize(
     input: PathBuf,
     catalog_path: PathBuf,
     output: PathBuf,
@@ -211,13 +221,17 @@ async fn write_portable(
     .await?;
     let staged = tempfile::NamedTempFile::new_in(super::parent(&output))?;
     let sink = tokio::fs::File::from_std(staged.reopen()?);
-    materialize_archive(&archive, sink, Default::default())
+    materialize_archive(&archive, sink, zstar::WriterOptions::default())
         .await?
         .sync_all()
         .await?;
     persist(staged, output).await
 }
-pub(super) async fn generation(key: String, output: PathBuf, root: PathBuf) -> AnyResult<()> {
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
+pub async fn generation(key: String, output: PathBuf, root: PathBuf) -> AnyResult<()> {
     vacant(&output)?;
     let store = store(&root).await?;
     // The descriptor itself must be supplied explicitly. Local roots load its
@@ -273,11 +287,7 @@ pub(super) async fn generation(key: String, output: PathBuf, root: PathBuf) -> A
     )
     .await
 }
-pub(super) async fn export(
-    catalog_path: PathBuf,
-    root: PathBuf,
-    destination: PathBuf,
-) -> AnyResult<()> {
+pub async fn export(catalog_path: PathBuf, root: PathBuf, destination: PathBuf) -> AnyResult<()> {
     let store = store(&root).await?;
     let catalog = catalog(catalog_path).await?;
     let resolver = PackedObjectResolver::new(store, catalog.clone(), ResolverOptions::default())?;

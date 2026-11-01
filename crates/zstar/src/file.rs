@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 type Load = Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>;
 
 /// Reusable random-access member cursor. Retains owned metadata and at most one
+///
 /// validated decoded source, independently of the archive's retained cache.
 /// The caller supplies the live archive for each operation.
 pub struct FileCursor {
@@ -21,6 +22,10 @@ pub struct FileCursor {
     cached: Option<(Key, Bytes)>,
 }
 impl FileCursor {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(entry: Entry) -> Result<Self> {
         if entry.kind != EntryKind::File {
             return Err(Error::Unsupported("entry is not a file"));
@@ -44,6 +49,14 @@ impl FileCursor {
         })
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Reads an exact bounded range with the archive's hash/resolver policy.
     /// Cancellation does not change any logical stream position.
     pub async fn read<R: AsyncRangeReader + ?Sized + 'static>(
@@ -160,21 +173,25 @@ impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     }
     /// Returns the logical payload length in bytes.
     #[must_use]
-    pub fn size(&self) -> u64 {
+    pub const fn size(&self) -> u64 {
         self.size
     }
     /// Returns the entry kind.
     #[must_use]
-    pub fn kind(&self) -> EntryKind {
+    pub const fn kind(&self) -> EntryKind {
         self.entry.kind
     }
     /// Borrows the entry's immutable metadata and extents.
     #[must_use]
-    pub fn metadata(&self) -> &Entry {
+    pub const fn metadata(&self) -> &Entry {
         &self.entry
     }
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -40,6 +40,10 @@ fn oversized_item_is_rejected_without_allocating() {
     assert!(decode_document(&doc, 0).is_err());
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[test]
 fn entry_above_cap_is_rejected_while_decoding() {
     let mut doc = header();

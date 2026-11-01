@@ -2,10 +2,11 @@ use std::io::{self, Read, Write};
 use zstar::backend::{BlockingArchive, BlockingBuilder};
 use zstar::{Entry, EntryKind, Error, SliceReader};
 fn build(frame: usize, workers: usize) -> Vec<u8> {
-    let mut writer = BlockingBuilder::with_options(Vec::new(), frame, 3, Default::default())
-        .unwrap()
-        .with_workers(workers)
-        .unwrap();
+    let mut writer =
+        BlockingBuilder::with_options(Vec::new(), frame, 3, zstar::ManifestOptions::default())
+            .unwrap()
+            .with_workers(workers)
+            .unwrap();
     for (name, bytes) in [("a", vec![]), ("b", vec![42; 8193]), ("雪", vec![7; 16385])] {
         writer
             .add_file(Entry::file(name), bytes.len() as u64, &mut bytes.as_slice())
@@ -26,17 +27,22 @@ fn empty_symlink_targets_are_rejected_before_writing() {
         .add_metadata(Entry::symlink("link", "../target"))
         .unwrap();
     let bytes = writer.finish().unwrap();
-    BlockingArchive::open(SliceReader::new(&bytes), Default::default())
+    BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default())
         .unwrap()
         .validate()
         .unwrap();
 }
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+)]
 #[test]
 fn streaming_frames_and_payloads_cover_empty_split_and_unicode_members() {
     for frame in [512, 777, 1024, 4096] {
         let bytes = build(frame, 0);
         let mut reader =
-            BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+            BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default())
+                .unwrap();
         reader
             .visit_frames(|_, _, raw| {
                 assert!(raw.len() <= frame);
@@ -84,12 +90,17 @@ fn long_paths_exact_link_text_and_wide_metadata_survive_physical_validation() {
         .add_file(file, 7, &mut b"unicode".as_slice())
         .unwrap();
     let bytes = writer.finish().unwrap();
-    let mut reader = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     reader.validate().unwrap();
     assert_eq!(reader.read_link("link").unwrap(), target);
     let e = reader.entry(&path).unwrap().unwrap();
     assert_eq!((e.uid, e.gid, e.mtime_ns), (u64::MAX, u64::MAX, i64::MIN));
 }
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
 #[test]
 fn changed_lengths_duplicate_paths_and_output_failure_poison_the_writer() {
     for mut payload in [b"ab".as_slice(), b"abcd".as_slice()] {
@@ -114,10 +125,11 @@ fn changed_lengths_duplicate_paths_and_output_failure_poison_the_writer() {
             Ok(())
         }
     }
-    let mut writer = BlockingBuilder::with_options(Broken, 1024, 3, Default::default())
-        .unwrap()
-        .with_workers(2)
-        .unwrap();
+    let mut writer =
+        BlockingBuilder::with_options(Broken, 1024, 3, zstar::ManifestOptions::default())
+            .unwrap()
+            .with_workers(2)
+            .unwrap();
     assert!(
         writer
             .add_file(Entry::file("a"), 32768, &mut vec![0; 32768].as_slice())
@@ -156,7 +168,8 @@ fn interrupted_short_payload_reads_work_and_callbacks_can_stop() {
     }
     let payload = vec![42; 4097];
     let mut writer =
-        BlockingBuilder::with_options(Vec::new(), 1024, 3, Default::default()).unwrap();
+        BlockingBuilder::with_options(Vec::new(), 1024, 3, zstar::ManifestOptions::default())
+            .unwrap();
     writer
         .add_file(
             Entry::file("file"),
@@ -168,7 +181,8 @@ fn interrupted_short_payload_reads_work_and_callbacks_can_stop() {
         )
         .unwrap();
     let bytes = writer.finish().unwrap();
-    let mut reader = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     assert_eq!(reader.read("file", 0, 4097, None, true).unwrap(), payload);
     let mut calls = 0;
     assert!(matches!(
@@ -184,7 +198,8 @@ fn interrupted_short_payload_reads_work_and_callbacks_can_stop() {
 fn pax_headers_split_at_unaligned_frame_boundaries_remain_exact() {
     for frame in [513, 523, 777] {
         let mut writer =
-            BlockingBuilder::with_options(Vec::new(), frame, 3, Default::default()).unwrap();
+            BlockingBuilder::with_options(Vec::new(), frame, 3, zstar::ManifestOptions::default())
+                .unwrap();
         let mut link = Entry::file("link");
         link.kind = EntryKind::Symlink;
         link.linkname = Some("雪".repeat(70));
@@ -197,7 +212,8 @@ fn pax_headers_split_at_unaligned_frame_boundaries_remain_exact() {
             .unwrap();
         let bytes = writer.finish().unwrap();
         let mut reader =
-            BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+            BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default())
+                .unwrap();
         reader.validate().unwrap();
     }
 }
@@ -215,7 +231,8 @@ fn late_parents_and_reverse_insertion_keep_tar_order_and_sort_manifest() {
         .add_file(Entry::file("a"), 1, &mut b"a".as_slice())
         .unwrap();
     let bytes = writer.finish().unwrap();
-    let mut reader = BlockingArchive::open(SliceReader::new(&bytes), Default::default()).unwrap();
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
     reader.validate().unwrap();
     let mut physical = Vec::new();
     reader

@@ -38,7 +38,7 @@ fn copy_bytes_like(
     buffer.copy_to_slice(py, &mut out[..length])?;
     Ok(length)
 }
-pub(crate) fn from_py(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
+pub fn from_py(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
     if depth > 64 {
         return Err(core_error(Error::Budget("CBOR nesting limit")));
     }
@@ -130,7 +130,7 @@ impl Seek for PythonSpill {
         .map_err(py_io)
     }
 }
-pub(crate) fn spill_factory(
+pub fn spill_factory(
     py: Python<'_>,
     callback: Option<Py<PyAny>>,
 ) -> PyResult<Option<zstar::SpillFactory>> {
@@ -149,7 +149,7 @@ pub(crate) fn spill_factory(
         })
         .transpose()
 }
-pub(crate) fn to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
+pub fn to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     Ok(match value {
         Value::Integer(n) => i128::from(*n).into_pyobject(py)?.into_any().unbind(),
         Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any().unbind(),
@@ -179,10 +179,7 @@ pub(crate) fn to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     })
 }
 
-pub(crate) fn extensions_to_py(
-    py: Python<'_>,
-    extensions: &zstar::Extensions,
-) -> PyResult<Py<PyAny>> {
+pub fn extensions_to_py(py: Python<'_>, extensions: &zstar::Extensions) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     for (key, value) in extensions {
         dict.set_item(key, to_py(py, value)?)?;
@@ -254,7 +251,7 @@ struct Gate<T> {
     closed: AtomicBool,
 }
 impl<T: Send> Gate<T> {
-    fn new(value: T) -> Self {
+    const fn new(value: T) -> Self {
         Self {
             value: Mutex::new(Some(value)),
             owner: AtomicU64::new(0),
@@ -272,6 +269,10 @@ impl<T: Send> Gate<T> {
         }
         Ok(())
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     /// Run `work` with exclusive access, detached from the interpreter.
     fn run<R: Send>(
         &self,
@@ -315,8 +316,25 @@ pub struct ManifestArchive {
 #[pymethods]
 impl ManifestArchive {
     #[new]
-    #[pyo3(signature=(source,size,*,memory_bytes=8<<20,max_encoded_bytes=4<<30,max_decoded_bytes=4<<30,max_read_bytes=64<<20,max_retained_entry_bytes=1<<30,max_entries=0,cache_bytes=16<<20,max_spool_bytes=4<<30,create_spill_store=None,shared_cache=None,shared_cache_identity=None))]
-    #[allow(clippy::too_many_arguments)] // Public Python keyword options.
+    #[pyo3(
+        signature = (
+            source,
+            size,
+            *,
+            memory_bytes = 8 << 20,
+            max_encoded_bytes = 4 << 30,
+            max_decoded_bytes = 4 << 30,
+            max_read_bytes = 64 << 20,
+            max_retained_entry_bytes = 1 << 30,
+            max_entries = 0,
+            cache_bytes = 16 << 20,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            shared_cache = None,
+            shared_cache_identity = None,
+        )
+    )]
+    #[expect(clippy::too_many_arguments, reason = "Public Python keyword options.")]
     fn new(
         py: Python<'_>,
         source: Py<PyAny>,
@@ -417,7 +435,16 @@ impl ManifestArchive {
     ) -> PyResult<()> {
         self.close(py)
     }
-    #[pyo3(signature=(path,offset=0,length=None,*,resolver=None,verify_external=true))]
+    #[pyo3(
+        signature = (
+            path,
+            offset = 0,
+            length = None,
+            *,
+            resolver = None,
+            verify_external = true,
+        )
+    )]
     fn read(
         &self,
         py: Python<'_>,
@@ -470,7 +497,7 @@ pub struct ManifestEntries {
 }
 #[pymethods]
 impl ManifestEntries {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    const fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -549,8 +576,24 @@ impl EntryArchiveWriter {
         }
     }
     #[new]
-    #[pyo3(signature=(output,*,frame_size=1<<20,compression_level=3,memory_bytes=8<<20,block_target=64<<10,max_spool_bytes=4<<30,create_spill_store=None,workers=0,root_extensions=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(
+        signature = (
+            output,
+            *,
+            frame_size = 1 << 20,
+            compression_level = 3,
+            memory_bytes = 8 << 20,
+            block_target = 64 << 10,
+            max_spool_bytes = 4 << 30,
+            create_spill_store = None,
+            workers = 0,
+            root_extensions = None,
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Independent wire fields or Python keyword options form this API."
+    )]
     fn new(
         py: Python<'_>,
         output: Py<PyAny>,
@@ -591,7 +634,13 @@ impl EntryArchiveWriter {
             failed: AtomicBool::new(false),
         })
     }
-    #[pyo3(signature=(entry,body=None,size=0))]
+    #[pyo3(
+        signature = (
+            entry,
+            body = None,
+            size = 0,
+        )
+    )]
     fn add(
         &self,
         py: Python<'_>,
@@ -621,7 +670,19 @@ impl EntryArchiveWriter {
         }
         result
     }
-    #[pyo3(signature=(path,archive_name,*,preserve_metadata=false,recursive=true))]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
+    #[pyo3(
+        signature = (
+            path,
+            archive_name,
+            *,
+            preserve_metadata = false,
+            recursive = true,
+        )
+    )]
     fn add_path(
         &self,
         py: Python<'_>,

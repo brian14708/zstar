@@ -38,6 +38,7 @@ pub(crate) fn artifact_content_type(key: &str) -> &'static str {
 }
 
 /// Cache admission for a private decoded-content cache. An absent policy keeps
+///
 /// the reader's immutable-snapshot caching behavior. Restrictive directives
 /// bypass retention; stale content is fetched again with the pinned validator.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -51,6 +52,10 @@ impl CachePolicy {
     pub fn from_cache_control(control: &str) -> Self {
         Self::from_headers(Some(control), None)
     }
+    #[expect(
+        clippy::or_fun_call,
+        reason = "The fallback is a cheap value conversion with no allocation or I/O."
+    )]
     pub(crate) fn from_headers(control: Option<&str>, age: Option<&str>) -> Self {
         let mut policy = Self::default();
         let mut max_age = None;
@@ -133,7 +138,7 @@ impl CachePolicy {
     }
     /// Observe another response for the same source. Retain restrictive
     /// directives for its lifetime so concurrent reads cannot relax admission.
-    pub fn observe(&mut self, mut response: Self) {
+    pub const fn observe(&mut self, mut response: Self) {
         response.denied |= self.denied;
         *self = response;
     }
@@ -285,6 +290,10 @@ fn map_conditional(error: std::io::Error, condition: Option<(&str, &str)>) -> st
         _ => error,
     }
 }
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Ownership matches the public API or asynchronous boundary."
+)]
 fn provider_failure(error: std::io::Error) -> std::io::Error {
     // Provider implementations may include signed URLs or credentials in
     // their error text. Preserve cancellation-like kinds for callers while
@@ -324,6 +333,10 @@ pub struct ReqwestTransport {
     max_response_bytes: usize,
 }
 impl ReqwestTransport {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new() -> std::io::Result<Self> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -346,7 +359,7 @@ impl ReqwestTransport {
     /// The supplied client must disable automatic response decompression so
     /// range validation sees the stored representation and its headers.
     #[must_use]
-    pub fn with_client(client: reqwest::Client, max_response_bytes: usize) -> Self {
+    pub const fn with_client(client: reqwest::Client, max_response_bytes: usize) -> Self {
         Self {
             client,
             max_response_bytes,
@@ -647,6 +660,10 @@ impl HttpRangeSource {
         }
         unreachable!()
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     async fn fetch(&self, range: Range<u64>) -> std::io::Result<RangeResponse> {
         let mut state = self.state.lock().await;
         if state.initialized {
@@ -675,6 +692,10 @@ impl HttpRangeSource {
         state.initialized = true;
         Ok(response)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub async fn put(&self, body: Bytes) -> std::io::Result<()> {
         for attempt in 0..2 {
             let request = self.request("PUT", attempt != 0).await?;
@@ -692,7 +713,8 @@ impl crate::AsyncRangeReader for HttpRangeSource {
         self.cache_policy.lock().unwrap().allows_reuse()
     }
     async fn size(&self) -> crate::Result<u64> {
-        if let Some(size) = self.state.lock().await.size {
+        let size = self.state.lock().await.size;
+        if let Some(size) = size {
             return Ok(size);
         }
         Ok(self.fetch(0..1).await?.total_size)
@@ -719,6 +741,14 @@ pub struct HttpEncodedObjectResolver {
     policies: std::sync::Mutex<lru::LruCache<[u8; 32], CachePolicy>>,
 }
 impl HttpEncodedObjectResolver {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub fn new(
         transport: Arc<dyn HttpTransport>,
         provider: impl Fn([u8; 32]) -> Arc<dyn RequestProvider> + Send + Sync + 'static,
@@ -751,6 +781,10 @@ impl crate::ObjectResolver for HttpEncodedObjectResolver {
             .get(&address)
             .is_some_and(CachePolicy::allows_reuse)
     }
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The guard intentionally covers this short state update."
+    )]
     async fn get_encoded(
         &self,
         address: [u8; 32],

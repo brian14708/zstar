@@ -33,6 +33,10 @@ fn header(request: &str, name: &str) -> Option<String> {
         key.eq_ignore_ascii_case(name).then(|| value.trim().into())
     })
 }
+#[expect(
+    clippy::option_if_let_else,
+    reason = "Explicit branches keep validation and state transitions readable."
+)]
 async fn server(object: Object, status: Option<u16>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/o?sig=secret", listener.local_addr().unwrap());
@@ -138,6 +142,10 @@ async fn weak_missing_and_invalid_validators_are_rejected_before_snapshot_use() 
     }
 }
 
+#[expect(
+    clippy::items_after_statements,
+    reason = "Keep local helpers next to the operation that uses them."
+)]
 #[tokio::test]
 async fn resolver_probe_and_read_share_one_snapshot() {
     // The object is replaced after the size probe: the body read must fail.

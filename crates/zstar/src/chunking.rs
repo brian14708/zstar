@@ -26,13 +26,17 @@ impl Default for Chunking {
 impl Chunking {
     /// Provisional evaluation profile, not a change to portable writer defaults.
     #[must_use]
-    pub fn fastcdc() -> Self {
+    pub const fn fastcdc() -> Self {
         Self::FastCdc {
             min: 64 << 10,
             target: 256 << 10,
             max: 1 << 20,
         }
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn validate(self) -> Result<()> {
         match self {
             Self::Fixed { size } if (1..=DATA_FRAME_MAX).contains(&size) => Ok(()),
@@ -51,7 +55,7 @@ impl Chunking {
         }
     }
     #[must_use]
-    pub fn max_size(self) -> usize {
+    pub const fn max_size(self) -> usize {
         match self {
             Self::Fixed { size } => size,
             Self::FastCdc { max, .. } => max,
@@ -69,6 +73,10 @@ pub struct Chunker {
     masks: (u64, u64),
 }
 impl Chunker {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(strategy: Chunking) -> Result<Self> {
         strategy.validate()?;
         let mut buffer = Vec::new();
@@ -116,6 +124,10 @@ impl Chunker {
         self.filled -= length;
         Some(chunk)
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn next(&mut self, input: &mut impl Read) -> Result<Option<Vec<u8>>> {
         while !self.eof && self.filled < self.buffer.len() {
             match input.read(&mut self.buffer[self.filled..]) {
@@ -127,6 +139,10 @@ impl Chunker {
         }
         Ok(self.take_chunk())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     /// Cancellation retains already received input in the bounded window.
     #[cfg(feature = "async")]
     pub async fn next_async<R: tokio::io::AsyncRead + Unpin>(
@@ -155,6 +171,10 @@ pub trait ObjectWriter: Send {
     ) -> impl std::future::Future<Output = Result<crate::Extent>> + Send;
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Externalize one declared file into ordered v1 extents. Returned metadata is
 /// bounded by the v1 extent and pointer limits; failures never publish an archive.
 #[cfg(feature = "async")]

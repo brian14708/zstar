@@ -12,6 +12,7 @@ use std::{
 };
 
 /// Runtime configuration owns credentials and endpoints. New objects are
+///
 /// immutable and uniquely keyed. A range must match the supplied identity and
 /// exact length; cancelling its future cancels pending requests.
 pub trait PackStore: Send + Sync {
@@ -47,6 +48,7 @@ impl Default for PackWriterOptions {
     }
 }
 /// One bounded spool, one compression job, and one upload at a time. The
+///
 /// catalog index is separately bounded. Reuse is local to an explicit base
 /// catalog/session; successful uploads may be orphaned after a later failure.
 pub struct PackWriter<S> {
@@ -75,6 +77,10 @@ enum PreparedChunk {
     },
 }
 impl PackState {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Ownership matches the public API or asynchronous boundary."
+    )]
     fn prepare(&mut self, raw: Bytes, options: &PackWriterOptions) -> Result<PreparedChunk> {
         let digest = *Digest::sha256(&raw).as_bytes();
         let decoded_length = raw.len() as u64;
@@ -142,6 +148,10 @@ impl PackState {
     }
 }
 impl<S: PackStore> PackWriter<S> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(store: Arc<S>, base: Catalog, options: PackWriterOptions) -> Result<Self> {
         if !crate::manifest::valid_path(&options.prefix)
             || options.target_bytes == 0
@@ -180,12 +190,20 @@ impl<S: PackStore> PackWriter<S> {
         self.failed = true;
         self.state = None;
     }
-    fn check_open(&self) -> Result<()> {
+    const fn check_open(&self) -> Result<()> {
         if self.failed || self.state.is_none() {
             return Err(Error::Unsupported("pack writer failed or closed"));
         }
         Ok(())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub async fn put_chunk(&mut self, raw: Bytes) -> Result<Extent> {
         self.check_open()?;
         if raw.is_empty() || raw.len() > crate::DATA_FRAME_MAX {
@@ -259,6 +277,14 @@ impl<S: PackStore> PackWriter<S> {
         state.hash = Sha256::new();
         Ok(())
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
     pub async fn finish(&mut self) -> Result<Catalog> {
         self.check_open()?;
         self.failed = true;
@@ -310,6 +336,10 @@ pub struct PackedObjectResolver<S> {
     requests: tokio::sync::Semaphore,
 }
 impl<S: PackStore> PackedObjectResolver<S> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     pub fn new(store: Arc<S>, catalog: Catalog, options: ResolverOptions) -> Result<Self> {
         if !(1..=32).contains(&options.concurrent_requests)
             || options.max_range_bytes == 0
@@ -331,6 +361,26 @@ impl<S: PackStore> PackedObjectResolver<S> {
             }),
         })
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "Unwraps enforce internal invariants established before this operation."
+    )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the ordered validation or protocol operation together."
+    )]
     pub async fn get_many(&self, requests: &[crate::archive::ObjectRequest]) -> Result<Vec<Bytes>> {
         if requests.len() > crate::MAX_BATCH_REQUESTS {
             return Err(Error::Budget("packed batch count"));

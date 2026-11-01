@@ -139,7 +139,7 @@ impl Error {
     }
     /// Stable machine-readable rejection category, shared with the corpus.
     #[must_use]
-    pub fn category(&self) -> &'static str {
+    pub const fn category(&self) -> &'static str {
         match self {
             Self::MalformedCatalog(_) => "malformed-catalog",
             Self::ChangedPack => "changed-pack",
@@ -188,6 +188,10 @@ pub trait RangeReader {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "Errors follow the documented operation contract and crate error types."
+    )]
     fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>>;
 }
 
@@ -201,11 +205,15 @@ impl Digest {
     }
 
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Verify a complete byte sequence against a SHA-256 digest.
 pub fn verify_sha256(bytes: &[u8], expected: [u8; 32]) -> Result<()> {
     if Digest::sha256(bytes).0 == expected {
@@ -215,8 +223,12 @@ pub fn verify_sha256(bytes: &[u8], expected: [u8; 32]) -> Result<()> {
     }
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 /// Validate a bounded half-open range without permitting integer wraparound.
-pub fn checked_range(offset: u64, length: u64, size: u64) -> Result<Range<u64>> {
+pub const fn checked_range(offset: u64, length: u64, size: u64) -> Result<Range<u64>> {
     if offset > size || length > size - offset {
         return Err(Error::Range);
     }
@@ -231,6 +243,14 @@ pub struct Footer {
     pub toc_sha256: [u8; 32],
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "Unwraps enforce internal invariants established before this operation."
+)]
 /// Parse and validate the fixed 80-byte terminal footer.
 pub fn parse_footer(bytes: &[u8]) -> Result<Footer> {
     if bytes.len() != FOOTER_SIZE {
@@ -280,6 +300,10 @@ pub fn encode_footer(footer: &Footer) -> [u8; FOOTER_SIZE] {
     out
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn encode_frame(data: &[u8], level: i32) -> Result<Vec<u8>> {
     if data.is_empty() || data.len() > DATA_FRAME_MAX {
         return Err(Error::MalformedFrame("invalid decoded frame size".into()));
@@ -289,6 +313,10 @@ pub fn encode_frame(data: &[u8], level: i32) -> Result<Vec<u8>> {
     encoder.compress(data).map_err(Error::Io)
 }
 
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
 pub fn decode_frame(encoded: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut context = zstd::zstd_safe::DCtx::create();
@@ -390,7 +418,7 @@ pub struct SliceReader<'a> {
 }
 impl<'a> SliceReader<'a> {
     #[must_use]
-    pub fn new(bytes: &'a [u8]) -> Self {
+    pub const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
 }
@@ -398,6 +426,10 @@ impl RangeReader for SliceReader<'_> {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
     fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>> {
         checked_range(
             range.start,
