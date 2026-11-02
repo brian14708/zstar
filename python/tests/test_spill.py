@@ -58,7 +58,7 @@ def test_reader_factory_temporary_files_and_cold_lookup(kind, inline_data, sourc
             stores.append(store)
             return store
 
-        options = dict(memory_bytes=1, create_spill_store=factory)
+        options = {"memory_bytes": 1, "create_spill_store": factory}
         if kind == "bytes":
             reader = Archive(inline_data, **options)
         elif kind == "manifest":
@@ -85,7 +85,7 @@ def test_quota_rejected_before_factory_callback(kind, inline_data, source_factor
     def factory():
         pytest.fail("quota must be checked before spill-store I/O")
 
-    options = dict(memory_bytes=0, max_spool_bytes=0, create_spill_store=factory)
+    options = {"memory_bytes": 0, "max_spool_bytes": 0, "create_spill_store": factory}
     with pytest.raises(ZstarError, match="aggregate spool storage"):
         if kind == "bytes":
             Archive(inline_data, **options)

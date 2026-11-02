@@ -73,131 +73,6 @@ fn python_cause(error: &zstar::Error) -> Option<&PyCause> {
     None
 }
 
-/// Bounded decoded-chunk memory shared by explicitly bound readers.
-#[pyclass(module = "zstar", frozen)]
-pub(crate) struct DecodedMemoryCache {
-    inner: Arc<zstar::MemoryDecodedCache>,
-}
-#[pymethods]
-impl DecodedMemoryCache {
-    #[new]
-    fn new(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(zstar::MemoryDecodedCache::new(capacity)),
-        }
-    }
-    #[getter]
-    fn used_bytes(&self) -> usize {
-        self.inner.used()
-    }
-    fn clear(&self) {
-        self.inner.clear();
-    }
-}
-
-/// Immutable validated content; only readers can construct tokens.
-#[pyclass(frozen, module = "zstar")]
-pub(crate) struct DecodedChunk {
-    inner: zstar::CachedChunk,
-}
-fn decoded_cache_key(key: &zstar::DecodedCacheKey) -> String {
-    fn hex(bytes: &[u8]) -> String {
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            output.push(char::from(DIGITS[usize::from(byte >> 4)]));
-            output.push(char::from(DIGITS[usize::from(byte & 15)]));
-        }
-        output
-    }
-    match key {
-        zstar::DecodedCacheKey::Archive {
-            identity,
-            metadata,
-            offset,
-            encoded_size,
-        } => format!(
-            "a:{}:{}:{offset}:{encoded_size}",
-            hex(identity),
-            hex(metadata)
-        ),
-        zstar::DecodedCacheKey::Object(digest) => format!("o:sha256:{}", hex(digest)),
-    }
-}
-#[pymethods]
-impl DecodedChunk {
-    #[getter]
-    fn key(&self) -> String {
-        decoded_cache_key(self.inner.key())
-    }
-    #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
-        pyo3::types::PyBytes::new(py, self.inner.as_bytes())
-    }
-    #[getter]
-    fn weight(&self) -> usize {
-        self.inner.weight()
-    }
-}
-struct PythonDecodedCache {
-    object: Py<PyAny>,
-}
-impl zstar::DecodedCache for PythonDecodedCache {
-    fn get(&self, key: &zstar::DecodedCacheKey) -> std::io::Result<Option<zstar::CachedChunk>> {
-        Python::attach(|py| {
-            let result = self
-                .object
-                .bind(py)
-                .call_method1("get", (decoded_cache_key(key),))?;
-            if result.is_none() {
-                return Ok(None);
-            }
-            let token = result.extract::<PyRef<'_, DecodedChunk>>()?;
-            Ok(Some(token.inner.clone()))
-        })
-        .map_err(|e: PyErr| std::io::Error::other(e.to_string()))
-    }
-    fn put(&self, value: zstar::CachedChunk) -> std::io::Result<()> {
-        Python::attach(|py| {
-            let token = Py::new(py, DecodedChunk { inner: value })?;
-            self.object.bind(py).call_method1("put", (token,))?;
-            Ok(())
-        })
-        .map_err(|e: PyErr| std::io::Error::other(e.to_string()))
-    }
-}
-
-pub(crate) fn decoded_cache_binding(
-    py: Python<'_>,
-    cache: Option<Py<PyAny>>,
-    identity: Option<Vec<u8>>,
-) -> PyResult<Option<zstar::SharedDecodedCache>> {
-    match (cache, identity) {
-        (None, None) => Ok(None),
-        (Some(cache), Some(identity)) => {
-            let backend: Arc<dyn zstar::DecodedCache> =
-                if let Ok(memory) = cache.bind(py).extract::<PyRef<'_, DecodedMemoryCache>>() {
-                    memory.inner.clone()
-                } else {
-                    for method in ["get", "put"] {
-                        if !cache.bind(py).getattr(method)?.is_callable() {
-                            return Err(pyo3::exceptions::PyTypeError::new_err(
-                                "shared_cache must provide callable get and put methods",
-                            ));
-                        }
-                    }
-                    Arc::new(PythonDecodedCache { object: cache })
-                };
-            zstar::SharedDecodedCache::new(&identity, backend)
-                .map(Some)
-                .map_err(core_error)
-        }
-        _ => Err(pyo3::exceptions::PyValueError::new_err(
-            "shared_cache and shared_cache_identity must be supplied together",
-        )),
-    }
-}
-
 /// Copy any contiguous or strided bytes-like object exactly once.
 pub(crate) fn buffer_vec(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     let buffer = PyBuffer::<u8>::get(data)?;
@@ -363,16 +238,12 @@ fn verification_dict(
 }
 
 struct PythonSource {
-    cache_policy: Arc<std::sync::Mutex<zstar::http::CachePolicy>>,
     object: Arc<Py<PyAny>>,
     size: u64,
     permits: Arc<tokio::sync::Semaphore>,
 }
 #[async_trait::async_trait]
 impl zstar::AsyncRangeReader for PythonSource {
-    fn cache_allowed(&self) -> bool {
-        self.cache_policy.lock().unwrap().allows_reuse()
-    }
     async fn size(&self) -> zstar::Result<u64> {
         Ok(self.size)
     }
@@ -386,7 +257,6 @@ impl zstar::AsyncRangeReader for PythonSource {
             self.size,
         )?;
         let object = self.object.clone();
-        let cache_policy = self.cache_policy.clone();
         let permit = self
             .permits
             .clone()
@@ -406,13 +276,7 @@ impl zstar::AsyncRangeReader for PythonSource {
                         "short range response",
                     ));
                 }
-                if let Ok(control) = object.bind(py).getattr("_zstar_cache_control") {
-                    let control: String = control.extract()?;
-                    cache_policy
-                        .lock()
-                        .unwrap()
-                        .observe(zstar::http::CachePolicy::from_cache_control(&control));
-                }
+
                 value.extract(py)
             })
             .map_err(|error| zstar::Error::Io(PyCause::io(error.to_string(), error)))?;
@@ -516,10 +380,9 @@ impl IndexedArchive {
     async fn open_source(
         source: Arc<dyn zstar::AsyncRangeReader>,
         options: zstar::ReaderOptions,
-        shared_cache: Option<zstar::SharedDecodedCache>,
     ) -> PyResult<Self> {
         let resolver = options.resolver.clone();
-        let reader = reader::open_reader(source, options, shared_cache).await?;
+        let reader = reader::open_reader(source, options).await?;
         Ok(Self {
             inner: std::sync::Mutex::new(Some(Arc::new(IndexedState { reader, resolver }))),
         })
@@ -657,9 +520,8 @@ impl IndexedArchive {
         signature = (
             data,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -668,8 +530,6 @@ impl IndexedArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -680,7 +540,6 @@ impl IndexedArchive {
     fn from_bytes(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -691,13 +550,10 @@ impl IndexedArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let (options, shared_cache) = reader::reader_options(
+        let options = reader::reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -708,18 +564,12 @@ impl IndexedArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let source: Arc<dyn zstar::AsyncRangeReader> =
             Arc::new(bytes::Bytes::from(buffer_vec(py, data)?));
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(
-                source,
-                options,
-                shared_cache,
-            ))
+            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(source, options))
         })
     }
 
@@ -730,9 +580,8 @@ impl IndexedArchive {
             url,
             *,
             headers = None,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -741,8 +590,6 @@ impl IndexedArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -754,7 +601,6 @@ impl IndexedArchive {
         py: Python<'_>,
         url: String,
         headers: Option<std::collections::BTreeMap<String, String>>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -765,13 +611,10 @@ impl IndexedArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let (options, shared_cache) = reader::reader_options(
+        let options = reader::reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -782,8 +625,6 @@ impl IndexedArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let mut request = zstar::http::PresignedRequest::get(url);
@@ -795,11 +636,7 @@ impl IndexedArchive {
             request,
         ));
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(
-                source,
-                options,
-                shared_cache,
-            ))
+            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(source, options))
         })
     }
 
@@ -817,9 +654,8 @@ impl IndexedArchive {
             access_key_id = None,
             secret_access_key = None,
             session_token = None,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -828,8 +664,6 @@ impl IndexedArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -848,7 +682,6 @@ impl IndexedArchive {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -859,13 +692,10 @@ impl IndexedArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let (options, shared_cache) = reader::reader_options(
+        let options = reader::reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -876,8 +706,6 @@ impl IndexedArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let builder = s3::builder(
@@ -893,11 +721,7 @@ impl IndexedArchive {
             let mut options = options;
             let source =
                 s3::source(builder, key, object_prefix, &mut options).map_err(core_error)?;
-            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(
-                source,
-                options,
-                shared_cache,
-            ))
+            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(source, options))
         })
     }
 
@@ -907,9 +731,8 @@ impl IndexedArchive {
         signature = (
             path,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -918,8 +741,6 @@ impl IndexedArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -930,7 +751,6 @@ impl IndexedArchive {
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -941,13 +761,10 @@ impl IndexedArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let (options, shared_cache) = reader::reader_options(
+        let options = reader::reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -958,8 +775,6 @@ impl IndexedArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         py.detach(|| {
@@ -969,7 +784,7 @@ impl IndexedArchive {
                         .await
                         .map_err(local_source_error)?,
                 );
-                Self::open_source(source, options, shared_cache).await
+                Self::open_source(source, options).await
             })
         })
     }
@@ -980,7 +795,6 @@ impl IndexedArchive {
             source,
             size,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
@@ -988,11 +802,9 @@ impl IndexedArchive {
             max_read_bytes = 64 << 20,
             max_retained_entry_bytes = 1 << 30,
             max_entries = 0,
-            verify_external = true,
+            verify_external = false,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -1004,7 +816,6 @@ impl IndexedArchive {
         py: Python<'_>,
         source: Py<PyAny>,
         size: u64,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         memory_bytes: u64,
         max_encoded_bytes: u64,
@@ -1015,13 +826,10 @@ impl IndexedArchive {
         verify_external: bool,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let (options, shared_cache) = reader::reader_options(
+        let options = reader::reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -1032,22 +840,15 @@ impl IndexedArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let source: Arc<dyn zstar::AsyncRangeReader> = Arc::new(PythonSource {
-            cache_policy: Arc::new(std::sync::Mutex::new(zstar::http::CachePolicy::default())),
             object: Arc::new(source),
             size,
             permits: Arc::new(tokio::sync::Semaphore::new(8)),
         });
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(
-                source,
-                options,
-                shared_cache,
-            ))
+            pyo3_async_runtimes::tokio::get_runtime().block_on(Self::open_source(source, options))
         })
     }
     fn paths(&self, py: Python<'_>) -> PyResult<Vec<String>> {
@@ -1152,12 +953,6 @@ impl IndexedArchive {
             .iter()
             .map(|bytes| pyo3::types::PyBytes::new(py, bytes).unbind())
             .collect())
-    }
-    #[getter]
-    fn cache_bytes(&self) -> usize {
-        lock_state(&self.inner)
-            .as_ref()
-            .map_or(0, |inner| inner.reader.cache_len_bytes())
     }
     #[getter]
     fn closed(&self) -> bool {
@@ -1458,7 +1253,7 @@ fn pack_directory(
         *,
         objects = None,
         allow_special_bits = false,
-        verify_external = true,
+        verify_external = false,
     )
 )]
 fn extract(
@@ -1501,7 +1296,7 @@ fn extract(
         data,
         *,
         objects = None,
-        verify_external = true,
+        verify_external = false,
     )
 )]
 fn materialize(
@@ -1553,8 +1348,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IndexedArchive>()?;
     m.add_class::<reader::MemberCursor>()?;
     m.add_class::<IndexedEntries>()?;
-    m.add_class::<DecodedMemoryCache>()?;
-    m.add_class::<DecodedChunk>()?;
     m.add_class::<async_archive::AsyncArchive>()?;
     m.add_class::<async_archive::AsyncEntries>()?;
     Ok(())

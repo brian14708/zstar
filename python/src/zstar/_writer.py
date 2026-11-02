@@ -22,6 +22,13 @@ def _open_no_follow(path: str | os.PathLike[str], flags: int, mode: int = 0o666)
     return os.open(os.fspath(path), flags | getattr(os, "O_NOFOLLOW", 0), mode)
 
 
+def _discard_path(path: str, identity: tuple[int, int]) -> None:
+    with suppress(OSError):
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) == identity:
+            os.unlink(path)
+
+
 class ArchiveWriter:
     """Streaming writer with tarfile-compatible addfile and filesystem add methods.
 
@@ -54,7 +61,7 @@ class ArchiveWriter:
             root_extensions=root_extensions,
         )
         self._owned: ExitStack | None = None
-        self._path: str | os.PathLike[str] | None = None
+        self._path: tuple[str, tuple[int, int]] | None = None
 
     @classmethod
     def from_file(
@@ -72,22 +79,22 @@ class ArchiveWriter:
         name = file
         cleanup_path = os.path.abspath(os.fspath(name))
         with ExitStack() as owner:
-            created = False
+            identity: tuple[int, int] | None = None
             try:
                 if mode == "x":
                     fd = os.open(os.fspath(name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
                 else:
                     fd = _open_no_follow(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-                created = True
                 output = owner.enter_context(os.fdopen(fd, "wb"))
+                stat = os.fstat(output.fileno())
+                identity = (stat.st_dev, stat.st_ino)
                 writer = cls(output, **options)
             except BaseException:
-                if created:
-                    with suppress(OSError):
-                        os.unlink(cleanup_path)
+                if identity is not None:
+                    _discard_path(cleanup_path, identity)
                 raise
             writer._owned = owner.pop_all()
-            writer._path = cleanup_path
+            writer._path = (cleanup_path, identity)
         return writer
 
     @property
@@ -133,7 +140,7 @@ class ArchiveWriter:
         info.mode = mode
         self.addfile(info, BytesIO(data))
 
-    def add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
+    def _add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
         """Add an explicitly externalized body, preserving its v1 chunk references."""
         if self.closed:
             raise ValueError("writer closed")
@@ -187,8 +194,7 @@ class ArchiveWriter:
     def _discard_output(self) -> None:
         path, self._path = self._path, None
         if path is not None:
-            with suppress(OSError):
-                os.unlink(path)
+            _discard_path(*path)
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -301,9 +307,9 @@ class AsyncArchiveWriter:
         async with self._lock:
             await _writer_call(partial(self._writer.write_bytes, name, data, mode=mode))
 
-    async def add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
+    async def _add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
         async with self._lock:
-            await _writer_call(partial(self._writer.add_external, tarinfo, body))
+            await _writer_call(partial(self._writer._add_external, tarinfo, body))
 
     async def add(
         self,

@@ -223,13 +223,15 @@ func testPackedRustFS(ctx context.Context, t *testing.T, client *awss3.Client, b
 		t.Fatal("multipart path not exercised")
 	}
 	defer func() {
-		listed, err := client.ListObjectsV2(context.Background(), &awss3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("packed/")})
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		listed, err := client.ListObjectsV2(cleanupCtx, &awss3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("packed/")})
 		if err != nil {
 			t.Error(err)
 			return
 		}
 		for _, object := range listed.Contents {
-			if _, err := client.DeleteObject(context.Background(), &awss3.DeleteObjectInput{Bucket: aws.String(bucket), Key: object.Key}); err != nil {
+			if _, err := client.DeleteObject(cleanupCtx, &awss3.DeleteObjectInput{Bucket: aws.String(bucket), Key: object.Key}); err != nil {
 				t.Error(err)
 			}
 		}
@@ -249,7 +251,7 @@ func testPackedRustFS(ctx context.Context, t *testing.T, client *awss3.Client, b
 	if err = archiveWriter.Close(); err != nil {
 		t.Fatal(err)
 	}
-	archive, err := zstar.OpenWithOptions(ctx, zstar.ReaderAtSource{Reader: bytes.NewReader(thin.Bytes()), Length: int64(thin.Len())}, zstar.ReaderOptions{Resolver: resolver, DisableContentCache: true})
+	archive, err := zstar.OpenWithOptions(ctx, zstar.ReaderAtSource{Reader: bytes.NewReader(thin.Bytes()), Length: int64(thin.Len())}, zstar.ReaderOptions{Resolver: resolver})
 	if err != nil {
 		t.Fatal(err)
 	}

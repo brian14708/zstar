@@ -61,7 +61,11 @@ files, metadata services, or proxy settings; applications can resolve those
 policies before constructing the builder.
 `ReaderOptions`, `WriterOptions`, and `ManifestOptions` configure reader,
 writer, and metadata budgets. Keep caller-owned sources immutable while a
-reader or its cached bytes are in use.
+reader is in use.
+
+Manifest primitives and packed-storage spool types are exported from the crate
+root. Capture sorting and manifest module layout are internal implementation
+details. Custom `PackStore` implementations can use the public `Spool` type.
 
 From the repository root, run the examples with:
 

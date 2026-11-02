@@ -1,20 +1,20 @@
 """Structural interfaces for custom storage and typed reader options."""
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeAlias, TypedDict
+from typing import Literal, NotRequired, TypeAlias, TypedDict
 
 from typing_extensions import Protocol, Reader, Writer
 
 __all__ = [
     "BinaryWriter",
     "CborValue",
-    "DecodedCache",
     "EntryFields",
     "EntryTuple",
     "ErrorCategory",
     "ExtentTuple",
     "ManifestOptions",
     "ObjectResolver",
+    "ProgressCallback",
     "RangeSource",
     "ReadReport",
     "ReaderOptions",
@@ -25,10 +25,6 @@ __all__ = [
     "VerificationReport",
     "WriterOptions",
 ]
-
-if TYPE_CHECKING:
-    from ._native import DecodedChunk, DecodedMemoryCache
-
 
 CborValue: TypeAlias = (
     bool | int | str | bytes | list["CborValue"] | tuple["CborValue", ...] | dict[str, "CborValue"]
@@ -90,17 +86,17 @@ class ObjectResolver(Protocol):
     def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
 
 
-class DecodedCache(Protocol):
-    """Caller-owned cache for immutable decoded chunks."""
-
-    def get(self, key: str, /) -> "DecodedChunk | None": ...
-    def put(self, token: "DecodedChunk", /) -> None: ...
-
-
 class SpillStore(Reader[bytes], BinaryWriter, Protocol):
     """Exclusive temporary binary store used by bounded metadata spools."""
 
     def seek(self, offset: int, whence: int = 0, /) -> int: ...
+
+
+class ProgressCallback(Protocol):
+    """Progress reporting used by filesystem uploads and downloads."""
+
+    def set_size(self, size: int, /) -> None: ...
+    def relative_update(self, inc: int = 1, /) -> None: ...
 
 
 class SignedRequest(TypedDict):
@@ -124,7 +120,6 @@ class WriterOptions(TypedDict, total=False):
 
 
 class ManifestOptions(TypedDict, total=False):
-    cache_bytes: int
     memory_bytes: int
     max_encoded_bytes: int
     max_decoded_bytes: int
@@ -133,8 +128,6 @@ class ManifestOptions(TypedDict, total=False):
     max_entries: int
     max_spool_bytes: int
     create_spill_store: Callable[[], SpillStore] | None
-    shared_cache: "DecodedCache | DecodedMemoryCache | None"
-    shared_cache_identity: bytes | None
 
 
 class ReaderOptions(ManifestOptions, total=False):

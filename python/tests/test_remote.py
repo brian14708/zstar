@@ -122,27 +122,6 @@ def serve():
         thread.join()
 
 
-def test_native_http_async_reads_coalesce_and_use_verified_cache(serve):
-    data = bytes(_native.pack_file("hello", b"hello world"))
-    with serve(data) as (url, calls, _):
-
-        async def exercise():
-            archive = await zstar.AsyncArchive.from_url(url, cache_bytes=65536)
-            assert [name async for name in archive.names()] == ["hello"]
-            assert len(calls) == 3  # GET size probe, footer, TOC
-            results = await asyncio.gather(*(archive.read("hello", 6, 5) for _ in range(8)))
-            assert results == [b"world"] * 8
-            assert len(calls) == 4
-            assert 0 < archive.cache_bytes <= 65536
-            assert await archive.read("hello") == b"hello world"
-            assert len(calls) == 4
-            with pytest.raises(ValueError):
-                await archive.read("hello", 12, 1)
-            assert len(calls) == 4
-
-        asyncio.run(exercise())
-
-
 def test_remote_spill_factory_limits_and_borrowed_store_lifetime(serve):
     data = bytes(_native.pack_file("hello", b"hello world"))
     stores = []
@@ -185,7 +164,6 @@ def test_native_http_cancellation_closes_pending_network_io(serve, readinto):
                 assert await asyncio.to_thread(disconnected.wait, 2), (
                     "Rust request survived Python cancellation"
                 )
-                assert archive.cache_bytes == 0
                 assert buffer == b"?" * 11 and await member.tell() == 0
                 if readinto:
                     assert await member.readinto(buffer) == 11
@@ -208,12 +186,11 @@ def test_remote_close_cancels_shared_network_reads_and_joins_all_closers(serve):
             reads = [asyncio.create_task(archive.read("hello")) for _ in range(8)]
 
             async def started():
-                while len(calls) < 4:
+                while len(calls) < 4:  # noqa: ASYNC110 - server runs in another thread
                     await asyncio.sleep(0.01)
 
             await asyncio.wait_for(started(), 2)
             await asyncio.wait_for(asyncio.gather(archive.close(), archive.close()), 2)
-            assert archive.closed and archive.cache_bytes == 0
             outcomes = await asyncio.gather(*reads, return_exceptions=True)
             assert all(isinstance(result, zstar.ZstarError) for result in outcomes)
             assert all(result.category == "unsupported-operation" for result in outcomes)
@@ -246,9 +223,7 @@ def test_remote_async_context_closes_caches_and_preserves_body_failure(serve):
                 async with archive as entered:
                     assert entered is archive and not archive.closed
                     assert await archive.read("hello") == b"hello world"
-                    assert archive.cache_bytes > 0
                     raise RuntimeError("body failed")
-            assert archive.closed and archive.cache_bytes == 0
             with pytest.raises(ValueError, match="closed"):
                 await archive.read("hello")
 
@@ -272,7 +247,7 @@ def test_put_cancellation_closes_pending_network_io(serve):
             future = _native.put_presigned(b"upload", url)
 
             async def started():
-                while not calls:
+                while not calls:  # noqa: ASYNC110 - server runs in another thread
                     await asyncio.sleep(0.01)
 
             await asyncio.wait_for(started(), 2)
@@ -323,7 +298,7 @@ def test_async_provider_refresh_preserves_loop_context_and_signed_headers(serve)
                     "expires_in": 300,
                 }
 
-            archive = await zstar.AsyncArchive.from_url(provider=provider, cache_bytes=0)
+            archive = await zstar.AsyncArchive.from_url(provider=provider)
             assert await archive.read("hello") == b"hello provider"
             assert seen[:2] == [("GET", False), ("GET", True)]
             assert len(seen) == 5  # rejected size probe + size/footer/TOC/payload
@@ -479,7 +454,7 @@ def test_parallel_provider_requests_have_independent_contexts(serve, tmp_path):
                     finally:
                         active -= 1
 
-            archive = await zstar.AsyncArchive.from_url(provider=Provider(), cache_bytes=0)
+            archive = await zstar.AsyncArchive.from_url(provider=Provider())
             got = await asyncio.gather(archive.read("a", 0, 1), archive.read("b", 0, 1))
             assert got == [b"a", b"b"]
             assert peak == 2
@@ -498,7 +473,6 @@ def test_remote_external_policy_cannot_disable_data_checksums(serve, verify_exte
             with pytest.raises(zstar.ZstarError) as caught:
                 await archive.read("a-b")
             assert caught.value.category == "malformed-frame"
-            assert archive.cache_bytes == 0
 
         asyncio.run(exercise())
 
@@ -508,7 +482,7 @@ def test_remote_batch_ranges_share_a_frame_without_decoded_cache(serve):
     with serve(data) as (url, calls, _):
 
         async def exercise():
-            archive = await zstar.AsyncArchive.from_url(url, cache_bytes=0)
+            archive = await zstar.AsyncArchive.from_url(url)
             assert len(calls) == 3
             assert await archive.read_many([("x", 6, 5), ("x", 0, 5), ("x", 0, 11)]) == [
                 b"world",
@@ -516,7 +490,6 @@ def test_remote_batch_ranges_share_a_frame_without_decoded_cache(serve):
                 b"hello world",
             ]
             assert len(calls) == 4
-            assert archive.cache_bytes == 0
             with pytest.raises(zstar.ZstarError):
                 await archive.read_many([("x", 0, 5), ("x", 12, 1)])
             assert len(calls) == 4
@@ -533,7 +506,9 @@ def test_remote_external_objects_share_encoded_resolver_reads_and_report_scope(
     with serve(data) as (url, calls, _):
 
         async def exercise():
-            archive = await zstar.AsyncArchive.from_url(url, resolver=resolver)
+            archive = await zstar.AsyncArchive.from_url(
+                url, resolver=resolver, verify_external=True
+            )
             assert archive.entry_count > 0
             before = len(calls)
             assert await archive.read_many([("repeat", 0, 12), ("world.txt", 0, 6)]) == [
@@ -546,7 +521,7 @@ def test_remote_external_objects_share_encoded_resolver_reads_and_report_scope(
             assert not report["full_archive_validated"]
             assert report["external_objects_sha256_checked"]
             assert not report["external_objects_unchecked"]
-            assert resolver.calls == 1
+            assert resolver.calls == 2
             assert len(calls) == before  # No physical pointer fetch for selective reads.
 
         asyncio.run(exercise())
@@ -574,7 +549,6 @@ def test_remote_external_hash_policy_and_encoded_resolver_error_categories(
                 with pytest.raises(zstar.ZstarError) as caught:
                     await archive.read("hello.txt", resolver=Wrong())
                 assert caught.value.category == "integrity-failure"
-                assert archive.cache_bytes == 0
             else:
                 raw, report = await archive.read_with_report("hello.txt", 0, 6, resolver=Wrong())
                 assert raw == b"wrong\n"
@@ -625,7 +599,7 @@ def test_async_metadata_calls_are_awaitable_and_share_the_loop_with_the_provider
                 await asyncio.sleep(0.01)
                 return {"url": url, "expires_in": 300}
 
-            archive = await zstar.AsyncArchive.from_url(provider=provider, cache_bytes=0)
+            archive = await zstar.AsyncArchive.from_url(provider=provider)
             from zstar import _native
 
             for awaitable in (
@@ -667,7 +641,7 @@ def test_native_http_sync_and_fsspec_read_without_head(serve):
         with zstar.Archive.from_url(url) as archive, archive.open("hello") as member:
             assert member.read(5) == b"hello"
             assert member.read() == b" world"
-        assert len(calls) == 4
+        assert len(calls) == 5
         fs = ZstarFileSystem(fo=url, target_options={"headers": {"X-Test": "value"}})
         try:
             with fs.open("hello", block_size=3) as member:
@@ -686,21 +660,3 @@ def test_native_http_sync_and_fsspec_read_without_head(serve):
                     assert stream.read() == b"hello world"
             finally:
                 fs.close()
-
-
-@pytest.mark.parametrize(
-    "control,requests",
-    [("private, max-age=3600, immutable", 1), ("no-store", 2), ("no-cache", 2), ("max-age=0", 2)],
-)
-def test_http_member_cache_honors_response_headers(serve, control, requests):
-    data = bytes(_native.pack_file("hello", b"hello world"))
-    with (
-        serve(data, cache_control=control) as (url, calls, _),
-        zstar.Archive.from_url(url) as archive,
-    ):
-        before = len(calls)
-        with archive.open("hello") as member:
-            assert member.read(5) == b"hello"
-            member.seek(6)
-            assert member.read(5) == b"world"
-        assert len(calls) - before == requests

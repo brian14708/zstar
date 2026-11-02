@@ -16,6 +16,15 @@ ROOT = Path(__file__).resolve().parents[2] / "testdata" / "entry-manifest"
 MANIFEST = json.loads((ROOT / "manifest.json").read_text())
 assert MANIFEST["schema_version"] == 1
 assert MANIFEST["format"] == "entry-manifest"
+CASES = [
+    {
+        **case,
+        "archive": path,
+        "archive_sha256": archive["sha256"],
+    }
+    for path, archive in MANIFEST["archives"].items()
+    for case in archive["cases"]
+]
 
 
 def artifact(name):
@@ -37,7 +46,7 @@ class Objects:
         return encoded
 
 
-@pytest.mark.parametrize("case", MANIFEST["cases"], ids=lambda case: case["name"])
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
 def test_corpus(case, source_factory):
     data = artifact(case["archive"])
     assert hashlib.sha256(data).hexdigest() == case["archive_sha256"]
@@ -49,7 +58,7 @@ def test_corpus(case, source_factory):
             archive = zstar.Archive.from_source(
                 source_factory(data),
                 len(data),
-                verify_external=case.get("verify_external", True),
+                verify_external=case.get("verify_external", False),
                 **options,
             )
             request = case["request"]
@@ -61,7 +70,7 @@ def test_corpus(case, source_factory):
             assert report["metadata_authenticated"]
             assert not report["full_archive_validated"]
             if operation == "external-range":
-                if case.get("verify_external", True):
+                if case.get("verify_external", False):
                     assert report["external_objects_sha256_checked"]
                     assert not report["external_objects_unchecked"]
                 else:
@@ -72,16 +81,21 @@ def test_corpus(case, source_factory):
             assert not archive.closed
         else:
             resolver = Objects(case.get("objects", {})) if operation == "external-closure" else None
-            archive = zstar.Archive(data, resolver=resolver, **options)
+            archive = zstar.Archive(
+                data,
+                resolver=resolver,
+                verify_external=case.get("verify_external", False),
+                **options,
+            )
             report = archive.verify(external=operation == "external-closure")
             for path, expected in case.get("members", {}).items():
                 assert archive.read(path, resolver=resolver) == artifact(expected)
             for path, target in case.get("links", {}).items():
                 assert archive.getinfo(path).linkname == target
     except zstar.ZstarError as error:
-        assert error.category == case["expected_error"], str(error)
+        assert error.category == case.get("expected_error"), str(error)
     else:
-        assert case["expected_error"] is None, "expected SDK rejection"
+        assert case.get("expected_error") is None, "expected SDK rejection"
         for key, expected in case.get("expected_verification", {}).items():
             actual = report[key]
             if key == "external_objects_sha256_checked" and isinstance(expected, bool):

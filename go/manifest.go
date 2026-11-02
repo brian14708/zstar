@@ -163,7 +163,7 @@ func (e Entry) External() bool {
 }
 
 func (e Entry) value() []any {
-	extents := make([]any, len(e.Extents))
+	extents := make([][]any, len(e.Extents))
 	for i, x := range e.Extents {
 		extents[i] = x.value()
 	}
@@ -333,40 +333,24 @@ func manifestEncode(value any) ([]byte, error) {
 	return manifestEncoder.Marshal(value)
 }
 
-// ManifestOptions controls resource budgets. Zero values select documented
-// defaults, except ContentCacheBytes, which disables the lower-level manifest
-// cache at zero.
-//
-// Reader fields (OpenManifest): MemoryBytes, MaxEncodedBytes, MaxDecodedBytes,
-// MaxReadBytes, MaxRetainedEntryBytes, MaxEntries, ContentCacheBytes,
-// ConcurrentChunks, ReadAheadBytes, DisableDisk, SpoolBudget, CreateSpillStore.
-// Writer fields: CompressionLevel, RootExtensions, BlockTarget, plus the
-// spool fields (MemoryBytes, DisableDisk, SpoolBudget, CreateSpillStore).
-// Fields outside the applicable side are ignored.
-type ManifestOptions struct {
+// ManifestReaderOptions controls manifest reading and content resource budgets.
+// Zero values select documented defaults. Writer configuration uses ManifestWriterOptions.
+type ManifestReaderOptions struct {
 	MemoryBytes, MaxEncodedBytes, MaxDecodedBytes uint64
 	MaxReadBytes                                  uint64
 	// MaxRetainedEntryBytes bounds the estimated heap retained by parsed
-	// entry metadata, including spare entry-slice capacity (default 1 GiB). Reader only. Exceeding it, or MaxEntries,
+	// entry metadata, including spare entry-slice capacity (default 1 GiB). Exceeding it, or MaxEntries,
 	// fails OpenManifest with a "resource-limit" error.
 	MaxRetainedEntryBytes uint64
 	// MaxEntries bounds the number of entries; zero means no separate count cap.
-	// Reader only.
 	MaxEntries uint64
-	// ContentCacheBytes is a decoded-content budget, disabled by default.
-	ContentCacheBytes uint64
 	// ConcurrentChunks bounds fetch/decode/hash work, including canceled calls.
 	ConcurrentChunks int
 	// ReadAheadBytes bounds sequential transport buffers (default 1 MiB).
 	ReadAheadBytes uint64
-	// Writer settings; zero compression level selects the codec default.
-	CompressionLevel int
-	RootExtensions   Extensions
-	// BlockTarget is a writer target in [512, 1 MiB], default 64 KiB.
-	BlockTarget int
-	DisableDisk bool
+	DisableDisk    bool
 	// SpoolBudget is shared by all derived spools. Nil creates a 4 GiB quota
-	// for this reader/writer; an explicit pointer can share it across owners.
+	// for this reader; an explicit pointer can share it across owners.
 	SpoolBudget *SpoolBudget
 	// CreateSpillStore supplies an empty append destination with independent
 	// ReadAt support. Ownership transfers to the SDK until Close.
@@ -381,7 +365,73 @@ type ManifestSpillStore interface {
 	io.Closer
 }
 
-func (o ManifestOptions) defaults() ManifestOptions {
+// SpoolOptions controls packed-object temporary storage. Zero values select
+// 8 MiB in memory and a 4 GiB size limit and shared quota.
+type SpoolOptions struct {
+	MemoryBytes      uint64
+	MaxEncodedBytes  uint64
+	DisableDisk      bool
+	SpoolBudget      *SpoolBudget
+	CreateSpillStore func() (ManifestSpillStore, error)
+}
+
+func (o SpoolOptions) defaults() manifestOptions {
+	return (ManifestReaderOptions{
+		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
+		DisableDisk: o.DisableDisk, SpoolBudget: o.SpoolBudget,
+		CreateSpillStore: o.CreateSpillStore,
+	}).defaults()
+}
+
+// ManifestWriterOptions controls manifest encoding and temporary storage.
+// Zero values select defaults. Reader-only limits are intentionally unavailable.
+type ManifestWriterOptions struct {
+	MemoryBytes, MaxEncodedBytes, MaxDecodedBytes uint64
+	CompressionLevel                              int
+	RootExtensions                                Extensions
+	// BlockTarget is a target in [512, 1 MiB], default 64 KiB.
+	BlockTarget      int
+	DisableDisk      bool
+	SpoolBudget      *SpoolBudget
+	CreateSpillStore func() (ManifestSpillStore, error)
+}
+
+type manifestOptions struct {
+	ManifestReaderOptions
+	CompressionLevel int
+	RootExtensions   Extensions
+	BlockTarget      int
+}
+
+func (o ManifestWriterOptions) defaults() manifestOptions {
+	result := (ManifestReaderOptions{
+		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
+		MaxDecodedBytes: o.MaxDecodedBytes, DisableDisk: o.DisableDisk,
+		SpoolBudget: o.SpoolBudget, CreateSpillStore: o.CreateSpillStore,
+	}).defaults()
+	result.CompressionLevel = o.CompressionLevel
+	result.RootExtensions = o.RootExtensions
+	if o.BlockTarget != 0 {
+		result.BlockTarget = o.BlockTarget
+	}
+	return result
+}
+
+func (o manifestOptions) writerOptions() ManifestWriterOptions {
+	return ManifestWriterOptions{
+		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
+		MaxDecodedBytes: o.MaxDecodedBytes, CompressionLevel: o.CompressionLevel,
+		RootExtensions: o.RootExtensions, BlockTarget: o.BlockTarget,
+		DisableDisk: o.DisableDisk, SpoolBudget: o.SpoolBudget,
+		CreateSpillStore: o.CreateSpillStore,
+	}
+}
+
+func (o ManifestReaderOptions) defaults() manifestOptions {
+	return (manifestOptions{ManifestReaderOptions: o}).defaults()
+}
+
+func (o manifestOptions) defaults() manifestOptions {
 	if o.SpoolBudget == nil {
 		o.SpoolBudget = NewSpoolBudget(4 << 30)
 	}
@@ -418,7 +468,7 @@ type manifestSpool struct {
 	custom   ManifestSpillStore
 	size     uint64
 	charged  uint64
-	options  ManifestOptions
+	options  manifestOptions
 	closed   bool
 	writeErr error
 }
@@ -619,11 +669,11 @@ type Manifest struct {
 // The caller owns the immutable source, which must support concurrent reads.
 // The opening context is used only during open; subsequent operations supply
 // their own contexts. Close releases SDK storage without closing the source.
-func OpenManifest(ctx context.Context, source RangeReader, options ManifestOptions) (result *Manifest, err error) {
+func OpenManifest(ctx context.Context, source RangeReader, config ManifestReaderOptions) (result *Manifest, err error) {
 	if source == nil {
 		return nil, errors.New("zstar: nil source")
 	}
-	options = options.defaults()
+	options := config.defaults()
 	if options.ReadAheadBytes > 17<<20 {
 		return nil, rejected("resource-limit", "read-ahead exceeds 17 MiB")
 	}
@@ -681,7 +731,6 @@ func OpenManifest(ctx context.Context, source RangeReader, options ManifestOptio
 	}
 	m := &Manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: footer.ManifestOffset, source: source, maxRead: options.MaxReadBytes, readAhead: options.ReadAheadBytes}
 	m.content = newManifestContentState(options, source)
-	m.content.metadata = footer.ManifestSHA256
 	defer func() {
 		if err != nil {
 			m.content.close()
@@ -851,7 +900,7 @@ func OpenManifest(ctx context.Context, source RangeReader, options ManifestOptio
 }
 
 // Close cancels content loads and releases retained metadata and SDK storage.
-// It leaves the caller-owned source, resolver and shared cache open.
+// It leaves the caller-owned source and resolver open.
 func (m *Manifest) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -948,7 +997,7 @@ func (m *Manifest) VisitEntries(visit func(Entry) error) error {
 // EncodedContentResolver returns a complete encoded object, with actual-input
 // limits enforced independently of the encoded-size hint. Implementations must
 // support concurrent calls and return caller-owned bytes. Readers never close
-// the resolver. A pointer implementation provides a stable cache namespace.
+// the resolver.
 type EncodedContentResolver interface {
 	GetEncoded(ctx context.Context, digest [32]byte, encodedSizeHint, maxBytes uint64) ([]byte, error)
 }
@@ -983,7 +1032,7 @@ func (m *Manifest) RootExtensions() Extensions {
 	return cloneExtensions(m.rootExtensions)
 }
 
-func decodedSpoolOptions(o ManifestOptions) ManifestOptions {
+func decodedSpoolOptions(o manifestOptions) manifestOptions {
 	o.MaxEncodedBytes = o.MaxDecodedBytes
 	return o
 }

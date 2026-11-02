@@ -5,16 +5,28 @@ run:
 linters:
   default: standard
   enable:
+    - asasalint
+    - bidichk
     - bodyclose
+    - canonicalheader
+    - contextcheck
     - durationcheck
     - errorlint
     - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - iface
     - copyloopvar
     - nilerr
     - nilnesserr
     - noctx
+    - nosprintfhostport
     - perfsprint
     - prealloc
+    - predeclared
+    - makezero
+    - mirror
     - reassign
     - usestdlibvars
     - wastedassign

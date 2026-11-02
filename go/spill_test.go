@@ -38,7 +38,7 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 	}
 	cleanupFailure := errors.New("custom spill cleanup failed")
 	store := &failingCloseSpill{}
-	reader, err := OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestOptions{
+	reader, err := OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	}})
 	if err != nil {
@@ -57,7 +57,7 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 		t.Fatal("closed reader used")
 	}
 	store = &failingCloseSpill{failure: cleanupFailure}
-	_, err = OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestOptions{
+	_, err = OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	}})
 	if !errors.Is(err, cleanupFailure) || !store.closed {
@@ -67,7 +67,7 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 	corrupt := bytes.Clone(data)
 	corrupt[len(corrupt)-1] ^= 1
 	store = &failingCloseSpill{failure: cleanupFailure}
-	_, err = OpenWithOptions(context.Background(), memoryRange(corrupt), ReaderOptions{Manifest: ManifestOptions{
+	_, err = OpenWithOptions(context.Background(), memoryRange(corrupt), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	}})
 	if ErrorCategory(err) != "integrity-failure" || !errors.Is(err, cleanupFailure) || !store.closed {
@@ -79,7 +79,7 @@ func TestSharedSpoolQuotaPrecedesIOAndReleasesAfterCleanupFailure(t *testing.T) 
 	budget := NewSpoolBudget(5)
 	calls := 0
 	cleanupFailure := errors.New("close failed")
-	options := (ManifestOptions{
+	options := (ManifestReaderOptions{
 		MemoryBytes: 1, DisableDisk: true, SpoolBudget: budget,
 		CreateSpillStore: func() (ManifestSpillStore, error) {
 			calls++
@@ -126,7 +126,7 @@ func TestSpoolBudgetSharedByConcurrentOwners(t *testing.T) {
 	results := make(chan bool, 8)
 	for range 8 {
 		wait.Go(func() {
-			spool := manifestSpool{options: (ManifestOptions{SpoolBudget: budget}).defaults()}
+			spool := manifestSpool{options: (ManifestReaderOptions{SpoolBudget: budget}).defaults()}
 			results <- spool.append([]byte("x")) == nil
 			ready <- struct{}{}
 			<-release
@@ -166,7 +166,7 @@ func (s *partialSpill) Write(data []byte) (int, error) {
 
 func TestPartialSpillWriteRetainsQuotaUntilClose(t *testing.T) {
 	budget := NewSpoolBudget(4)
-	options := (ManifestOptions{
+	options := (ManifestReaderOptions{
 		MemoryBytes: 1, SpoolBudget: budget,
 		CreateSpillStore: func() (ManifestSpillStore, error) { return &partialSpill{}, nil },
 	}).defaults()
@@ -204,14 +204,16 @@ func TestSpoolQuotaPublicReaderAndWriterFailureCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	budget := NewSpoolBudget(0)
-	options := ManifestOptions{
+	options := ManifestReaderOptions{
 		SpoolBudget: budget, MemoryBytes: 1,
 		CreateSpillStore: func() (ManifestSpillStore, error) { t.Fatal("quota must precede callback"); return nil, nil },
 	}
 	if _, err = OpenManifest(context.Background(), memoryRange(data), options); ErrorCategory(err) != "resource-limit" {
 		t.Fatal(err)
 	}
-	writer, err := NewEntryArchiveWriter(io.Discard, 2048, options)
+	writer, err := NewEntryArchiveWriter(io.Discard, 2048, ManifestWriterOptions{
+		SpoolBudget: budget, MemoryBytes: 1, CreateSpillStore: options.CreateSpillStore,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +230,7 @@ func TestSpoolQuotaPublicReaderAndWriterFailureCleanup(t *testing.T) {
 
 func TestRecordQuotaFailurePreservesLogicalSpool(t *testing.T) {
 	budget := NewSpoolBudget(5)
-	spool := manifestSpool{options: (ManifestOptions{SpoolBudget: budget}).defaults()}
+	spool := manifestSpool{options: (ManifestReaderOptions{SpoolBudget: budget}).defaults()}
 	defer func() { checkCleanup(t, spool.close()) }()
 	if err := spool.append([]byte("a")); err != nil {
 		t.Fatal(err)
@@ -244,7 +246,7 @@ func TestRecordQuotaFailurePreservesLogicalSpool(t *testing.T) {
 func TestFactoryFailureRollsBackReservationAndRejectsNonemptyStore(t *testing.T) {
 	budget := NewSpoolBudget(3)
 	factoryFailure := errors.New("factory failed")
-	spool := manifestSpool{options: (ManifestOptions{
+	spool := manifestSpool{options: (ManifestReaderOptions{
 		MemoryBytes: 1, SpoolBudget: budget,
 		CreateSpillStore: func() (ManifestSpillStore, error) { return nil, factoryFailure },
 	}).defaults()}
@@ -282,7 +284,7 @@ func (s *shortReadSpill) ReadAt(out []byte, at int64) (int, error) {
 }
 
 func TestCustomSpillCannotSilentlyReturnShortMetadata(t *testing.T) {
-	spool := manifestSpool{options: (ManifestOptions{
+	spool := manifestSpool{options: (ManifestReaderOptions{
 		MemoryBytes:      1,
 		CreateSpillStore: func() (ManifestSpillStore, error) { return &shortReadSpill{}, nil },
 	}).defaults()}

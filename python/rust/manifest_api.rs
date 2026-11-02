@@ -83,12 +83,12 @@ fn write_python(
 ) -> std::io::Result<usize> {
     Python::attach(|py| -> PyResult<usize> {
         let result = object.call_method1(py, "write", (PyBytes::new(py, bytes),))?;
-        // Sinks may return None to indicate that the whole buffer was accepted.
-        let size = if result.is_none(py) {
-            bytes.len()
-        } else {
-            result.extract(py)?
-        };
+        if result.is_none(py) {
+            return Err(pyo3::exceptions::PyBlockingIOError::new_err(
+                "output stream would block",
+            ));
+        }
+        let size = result.extract(py)?;
         if size > bytes.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(oversized));
         }
@@ -327,11 +327,8 @@ impl ManifestArchive {
             max_read_bytes = 64 << 20,
             max_retained_entry_bytes = 1 << 30,
             max_entries = 0,
-            cache_bytes = 16 << 20,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
         )
     )]
     #[expect(clippy::too_many_arguments, reason = "Public Python keyword options.")]
@@ -345,13 +342,9 @@ impl ManifestArchive {
         max_read_bytes: u64,
         max_retained_entry_bytes: u64,
         max_entries: u64,
-        cache_bytes: usize,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
     ) -> PyResult<Self> {
-        let shared_cache = crate::decoded_cache_binding(py, shared_cache, shared_cache_identity)?;
         let options = ManifestOptions {
             memory_bytes,
             max_encoded_bytes,
@@ -363,7 +356,7 @@ impl ManifestArchive {
             create_spill_store: spill_factory(py, create_spill_store)?,
             ..Default::default()
         };
-        let mut reader = py
+        let reader = py
             .detach(|| {
                 BlockingArchive::open(
                     Source {
@@ -374,8 +367,6 @@ impl ManifestArchive {
                 )
             })
             .map_err(core_error)?;
-        reader.set_content_cache_bytes(cache_bytes);
-        reader.set_shared_decoded_cache(shared_cache);
         let entry_count = reader.manifest().root().entry_count;
         Ok(Self {
             inner: Arc::new(Gate::new(reader)),
@@ -397,10 +388,6 @@ impl ManifestArchive {
     #[getter]
     fn spilled(&self, py: Python<'_>) -> PyResult<bool> {
         self.inner.run(py, |r| Ok(r.manifest().spilled()))
-    }
-    #[getter]
-    fn content_cache_bytes(&self, py: Python<'_>) -> PyResult<usize> {
-        self.inner.run(py, |r| Ok(r.content_cache_bytes()))
     }
     /// A bounded cursor. Each result owns its metadata; closing the archive
     /// invalidates all cursors. The archive validates entry count and required features at open.
@@ -442,7 +429,7 @@ impl ManifestArchive {
             length = None,
             *,
             resolver = None,
-            verify_external = true,
+            verify_external = false,
         )
     )]
     fn read(

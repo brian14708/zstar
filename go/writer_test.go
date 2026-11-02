@@ -234,40 +234,6 @@ func TestWriterFailureAndNamespaceRules(t *testing.T) {
 	}
 }
 
-func TestSmallMembersShareFramesAndCache(t *testing.T) {
-	var output bytes.Buffer
-	writer := mustTestWriter(t, &output, WriterOptions{})
-	for i := range 10 {
-		if err := writer.Add(context.Background(), Header{Path: fmt.Sprintf("f%d", i), Size: 1}, strings.NewReader("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	source := &countedSource{data: output.Bytes()}
-	archive, err := Open(context.Background(), source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := archive.Entry("f0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	last, err := archive.Entry("f9")
-	if err != nil || first.Extents[0].Source != last.Extents[0].Source {
-		t.Fatal("small members scattered")
-	}
-	for i := range 10 {
-		if _, err = archive.Read(context.Background(), fmt.Sprintf("f%d", i), 0, 1); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if source.reads != 3 {
-		t.Fatalf("wanted footer+metadata+shared frame, got %d reads", source.reads)
-	}
-}
-
 type countedSource struct {
 	data  []byte
 	reads int
@@ -281,7 +247,7 @@ func (s *countedSource) ReadRange(_ context.Context, offset, length int64) ([]by
 
 func TestConcurrentReaderAtAndBudget(t *testing.T) {
 	data := buildTestArchive(t, 1024)
-	archive, err := OpenWithOptions(context.Background(), ReaderAtSource{Reader: bytes.NewReader(data), Length: int64(len(data))}, ReaderOptions{Manifest: ManifestOptions{MaxReadBytes: 32, ContentCacheBytes: 4096}})
+	archive, err := OpenWithOptions(context.Background(), ReaderAtSource{Reader: bytes.NewReader(data), Length: int64(len(data))}, ReaderOptions{Manifest: ManifestReaderOptions{MaxReadBytes: 32}})
 	if err != nil {
 		t.Fatal(err)
 	}

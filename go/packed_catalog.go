@@ -33,6 +33,7 @@ func packedStrongETag(s string) bool {
 	}
 	return true
 }
+
 func (s PackSnapshot) value() []any { return []any{s.Key, s.Length, s.Version, s.ETag} }
 
 // PackRecord identifies one complete encoded pack by SHA-256.
@@ -77,21 +78,28 @@ type PackedCatalog struct {
 	byChunk map[[32]byte]int
 }
 
-// NewPackedCatalog copies, sorts and bounds immutable catalog records.
-func NewPackedCatalog(packs []PackRecord, chunks []PackedChunk, limits CatalogLimits) (*PackedCatalog, error) {
-	limits = limits.normalized()
+func checkCatalogLimits(packs []PackRecord, chunks []PackedChunk, limits CatalogLimits) error {
 	if limits.MaxPacks < 0 || limits.MaxChunks < 0 || len(packs) > limits.MaxPacks || len(chunks) > limits.MaxChunks {
-		return nil, rejected("resource-limit", "catalog records")
+		return rejected("resource-limit", "catalog records")
 	}
 	cost := uint64(len(chunks)) * 256
 	for _, pack := range packs {
 		if err := pack.Snapshot.Validate(); err != nil {
-			return nil, err
+			return err
 		}
 		cost += uint64(256 + len(pack.Snapshot.Key)*2 + len(pack.Snapshot.Version) + len(pack.Snapshot.ETag))
 	}
 	if cost > limits.MaxMemoryBytes/2 {
-		return nil, rejected("resource-limit", "catalog memory")
+		return rejected("resource-limit", "catalog memory")
+	}
+	return nil
+}
+
+// NewPackedCatalog copies, sorts and bounds immutable catalog records.
+func NewPackedCatalog(packs []PackRecord, chunks []PackedChunk, limits CatalogLimits) (*PackedCatalog, error) {
+	limits = limits.normalized()
+	if err := checkCatalogLimits(packs, chunks, limits); err != nil {
+		return nil, err
 	}
 	c := &PackedCatalog{packs: append([]PackRecord(nil), packs...), chunks: append([]PackedChunk(nil), chunks...), byPack: make(map[[32]byte]int, len(packs)), byChunk: make(map[[32]byte]int, len(chunks))}
 	sort.Slice(c.packs, func(i, j int) bool { return bytes.Compare(c.packs[i].ID[:], c.packs[j].ID[:]) < 0 })
@@ -143,16 +151,18 @@ func (c *PackedCatalog) Encode(limits CatalogLimits) ([]byte, error) {
 		return nil, errors.New("zstar: nil packed catalog")
 	}
 	limits = limits.normalized()
-	if _, err := NewPackedCatalog(c.packs, c.chunks, limits); err != nil {
+	// Records and lookup indexes are immutable and were validated at construction.
+	// Only the caller's potentially tighter limits need checking again.
+	if err := checkCatalogLimits(c.packs, c.chunks, limits); err != nil {
 		return nil, err
 	}
-	packs := make([]any, len(c.packs))
-	chunks := make([]any, len(c.chunks))
+	packs := make([][2]any, len(c.packs))
+	chunks := make([][5]any, len(c.chunks))
 	for i, pack := range c.packs {
-		packs[i] = []any{pack.ID[:], pack.Snapshot.value()}
+		packs[i] = [2]any{pack.ID, pack.Snapshot.value()}
 	}
 	for i, chunk := range c.chunks {
-		chunks[i] = []any{chunk.Digest[:], uint64(c.byPack[chunk.Pack]), chunk.Offset, chunk.EncodedLength, chunk.DecodedLength}
+		chunks[i] = [5]any{chunk.Digest, uint64(c.byPack[chunk.Pack]), chunk.Offset, chunk.EncodedLength, chunk.DecodedLength}
 	}
 	raw, err := manifestEncode([]any{uint64(1), packs, chunks})
 	if err != nil {

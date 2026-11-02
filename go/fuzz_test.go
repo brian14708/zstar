@@ -1,7 +1,6 @@
 package zstar
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -24,7 +23,7 @@ func FuzzIndexedArchive(f *testing.F) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		reader, err := OpenWithOptions(ctx, memoryRange(data), ReaderOptions{Manifest: ManifestOptions{MaxEncodedBytes: 64 << 10, MaxDecodedBytes: 64 << 10, MaxReadBytes: 64 << 10, ConcurrentChunks: 1, DisableDisk: true}, DisableContentCache: true})
+		reader, err := OpenWithOptions(ctx, memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{MaxEncodedBytes: 64 << 10, MaxDecodedBytes: 64 << 10, MaxReadBytes: 64 << 10, ConcurrentChunks: 1, DisableDisk: true}})
 		if err != nil {
 			return
 		}
@@ -79,31 +78,10 @@ func TestMetadataBudgetRejectsBeforeMetadataFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := &countedSource{data: data}
-	if _, err := OpenWithOptions(context.Background(), source, ReaderOptions{Manifest: ManifestOptions{MaxDecodedBytes: 1}}); ErrorCategory(err) != "resource-limit" {
+	if _, err := OpenWithOptions(context.Background(), source, ReaderOptions{Manifest: ManifestReaderOptions{MaxDecodedBytes: 1}}); ErrorCategory(err) != "resource-limit" {
 		t.Fatal(err)
 	}
 	if source.reads != 1 {
 		t.Fatalf("budget rejection fetched metadata: %d", source.reads)
 	}
-}
-
-func FuzzDecodeDiskChunk(f *testing.F) {
-	valid := encodeDiskChunk(CachedChunk{key: DecodedCacheKey{Kind: 1, Identity: [32]byte{1}, Offset: 7}, raw: []byte("payload"), verified: true})
-	f.Add(valid)
-	f.Add(valid[:diskCacheHeaderBytes])
-	f.Add([]byte(diskCacheMagic))
-	f.Add([]byte{})
-	f.Fuzz(func(t *testing.T, data []byte) {
-		value, err := decodeDiskChunk(data)
-		if err != nil {
-			return
-		}
-		// Accepted inputs must round-trip exactly and never alias beyond bounds.
-		if again := encodeDiskChunk(value); !bytes.Equal(again, data) {
-			t.Fatalf("accepted non-canonical chunk")
-		}
-		if cap(value.raw) != len(value.raw) {
-			t.Fatal("raw capacity exposes digest bytes")
-		}
-	})
 }

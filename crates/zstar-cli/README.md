@@ -65,8 +65,9 @@ zstar export-objects catalog.cbor --store object-store --destination exported
 zstar extract thin.zstar restored --objects exported/objects
 ```
 
-External-object hashes are checked by default. `--skip-external-hash` skips only
-that check; manifest authentication and data checksums remain required.
+External-object hashes are not checked by default. Use `--verify-external-hash`
+to opt into SHA-256 verification. Manifest authentication and data checksums remain
+required.
 The Rust library module documentation describes the filesystem restoration
 policy; the [specification][spec] defines the packed storage profile and
 validation scopes.

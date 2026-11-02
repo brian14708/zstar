@@ -22,16 +22,11 @@ impl MemberCursor {
 pub async fn open_reader(
     source: Arc<dyn zstar::AsyncRangeReader>,
     options: ReaderOptions,
-    shared_cache: Option<zstar::SharedDecodedCache>,
 ) -> PyResult<Reader> {
     let reader = Reader::open_with_options(source, options)
         .await
         .map_err(super::core_error)?;
-    Ok(if let Some(shared) = shared_cache {
-        reader.with_shared_decoded_cache(shared)
-    } else {
-        reader
-    })
+    Ok(reader)
 }
 
 #[expect(
@@ -40,7 +35,6 @@ pub async fn open_reader(
 )]
 pub fn reader_options(
     py: Python<'_>,
-    cache_bytes: usize,
     concurrent_chunks: usize,
     verify_external: bool,
     memory_bytes: u64,
@@ -51,13 +45,9 @@ pub fn reader_options(
     max_entries: u64,
     max_spool_bytes: u64,
     create_spill_store: Option<Py<PyAny>>,
-    shared_cache: Option<Py<PyAny>>,
-    shared_cache_identity: Option<Vec<u8>>,
     resolver: Option<Py<PyAny>>,
-) -> PyResult<(ReaderOptions, Option<zstar::SharedDecodedCache>)> {
-    let shared = super::decoded_cache_binding(py, shared_cache, shared_cache_identity)?;
+) -> PyResult<ReaderOptions> {
     let options = ReaderOptions {
-        cache_bytes,
         concurrent_chunks,
         verify_external,
         resolver: resolver.map(|r| super::pack::binding(py, r)),
@@ -73,5 +63,5 @@ pub fn reader_options(
             ..Default::default()
         },
     };
-    Ok((options, shared))
+    Ok(options)
 }

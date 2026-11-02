@@ -6,7 +6,6 @@ import (
 	"io"
 	"math"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -25,14 +24,12 @@ type PackStore struct {
 	client         PackClient
 	bucket, prefix string
 	options        UploadOptions
-	policyMu       sync.Mutex
-	policies       map[string]zstar.ContentCachePolicy
 }
 
 // NewPackStore binds native S3 configuration and bounded immutable uploads.
 func NewPackStore(client PackClient, bucket, prefix string, options UploadOptions) *PackStore {
 	options.Immutable = true
-	return &PackStore{client: client, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/"), options: options, policies: make(map[string]zstar.ContentCachePolicy)}
+	return &PackStore{client: client, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/"), options: options}
 }
 
 func (s *PackStore) key(key string) string {
@@ -40,14 +37,6 @@ func (s *PackStore) key(key string) string {
 		return key
 	}
 	return s.prefix + "/" + key
-}
-
-// PackCacheAllowed reports admission from the last successful packed range.
-func (s *PackStore) PackCacheAllowed(snapshot zstar.PackSnapshot) bool {
-	s.policyMu.Lock()
-	defer s.policyMu.Unlock()
-	policy, ok := s.policies[snapshot.Key]
-	return ok && policy.AllowsReuse()
 }
 
 // PutPack publishes an immutable artifact and captures its completed identity.
@@ -91,19 +80,6 @@ func (s *PackStore) ReadPackedRange(ctx context.Context, snapshot zstar.PackSnap
 	data, err := source.ReadRange(ctx, int64(offset), int64(length))
 	if errors.Is(err, errObjectChanged) {
 		return nil, &zstar.FormatError{Category: "changed-pack", Cause: err}
-	}
-	if err == nil {
-		s.policyMu.Lock()
-		if len(s.policies) >= 1024 {
-			for key := range s.policies {
-				delete(s.policies, key)
-				break
-			}
-		}
-		policy := s.policies[snapshot.Key]
-		policy.Observe(source.policy)
-		s.policies[snapshot.Key] = policy
-		s.policyMu.Unlock()
 	}
 	return data, err
 }

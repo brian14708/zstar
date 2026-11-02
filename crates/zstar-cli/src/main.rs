@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use zstar::ManifestOptions;
 use zstar::backend::BlockingArchive;
 use zstar::fs::{self as restore, LocalFileSource};
-use zstar::manifest_io::ManifestOptions;
 use zstar::s3::object_store::client::CredentialProvider;
 use zstar::s3::object_store::{ObjectStoreExt, aws::AwsCredential, path::Path as ObjectPath};
 
@@ -175,9 +175,9 @@ enum Command {
         objects: Option<PathBuf>,
         #[arg(long)]
         allow_special_bits: bool,
-        /// Skip external-object SHA-256; metadata hashes and data checksums remain required.
+        /// Verify external-object SHA-256 in addition to availability and length checks.
         #[arg(long)]
-        skip_external_hash: bool,
+        verify_external_hash: bool,
         #[arg(long, default_value_t = 64)]
         max_directory_handles: usize,
         #[command(flatten)]
@@ -464,7 +464,7 @@ async fn main() -> restore::AnyResult<()> {
             destination,
             objects,
             allow_special_bits,
-            skip_external_hash,
+            verify_external_hash,
             max_directory_handles,
             metadata,
         } => {
@@ -485,7 +485,7 @@ async fn main() -> restore::AnyResult<()> {
                     .transpose()?,
                 restore::ExtractOptions {
                     allow_special_bits,
-                    verify_external: !skip_external_hash,
+                    verify_external: verify_external_hash,
                     max_directory_handles,
                     manifest: metadata.options(),
                 },

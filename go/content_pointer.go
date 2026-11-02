@@ -34,7 +34,7 @@ func EncodeContentReference(extents []Extent) ([]byte, error) {
 	if err := validateObjectExtents(extents); err != nil {
 		return nil, err
 	}
-	values := make([]any, len(extents))
+	values := make([][]any, len(extents))
 	for i, e := range extents {
 		values[i] = e.value()
 	}

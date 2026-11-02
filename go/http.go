@@ -34,15 +34,6 @@ type HTTPRangeReader struct {
 	state   httpRangeState
 }
 
-// CacheAllowed reports admission under the last successful response policy.
-func (r *HTTPRangeReader) CacheAllowed() bool { return r.state.cacheAllowed() }
-
-func (s *httpRangeState) cacheAllowed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasVersion && s.policy.AllowsReuse()
-}
-
 func (*HTTPRangeReader) String() string { return "HTTPRangeReader{URL:<redacted>, Headers:<redacted>}" }
 
 // GoString redacts URLs and headers in Go-syntax diagnostic output.
@@ -52,7 +43,6 @@ type httpRangeState struct {
 	mu      sync.Mutex
 	size    int64
 	hasSize bool
-	policy  ContentCachePolicy
 	// Pinned object version from the first response.
 	etag       string
 	hasVersion bool
@@ -236,7 +226,6 @@ func (s *httpRangeState) read(ctx context.Context, client *http.Client, url stri
 		req.Header.Set("Cache-Control", "no-transform")
 	}
 	s.conditions(req.Header)
-	requested := time.Now()
 	resp, err := rangeClient(client).Do(req)
 	if err != nil {
 		return nil, fail(err)
@@ -284,8 +273,6 @@ func (s *httpRangeState) read(ctx context.Context, client *http.Client, url stri
 		return nil, fmt.Errorf("%w: size changed", ErrObjectChanged)
 	}
 	s.size, s.hasSize = total, true
-	s.policy.Observe(responseContentCachePolicy(resp.Header, requested))
-	s.policy.denied = s.policy.denied || responseContentCachePolicy(req.Header, requested).denied
 	return data, nil
 }
 
@@ -313,9 +300,6 @@ type RefreshingRangeReader struct {
 	Client   *http.Client
 	state    httpRangeState
 }
-
-// CacheAllowed reports admission under the last successful response policy.
-func (r *RefreshingRangeReader) CacheAllowed() bool { return r.state.cacheAllowed() }
 
 func (*RefreshingRangeReader) String() string { return "RefreshingRangeReader{Provider:<redacted>}" }
 

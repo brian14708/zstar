@@ -24,7 +24,7 @@ type PackWriterOptions struct {
 	TargetBytes      uint64
 	CompressionLevel int
 	Catalog          CatalogLimits
-	Spool            ManifestOptions
+	Spool            SpoolOptions
 }
 
 // PackWriter serializes one compression job, spool and upload. Its catalog
@@ -57,8 +57,8 @@ func NewPackWriter(store PackStore, base *PackedCatalog, options PackWriterOptio
 		options.CompressionLevel = 3
 	}
 	options.Catalog = options.Catalog.normalized()
-	options.Spool = options.Spool.defaults()
-	if !validPath(options.Prefix) || options.TargetBytes > options.Spool.MaxEncodedBytes || options.CompressionLevel < -131072 || options.CompressionLevel > 22 {
+	spoolOptions := options.Spool.defaults()
+	if !validPath(options.Prefix) || options.TargetBytes > spoolOptions.MaxEncodedBytes || options.CompressionLevel < -131072 || options.CompressionLevel > 22 {
 		return nil, errors.New("zstar: invalid pack writer settings")
 	}
 	if base == nil {
@@ -75,7 +75,7 @@ func NewPackWriter(store PackStore, base *PackedCatalog, options PackWriterOptio
 	if err != nil {
 		return nil, err
 	}
-	return &PackWriter{store: store, options: options, catalog: base, pending: make(map[[32]byte]PackedChunk), spool: manifestSpool{options: options.Spool}, hash: sha256.New(), codec: codec}, nil
+	return &PackWriter{store: store, options: options, catalog: base, pending: make(map[[32]byte]PackedChunk), spool: manifestSpool{options: spoolOptions}, hash: sha256.New(), codec: codec}, nil
 }
 
 // CompletedPacks returns uploaded immutable keys for orphan accounting.
@@ -197,7 +197,7 @@ func (w *PackWriter) flush(ctx context.Context) error {
 		return err
 	}
 	w.catalog = catalog
-	w.spool = manifestSpool{options: w.options.Spool}
+	w.spool = manifestSpool{options: w.spool.options}
 	clear(w.pending)
 	w.hash.Reset()
 	return nil

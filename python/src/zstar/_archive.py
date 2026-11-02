@@ -98,10 +98,6 @@ class _Metadata(Generic[_Reader]):
         self._check_open()
         return self._reader.entry_count
 
-    @property
-    def cache_bytes(self) -> int:
-        return self._reader.cache_bytes
-
 
 class Archive(_Metadata[_native.IndexedArchive]):
     """Synchronous indexed reader. Opening validates metadata; verify checks all content."""

@@ -10,16 +10,13 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 type Load = Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>;
 
-/// Reusable random-access member cursor. Retains owned metadata and at most one
-///
-/// validated decoded source, independently of the archive's retained cache.
+/// Reusable random-access member cursor retaining owned metadata.
 /// The caller supplies the live archive for each operation.
 pub struct FileCursor {
     pub(crate) owner: Option<std::sync::Weak<crate::ManifestReader>>,
     entry: Entry,
     starts: Vec<u64>,
     size: u64,
-    cached: Option<(Key, Bytes)>,
 }
 impl FileCursor {
     #[expect(
@@ -45,7 +42,6 @@ impl FileCursor {
             entry,
             starts,
             size,
-            cached: None,
         })
     }
 
@@ -99,27 +95,9 @@ impl FileCursor {
                 .await;
         }
         let key = Key::of(first);
-        let raw = if archive.cache_allowed(&key, archive.resolver()) {
-            self.cached
-                .as_ref()
-                .filter(|(previous, _)| *previous == key)
-                .map(|(_, raw)| raw.clone())
-        } else {
-            None
-        };
-        let raw = match raw {
-            Some(raw) => raw,
-            None => {
-                archive
-                    .content(&key, first.encoded_size, archive.resolver())
-                    .await?
-            }
-        };
-        self.cached = if archive.cache_allowed(&key, archive.resolver()) {
-            Some((key, raw.clone()))
-        } else {
-            None
-        };
+        let raw = archive
+            .content(&key, first.encoded_size, archive.resolver())
+            .await?;
         crate::checked_range(first.offset, first.size, raw.len() as u64)?;
         let start = (first.offset + within) as usize;
         // Share the validated single chunk for bounded readinto operations.
@@ -133,17 +111,14 @@ impl FileCursor {
 /// symlink handles expose metadata and reject reads. Seeking beyond EOF is
 /// permitted; negative and overflowing positions return an invalid-input error.
 ///
-/// The handle retains its archive and a bounded validated read window independently
-/// of the archive cache budget. Sequential reads may coalesce up to four extents
-/// and 8 MiB; seeks reset read-ahead detection. Dropping it cancels pending source I/O.
+/// The handle retains its archive and pending read state. Dropping it cancels
+/// pending source I/O. Completed reads do not retain decoded content.
 pub struct File<R: AsyncRangeReader + ?Sized> {
     archive: Archive<R>,
     entry: Entry,
     size: u64,
     starts: Vec<u64>,
     position: u64,
-    last_end: Option<u64>,
-    cached: Option<(u64, Bytes)>,
     pending: Option<(u64, Load)>,
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
@@ -161,8 +136,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
             size,
             starts,
             position: 0,
-            last_end: None,
-            cached: None,
             pending: None,
         })
     }
@@ -210,67 +183,37 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
             .starts
             .partition_point(|start| *start <= this.position)
             .saturating_sub(1);
-        if !this.archive.cache_allowed(
-            &Key::of(&this.entry.extents[index]),
-            this.archive.resolver(),
-        ) {
-            this.cached = None;
+        if this.pending.is_none() {
+            let start = this.position;
+            let extent = &this.entry.extents[index];
+            let end = this.starts[index] + extent.size;
+            let length = (end - start)
+                .min(this.archive.max_read_bytes())
+                .min(buffer.remaining() as u64);
+            let archive = this.archive.clone();
+            let path = this.entry.path.clone();
+            let future = Box::pin(async move {
+                archive
+                    .read_range_with_resolver(&path, start, length, archive.resolver())
+                    .await
+            });
+            this.pending = Some((start, future));
         }
-        let cache_hit = this.cached.as_ref().is_some_and(|(start, bytes)| {
-            this.position >= *start && this.position - *start < bytes.len() as u64
-        });
-        if !cache_hit {
-            if this.pending.is_none() {
-                let start = this.position;
-                let extent = &this.entry.extents[index];
-                let mut end = this.starts[index] + extent.size;
-                // Read ahead only after a successful sequential read. Random
-                // seeks reset detection. Both bytes and extent count are bounded.
-                let cap = this.archive.max_read_bytes().min(8 << 20);
-                if this.last_end == Some(start) {
-                    for next in index + 1..this.entry.extents.len().min(index + 4) {
-                        let next_end = this.starts[next] + this.entry.extents[next].size;
-                        if next_end - start > cap {
-                            break;
-                        }
-                        end = next_end;
-                    }
-                }
-                let length = (end - start).min(this.archive.max_read_bytes());
-                let archive = this.archive.clone();
-                let path = this.entry.path.clone();
-                let future = Box::pin(async move {
-                    archive
-                        .read_range_with_resolver(&path, start, length, archive.resolver())
-                        .await
-                });
-                this.pending = Some((start, future));
+        let (start, future) = this.pending.as_mut().unwrap();
+        let start = *start;
+        let raw = match future.as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                this.pending = None;
+                return Poll::Ready(Err(io::Error::from(error)));
             }
-            let (start, future) = this.pending.as_mut().unwrap();
-            match future.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => {
-                    this.pending = None;
-                    return Poll::Ready(Err(io::Error::from(error)));
-                }
-                Poll::Ready(Ok(raw)) => {
-                    this.cached = Some((*start, raw));
-                    this.pending = None;
-                }
-            }
-        }
-        let (start, raw) = this.cached.as_ref().unwrap();
+            Poll::Ready(Ok(raw)) => raw,
+        };
+        this.pending = None;
         let offset = (this.position - start) as usize;
         let count = (raw.len() - offset).min(buffer.remaining());
         buffer.put_slice(&raw[offset..offset + count]);
         this.position += count as u64;
-        this.last_end = Some(this.position);
-        if !this.archive.cache_allowed(
-            &Key::of(&this.entry.extents[index]),
-            this.archive.resolver(),
-        ) {
-            this.cached = None;
-        }
         Poll::Ready(Ok(()))
     }
 }
@@ -289,7 +232,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncSeek for File<R> {
             )
         })?;
         this.pending = None;
-        this.last_end = None;
         Ok(())
     }
     fn poll_complete(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<u64>> {

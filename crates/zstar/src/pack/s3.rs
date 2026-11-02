@@ -17,16 +17,11 @@ pub struct S3PackStore {
     part_size: usize,
     concurrency: usize,
     client: reqwest::Client,
-    policies: std::sync::Mutex<lru::LruCache<String, crate::http::CachePolicy>>,
 }
 impl S3PackStore {
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
     )]
     pub fn new(
         store: Arc<AmazonS3>,
@@ -42,9 +37,6 @@ impl S3PackStore {
             root,
             part_size,
             concurrency,
-            policies: std::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1024).unwrap(),
-            )),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -144,13 +136,6 @@ fn storage_error(error: crate::s3::object_store::Error) -> Error {
     }
 }
 impl PackStore for S3PackStore {
-    fn cache_allowed(&self, snapshot: &Snapshot) -> bool {
-        self.policies
-            .lock()
-            .unwrap()
-            .get(&snapshot.key)
-            .is_some_and(crate::http::CachePolicy::allows_reuse)
-    }
     #[expect(
         clippy::too_many_lines,
         reason = "Keep the ordered validation or protocol operation together."
@@ -323,10 +308,6 @@ impl PackStore for S3PackStore {
         snapshot.validate()?;
         Ok(snapshot)
     }
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "The guard intentionally covers this short state update."
-    )]
     async fn get_range(&self, snapshot: &Snapshot, range: Range<u64>) -> Result<Bytes> {
         snapshot.validate()?;
         let size = range.end.checked_sub(range.start).ok_or(Error::Range)?;
@@ -360,14 +341,7 @@ impl PackStore for S3PackStore {
         {
             return Err(Error::ChangedPack);
         }
-        let policy = crate::s3::response_cache_policy(&result.attributes);
         let bytes = crate::s3::read_exact(result, size).await?;
-        let mut policies = self.policies.lock().unwrap();
-        if let Some(previous) = policies.get_mut(&snapshot.key) {
-            previous.observe(policy);
-        } else {
-            policies.put(snapshot.key.clone(), policy);
-        }
         Ok(bytes)
     }
 }

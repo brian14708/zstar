@@ -219,11 +219,11 @@ async fn bucket_request(client: &reqwest::Client, store: &AmazonS3, method: reqw
     reason = "Keep the ordered validation or protocol operation together."
 )]
 async fn test_packed_generation(store: Arc<AmazonS3>) {
-    use zstar::manifest_io::{ManifestOptions, Spool};
     use zstar::pack::{
         Catalog, CatalogLimits, Generation, PackStore, PackWriter, PackWriterOptions,
         PackedObjectResolver, ResolverOptions, S3PackStore, publish_generation,
     };
+    use zstar::{ManifestOptions, Spool};
     use zstar::{ObjectRequest, ObjectResolver};
     let packs =
         Arc::new(S3PackStore::new(store.clone(), Path::from("packed"), 5 << 20, 2).unwrap());

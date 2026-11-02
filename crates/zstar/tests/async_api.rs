@@ -14,8 +14,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 use zstar::{
-    Archive, AsyncRangeReader, Builder, EntryKind, Error, Header, ObjectResolver, ReadRequest,
-    ReaderOptions, Result, VerificationScope, WriterOptions,
+    Archive, AsyncRangeReader, Builder, Error, Header, ObjectResolver, ReadRequest, ReaderOptions,
+    Result, VerificationScope, WriterOptions,
 };
 
 fn payload() -> Vec<u8> {
@@ -158,54 +158,6 @@ async fn owned_stream_combinators_and_large_seek_indexes() {
     assert_eq!(tail, bytes[bytes.len() - 100..]);
 }
 
-struct CountingSource {
-    bytes: Bytes,
-    calls: AtomicUsize,
-}
-#[async_trait::async_trait]
-impl AsyncRangeReader for CountingSource {
-    async fn size(&self) -> Result<u64> {
-        Ok(self.bytes.len() as u64)
-    }
-    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.bytes.read_range(range).await
-    }
-}
-
-#[tokio::test]
-async fn enumeration_is_lazy_and_file_retains_its_active_chunk_without_cache() {
-    let source = Arc::new(CountingSource {
-        bytes: fixture().await,
-        calls: AtomicUsize::new(0),
-    });
-    let archive = Archive::open_with_options(
-        source.clone(),
-        ReaderOptions {
-            cache_bytes: 0,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let before = source.calls.load(Ordering::SeqCst);
-    let entries = archive.entries();
-    futures_util::pin_mut!(entries);
-    let directory = entries.try_next().await.unwrap().unwrap();
-    assert_eq!(directory.kind(), EntryKind::Directory);
-    let mut file = entries.try_next().await.unwrap().unwrap();
-    assert_eq!(file.path(), "dir/file");
-    assert_eq!(source.calls.load(Ordering::SeqCst), before);
-    let mut byte = [0];
-    file.read_exact(&mut byte).await.unwrap();
-    let after = source.calls.load(Ordering::SeqCst);
-    file.read_exact(&mut byte).await.unwrap();
-    file.seek(SeekFrom::Start(0)).await.unwrap();
-    file.read_exact(&mut byte).await.unwrap();
-    assert_eq!(source.calls.load(Ordering::SeqCst), after);
-    assert_eq!(archive.cache_len_bytes(), 0);
-}
-
 #[expect(
     clippy::cast_possible_truncation,
     reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
@@ -254,6 +206,7 @@ async fn configured_resolver_applies_to_reads_handles_batches_and_closure() {
         source.clone(),
         ReaderOptions {
             resolver: Some(objects.clone()),
+            verify_external: true,
             ..Default::default()
         },
     )
@@ -287,7 +240,7 @@ async fn configured_resolver_applies_to_reads_handles_batches_and_closure() {
         .unwrap();
     assert_eq!(closure.external_objects_sha256_checked.len(), 1);
     assert_eq!(closure.external_objects_unchecked, [] as [[u8; 32]; 0]);
-    assert_eq!(objects.calls.load(Ordering::SeqCst), 1);
+    assert!(objects.calls.load(Ordering::SeqCst) > 1);
     let unresolved = Archive::open(source).await.unwrap();
     assert!(
         unresolved

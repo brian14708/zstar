@@ -113,7 +113,7 @@ func PublishPackedGeneration(ctx context.Context, store PackStore, prefix string
 	if err != nil || length < 0 {
 		return descriptor, generation, errors.New("zstar: invalid archive size")
 	}
-	manifest, err := OpenManifest(ctx, &publicationSource{reader: archive, length: length}, ManifestOptions{})
+	manifest, err := OpenManifest(ctx, &publicationSource{reader: archive, length: length}, ManifestReaderOptions{})
 	if err != nil {
 		return descriptor, generation, err
 	}

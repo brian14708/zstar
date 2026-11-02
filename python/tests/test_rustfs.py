@@ -217,12 +217,13 @@ def test_async_fsspec_s3_snapshot_conditions():
                 "key": "zstar-test",
                 "secret": "zstar-test-secret",
                 "client_kwargs": {"endpoint_url": endpoint, "region_name": "us-east-1"},
+                # Every read must reach the transport to check snapshot conditions.
+                "default_cache_type": "none",
             }
             async with ZstarFileSystem(
                 fo=f"s3://{bucket}/archive.zstar",
                 target_options=options,
                 asynchronous=True,
-                cache_bytes=0,
             ) as fs:
                 assert await fs._cat_file("data", start=1, end=6) == b"AAAAA"
                 assert await fs._cat_ranges(
@@ -305,12 +306,12 @@ def test_async_packed_s3_generation():
     endpoint = os.environ["ZSTAR_S3_ENDPOINT"]
     parsed = urlsplit(endpoint)
     assert parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-    config = dict(
-        endpoint=endpoint,
-        region="us-east-1",
-        access_key_id="zstar-test",
-        secret_access_key="zstar-test-secret",
-    )
+    config = {
+        "endpoint": endpoint,
+        "region": "us-east-1",
+        "access_key_id": "zstar-test",
+        "secret_access_key": "zstar-test-secret",
+    }
     client = boto3.client(
         "s3",
         endpoint_url=endpoint,
@@ -333,7 +334,7 @@ def test_async_packed_s3_generation():
         info = TarInfo("file")
         info.size = len(data)
         with ArchiveWriter(thin) as writer:
-            writer.add_external(info, body)
+            writer._add_external(info, body)
         _key, generation = await _native.publish_packed_generation_async(
             store, io.BytesIO(thin.getvalue()), catalog
         )
@@ -352,7 +353,8 @@ def test_async_packed_s3_generation():
 
 
 @pytest.mark.skipif(not os.getenv("ZSTAR_S3_ENDPOINT"), reason="requires local RustFS")
-def test_fsspec_s3_uses_ranges(tmp_path):
+@pytest.mark.parametrize("cache_type", ["none", "blockcache"])
+def test_fsspec_s3_uses_ranges(tmp_path, cache_type):
     import http.client
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -415,6 +417,8 @@ def test_fsspec_s3_uses_ranges(tmp_path):
                 },
                 "key": "zstar-test",
                 "secret": "zstar-test-secret",
+                "default_cache_type": cache_type,
+                "default_block_size": 64 << 10,
             },
         )
         try:

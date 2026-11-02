@@ -11,8 +11,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 use zstar::{
+    ManifestOptions, Spool,
     chunking::{Chunking, external_file},
-    manifest_io::{ManifestOptions, Spool},
     pack::{
         Catalog, CatalogLimits, Generation, LocalPackStore, PackWriter, PackWriterOptions,
         PackedObjectResolver, ResolverOptions, S3PackStore, Snapshot, publish_generation,
@@ -24,12 +24,6 @@ enum Store {
     S3(S3PackStore),
 }
 impl zstar::pack::PackStore for Store {
-    fn cache_allowed(&self, snapshot: &Snapshot) -> bool {
-        match self {
-            Self::Local(store) => store.cache_allowed(snapshot),
-            Self::S3(store) => store.cache_allowed(snapshot),
-        }
-    }
     async fn put(&self, key: String, data: Spool) -> zstar::Result<Snapshot> {
         match self {
             Self::Local(s) => s.put(key, data).await,
@@ -609,7 +603,6 @@ impl PyResolver {
             max_range_bytes = 8 << 20,
             max_overfetch_bytes = 0,
             max_batch_bytes = 64 << 20,
-            cache_bytes = 0,
             concurrency = 8,
         )
     )]
@@ -619,7 +612,6 @@ impl PyResolver {
         max_range_bytes: u64,
         max_overfetch_bytes: u64,
         max_batch_bytes: u64,
-        cache_bytes: usize,
         concurrency: usize,
     ) -> PyResult<Self> {
         PackedObjectResolver::new(
@@ -629,7 +621,6 @@ impl PyResolver {
                 max_range_bytes,
                 max_overfetch_bytes,
                 max_batch_bytes,
-                cache_bytes,
                 concurrent_requests: concurrency,
             },
         )

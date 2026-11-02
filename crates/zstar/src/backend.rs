@@ -1,12 +1,12 @@
 //! Archive I/O for the entry-oriented manifest. No persistent frame table.
-use crate::decoded_cache::{DecodedBody, DecodedCacheKey, SharedDecodedCache};
+use crate::decoded_body::DecodedBody;
 use crate::manifest::{
     ENCODED_FRAME_MAX, EXTENTS_MAX, Entry, EntryKind, Extent, Source, decode_pointer,
     encode_pointer,
 };
 use crate::manifest_io::{ManifestEncoder, ManifestOptions, ManifestReader, SpillStore, Spool};
 use crate::{Error, RangeReader, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 fn invalid(reason: &str) -> Error {
@@ -30,117 +30,12 @@ pub trait EncodedObjectResolver {
     ) -> Result<Vec<u8>>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ContentKey {
-    Archive(u64, u64),
-    Object([u8; 32]),
-}
-impl ContentKey {
-    const fn of(extent: &Extent) -> Self {
-        match extent.source {
-            Source::Archive(at) => Self::Archive(at, extent.encoded_size),
-            Source::Object(hash) => Self::Object(hash),
-        }
-    }
-}
-struct CachedContent {
-    raw: DecodedBody,
-    verified: bool,
-    stamp: u64,
-}
-#[derive(Default)]
-struct ContentCache {
-    entries: HashMap<ContentKey, CachedContent>,
-    order: BTreeMap<u64, ContentKey>,
-    capacity: usize,
-    bytes: usize,
-    clock: u64,
-    shared: Option<SharedDecodedCache>,
-    metadata: [u8; 32],
-}
-impl ContentCache {
-    // Charge payload plus conservative map/node/Arc bookkeeping. Active streams
-    // retain their selected frame independently of the cache capacity.
-    const OVERHEAD: usize = 256;
-    fn get(&mut self, key: &ContentKey, verify: bool) -> Result<Option<DecodedBody>> {
-        let Some(entry) = self.entries.get_mut(key) else {
-            return Ok(None);
-        };
-        // Resolvers are supplied per operation and have no stable namespace.
-        // Only a successful whole-object hash permits reuse across resolvers.
-        if matches!(key, ContentKey::Object(_)) && !verify && !entry.verified {
-            return Ok(None);
-        }
-        if let ContentKey::Object(hash) = key
-            && verify
-            && !entry.verified
-        {
-            // Never promote unchecked bytes without hashing, and never return
-            // them to a caller requiring verification after a failed hash.
-            crate::verify_sha256(&entry.raw, *hash)?;
-            entry.verified = true;
-        }
-        self.order.remove(&entry.stamp);
-        self.clock += 1;
-        entry.stamp = self.clock;
-        self.order.insert(entry.stamp, key.clone());
-        Ok(Some(entry.raw.clone()))
-    }
-    fn insert(&mut self, key: ContentKey, raw: DecodedBody, verified: bool) {
-        let charge = raw.allocated().saturating_add(Self::OVERHEAD);
-        if charge > self.capacity {
-            return;
-        }
-        if let Some(previous) = self.entries.remove(&key) {
-            self.order.remove(&previous.stamp);
-            self.bytes -= previous.raw.allocated() + Self::OVERHEAD;
-        }
-        while self.bytes > self.capacity - charge {
-            let (stamp, oldest) = self.order.pop_first().unwrap();
-            let entry = self.entries.remove(&oldest).unwrap();
-            debug_assert_eq!(entry.stamp, stamp);
-            self.bytes -= entry.raw.allocated() + Self::OVERHEAD;
-        }
-        self.clock += 1;
-        self.bytes += charge;
-        self.order.insert(self.clock, key.clone());
-        self.entries.insert(
-            key,
-            CachedContent {
-                raw,
-                verified,
-                stamp: self.clock,
-            },
-        );
-    }
-}
 fn load_content<R: RangeReader>(
     source: &mut R,
-    cache: &mut ContentCache,
     extent: &Extent,
     resolver: &mut Option<&mut dyn EncodedObjectResolver>,
     verify_external: bool,
 ) -> Result<DecodedBody> {
-    let key = ContentKey::of(extent);
-    if let Some(raw) = cache.get(&key, verify_external)? {
-        return Ok(raw);
-    }
-    let shared_key = cache
-        .shared
-        .as_ref()
-        .and_then(|shared| match extent.source {
-            Source::Archive(at) => {
-                Some(shared.archive_key(cache.metadata, at, extent.encoded_size))
-            }
-            Source::Object(hash) if verify_external => Some(DecodedCacheKey::Object(hash)),
-            Source::Object(_) => None,
-        });
-    if let Some(shared_key) = shared_key
-        && let Some(raw) = cache.shared.as_ref().unwrap().get(&shared_key)
-    {
-        cache.insert(key, raw.clone(), true);
-        return Ok(raw);
-    }
     let encoded = match extent.source {
         Source::Archive(at) => {
             let end = at.checked_add(extent.encoded_size).ok_or(Error::Range)?;
@@ -164,10 +59,6 @@ fn load_content<R: RangeReader>(
     {
         crate::verify_sha256(&raw, hash)?;
     }
-    if let Some(shared_key) = shared_key {
-        cache.shared.as_ref().unwrap().put(shared_key, raw.clone());
-    }
-    cache.insert(key, raw.clone(), verify_external);
     Ok(raw)
 }
 
@@ -177,7 +68,6 @@ fn load_content<R: RangeReader>(
 /// require SHA-256 verification; a zero-length read performs no content I/O.
 pub struct ContentReader<'a, R: RangeReader> {
     source: &'a mut R,
-    cache: &'a mut ContentCache,
     resolver: Option<&'a mut dyn EncodedObjectResolver>,
     verify_external: bool,
     extents: std::vec::IntoIter<Extent>,
@@ -210,7 +100,6 @@ impl<R: RangeReader> ContentReader<'_, R> {
                 if !hit {
                     let raw = load_content(
                         self.source,
-                        self.cache,
                         &extent,
                         &mut self.resolver,
                         self.verify_external,
@@ -674,29 +563,24 @@ pub struct BlockingArchive<R: RangeReader> {
     manifest: std::sync::Arc<ManifestReader>,
     data_end: u64,
     options: ManifestOptions,
-    content_cache: ContentCache,
 }
 impl<R: RangeReader> BlockingArchive<R> {
     pub fn manifest(&self) -> &ManifestReader {
         &self.manifest
     }
     #[cfg(feature = "async")]
-    pub(crate) fn from_manifest(
+    pub(crate) const fn from_manifest(
         source: R,
         manifest: std::sync::Arc<ManifestReader>,
         data_end: u64,
         options: ManifestOptions,
-        metadata: [u8; 32],
+        _metadata: [u8; 32],
     ) -> Self {
         Self {
             source,
             manifest,
             data_end,
             options,
-            content_cache: ContentCache {
-                metadata,
-                ..Default::default()
-            },
         }
     }
 
@@ -712,37 +596,7 @@ impl<R: RangeReader> BlockingArchive<R> {
             manifest: std::sync::Arc::new(manifest),
             data_end: footer.toc_offset,
             options,
-            content_cache: ContentCache {
-                metadata: footer.toc_sha256,
-                ..Default::default()
-            },
         })
-    }
-    /// Configure reader-local decoded content reuse. Zero (the default) disables
-    /// retention across reads. Changing the budget clears all retained content.
-    /// Archive bytes must remain immutable for the lifetime of this reader.
-    pub fn set_content_cache_bytes(&mut self, capacity: usize) {
-        self.content_cache = ContentCache {
-            capacity,
-            shared: self.content_cache.shared.clone(),
-            metadata: self.content_cache.metadata,
-            ..Default::default()
-        };
-    }
-    /// Attach a caller-owned cache bound to this immutable archive snapshot.
-    /// Backend failures fall back to the source. Unchecked objects bypass it.
-    /// Replacing the binding clears reader-local retained content.
-    pub fn set_shared_decoded_cache(&mut self, shared: Option<SharedDecodedCache>) {
-        self.content_cache = ContentCache {
-            capacity: self.content_cache.capacity,
-            metadata: self.content_cache.metadata,
-            shared,
-            ..Default::default()
-        };
-    }
-    /// Charged retained bytes; selected frames held by streams are additional.
-    pub const fn content_cache_bytes(&self) -> usize {
-        self.content_cache.bytes
     }
     pub fn entry(&mut self, path: &str) -> Result<Option<Entry>> {
         self.manifest.entry(path)
@@ -761,7 +615,6 @@ impl<R: RangeReader> BlockingArchive<R> {
         }
         Ok(ContentReader {
             source: &mut self.source,
-            cache: &mut self.content_cache,
             resolver,
             verify_external,
             extents: entry.extents.into_iter(),
@@ -822,13 +675,8 @@ impl<R: RangeReader> BlockingArchive<R> {
                         && (matches!(source, Source::Object(_)) || *encoded == extent.encoded_size)
                 });
                 if !same {
-                    let raw = load_content(
-                        &mut self.source,
-                        &mut self.content_cache,
-                        extent,
-                        &mut resolver,
-                        verify_external,
-                    )?;
+                    let raw =
+                        load_content(&mut self.source, extent, &mut resolver, verify_external)?;
                     cached = Some((extent.source.clone(), extent.encoded_size, raw));
                 }
                 let raw = &cached.as_ref().unwrap().2;

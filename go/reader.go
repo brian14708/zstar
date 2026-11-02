@@ -2,26 +2,22 @@ package zstar
 
 import (
 	"context"
-	"errors"
 	"reflect"
 )
 
 // ReaderOptions controls bounded metadata/content storage and external hashes.
-// Content caching defaults to 16 MiB; DisableContentCache explicitly disables it.
 // Metadata is always authenticated and archive data checksums are mandatory.
 type ReaderOptions struct {
-	Manifest            ManifestOptions
-	Resolver            EncodedContentResolver
-	SkipExternalHash    bool
-	DisableContentCache bool
-	// SharedContentCache requires an immutable encoded archive SourceIdentity.
-	SharedContentCache DecodedContentCache
-	SourceIdentity     []byte
+	Manifest ManifestReaderOptions
+	Resolver EncodedContentResolver
+	// VerifyExternalHash opts into SHA-256 verification of resolved objects.
+	// The default checks object availability, encoded bounds and decoded extent lengths.
+	VerifyExternalHash bool
 }
 
-// Reader owns authenticated sorted entries and bounded content caches.
+// Reader owns authenticated sorted entries and bounded read state.
 // Metadata spools are released after open; retained entries use O(N) memory.
-// Close releases entries/caches and cancels loads, without closing source.
+// Close releases entries and cancels loads, without closing source.
 // Sources and resolvers must support concurrent calls and stay immutable.
 type Reader struct {
 	manifest       *Manifest
@@ -38,7 +34,7 @@ func (r *readerResolver) GetEncoded(ctx context.Context, address [32]byte, hint,
 }
 
 func (r *readerResolver) EncodedLength(d [32]byte) (uint64, bool) {
-	if b, ok := r.inner.(BatchEncodedContentResolver); ok {
+	if b, ok := r.inner.(EncodedContentIndex); ok {
 		return b.EncodedLength(d)
 	}
 	return 0, false
@@ -67,39 +63,22 @@ func Open(ctx context.Context, source RangeReader) (*Reader, error) {
 }
 
 // OpenWithOptions authenticates an archive using options. The caller owns
-// the source, resolver and any shared cache. Sources and resolvers must support
+// the source and resolver. Sources and resolvers must support
 // concurrent calls. ctx applies only to opening, not subsequent reads.
 func OpenWithOptions(ctx context.Context, source RangeReader, options ReaderOptions) (*Reader, error) {
-	if (options.SharedContentCache == nil) != (len(options.SourceIdentity) == 0) {
-		return nil, rejected("unsupported-operation", "shared cache and source identity must be supplied together")
-	}
-	if len(options.SourceIdentity) > 65536 {
-		return nil, rejected("resource-limit", "shared cache identity exceeds 65536 bytes")
-	}
-	options.SourceIdentity = append([]byte(nil), options.SourceIdentity...)
-	if options.DisableContentCache {
-		options.Manifest.ContentCacheBytes = 0
-	} else if options.Manifest.ContentCacheBytes == 0 {
-		options.Manifest.ContentCacheBytes = 16 << 20
-	}
 	manifest, err := OpenManifest(ctx, source, options.Manifest)
 	if err != nil {
 		return nil, err
-	}
-	if options.SharedContentCache != nil {
-		if err := manifest.SetSharedContentCache(options.SourceIdentity, options.SharedContentCache); err != nil {
-			return nil, errors.Join(err, manifest.Close())
-		}
 	}
 	resolver := options.Resolver
 	if resolver != nil && reflect.ValueOf(resolver).Kind() != reflect.Pointer {
 		resolver = &readerResolver{inner: resolver}
 	}
-	return &Reader{manifest, resolver, !options.SkipExternalHash}, nil
+	return &Reader{manifest, resolver, options.VerifyExternalHash}, nil
 }
 
-// Close cancels active loads and releases metadata and private caches.
-// It leaves the source, resolver and caller-owned shared cache open.
+// Close cancels active loads and releases metadata state.
+// It leaves the source and resolver open.
 func (r *Reader) Close() error { return r.manifest.Close() }
 
 // Entry returns owned member metadata without following links. Missing paths
@@ -172,8 +151,8 @@ func (r *Reader) ReadLink(path string) (string, error) {
 }
 
 // Verify validates the complete physical archive. If externalClosure is
-// true, it also resolves every external extent. SkipExternalHash controls
-// object hashing; codec checksums and range checks always apply.
+// true, it also resolves every external extent. External object SHA-256 is
+// checked only when VerifyExternalHash is set; codec checksums and range checks always apply.
 func (r *Reader) Verify(ctx context.Context, externalClosure bool) (VerificationReport, error) {
 	return r.manifest.Verify(ctx, r.resolver, r.verifyExternal, externalClosure)
 }
@@ -185,6 +164,3 @@ func (r *Reader) Verify(ctx context.Context, externalClosure bool) (Verification
 func (r *Reader) VisitPayloads(ctx context.Context, visit func(Entry, []byte) error) (ArchiveReport, error) {
 	return r.manifest.VisitPayloads(ctx, visit)
 }
-
-// ContentCacheBytes reports private decoded-cache allocation and bookkeeping.
-func (r *Reader) ContentCacheBytes() uint64 { return r.manifest.ContentCacheBytes() }

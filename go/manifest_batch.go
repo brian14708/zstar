@@ -153,12 +153,7 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 		out[i] = make([]byte, int(request.Length))
 	}
 	var resultError error
-	if len(jobs) == 1 {
-		// Grouped requests often select one physical chunk. Loading it directly
-		// avoids a batch worker; the content loader still coalesces misses and
-		// retains its work permit until an uninterruptible callback returns.
-		resultError = m.readJob(ctx, &jobs[0], out, resolver, verifyExternal)
-	} else if len(jobs) > 1 {
+	if len(jobs) > 0 {
 		work, cancel := context.WithCancel(ctx)
 		defer cancel()
 		var wg sync.WaitGroup

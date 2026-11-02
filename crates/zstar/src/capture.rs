@@ -37,10 +37,6 @@ impl CaptureSpool {
         }
     }
     #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
         clippy::needless_pass_by_value,
         reason = "Ownership matches the public API or asynchronous boundary."
     )]
@@ -59,10 +55,6 @@ impl CaptureSpool {
         crate::cbor::append_head(&mut self.encoded, 0, payload_size);
         self.records.append_encoded_record(&self.encoded)
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     pub fn sorted(self) -> Result<CapturedEntries> {
         Ok(CapturedEntries {
             records: sort_records(self.records, self.options, key)?,

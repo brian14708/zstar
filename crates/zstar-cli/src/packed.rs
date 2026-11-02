@@ -5,9 +5,9 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zstar::{
+    ManifestOptions, Spool,
     chunking::Chunking,
     fs::AnyResult,
-    manifest_io::{ManifestOptions, Spool},
     pack::{
         Catalog, CatalogLimits, Generation, LocalPackStore, PackStore, PackWriter,
         PackWriterOptions, PackedObjectResolver, ResolverOptions, S3PackStore, Snapshot,
@@ -20,12 +20,6 @@ enum Store {
     S3(S3PackStore),
 }
 impl PackStore for Store {
-    fn cache_allowed(&self, snapshot: &Snapshot) -> bool {
-        match self {
-            Self::Local(store) => store.cache_allowed(snapshot),
-            Self::S3(store) => store.cache_allowed(snapshot),
-        }
-    }
     async fn put(&self, key: String, data: Spool) -> zstar::Result<Snapshot> {
         match self {
             Self::Local(s) => s.put(key, data).await,

@@ -4,7 +4,7 @@ import "sync/atomic"
 
 // SpoolBudget bounds retained logical bytes across memory and spill stores.
 // Sharing its pointer across options shares the quota. It must not be copied.
-// Filesystem overhead, migration copies and decoded caches are separate.
+// Filesystem overhead and migration copies are separate.
 type SpoolBudget struct {
 	limit uint64
 	used  atomic.Uint64

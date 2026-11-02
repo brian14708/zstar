@@ -14,7 +14,7 @@ from os import PathLike, fspath
 from pathlib import Path
 from tarfile import TarInfo
 from types import TracebackType
-from typing import Any, BinaryIO, Literal, TypedDict, cast, overload
+from typing import BinaryIO, Literal, Protocol, TypedDict, cast, overload
 
 from fsspec.archive import AbstractArchiveFileSystem
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem, sync
@@ -27,7 +27,7 @@ from ._file import AsyncArchiveFile
 from ._fs_writer import _member_name, _StagedMember, _WriteSession
 from ._info import _nanoseconds
 from ._writer import _writer_call
-from .types import ReaderOptions, WriterOptions
+from .types import ProgressCallback, ReaderOptions, WriterOptions
 
 __all__ = ["FileInfo", "ZstarFileSystem"]
 
@@ -38,7 +38,7 @@ def _write_all(output: BinaryIO, data: bytes) -> None:
     while remaining:
         count = output.write(remaining)
         if count is None:
-            return
+            raise BlockingIOError(errno.EAGAIN, "output stream would block")
         if count <= 0 or count > len(remaining):
             raise OSError("invalid output stream write count")
         remaining = remaining[count:]
@@ -231,7 +231,12 @@ class _AsyncMemberFile(AbstractAsyncStreamedFile):
 class _MemberFile(AbstractBufferedFile):
     def __init__(self, fs: ZstarFileSystem, path: str, stream: _AsyncMemberFile, **kwargs: object):
         self._stream = stream
-        kwargs.setdefault("cache_type", "none")
+        # Disable fsspec read-ahead caching; archive reads must issue only the
+        # requested ranges regardless of caller-supplied file options.
+        kwargs.pop("cache_type", None)
+        kwargs.pop("cache_options", None)
+        kwargs["cache_type"] = "none"
+        kwargs["block_size"] = 0
         try:
             super().__init__(fs, path, mode="rb", size=stream.size, **kwargs)
         except BaseException:
@@ -256,11 +261,24 @@ class _MemberFile(AbstractBufferedFile):
         return sync(self.fs.loop, self._stream._fetch_range, start, end)
 
 
+class _AsyncOutput(Protocol):
+    async def write(self, data: bytes, /) -> int: ...
+    async def close(self) -> None: ...
+
+
+class _SetMetadata(Protocol):
+    def __call__(self, path: str, /, **metadata: str) -> object: ...
+
+
+class _AsyncSetMetadata(Protocol):
+    async def __call__(self, path: str, /, **metadata: str) -> object: ...
+
+
 class _AsyncSink:
     """Bridge native worker writes to a caller-supplied async backend."""
 
-    def __init__(self, stream: object, loop: asyncio.AbstractEventLoop):
-        self.stream, self.loop = cast(Any, stream), loop
+    def __init__(self, stream: _AsyncOutput, loop: asyncio.AbstractEventLoop):
+        self.stream, self.loop = stream, loop
 
     def write(self, data: Buffer) -> int:
         return asyncio.run_coroutine_threadsafe(self.stream.write(bytes(data)), self.loop).result()
@@ -374,7 +392,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     Use ``zstar://member::file:///path/archive.zstar`` or construct with ``fo``.
     Member paths are relative; ``""`` is the root. ``asynchronous=True`` enables
     fsspec's async methods and ``open_async``. Use ``await fs.aclose()`` for async
-    cleanup. The default sync facade shares the same async reader and caches.
+    cleanup. The default sync facade shares the same async reader.
 
     ``mode="w"`` creates a new archive. Close each member before opening the
     next; ancestors are created automatically and duplicate names are rejected.
@@ -391,7 +409,9 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
 
     Chained URLs and ``fs=`` use fsspec seekable range streams. Keep their
     underlying archive objects immutable. S3 paths use fsspec/s3fs credentials
-    and configuration, whether supplied directly or through chaining.
+    and configuration, whether supplied directly or through chaining. Source
+    streams honor backend caching defaults; use a ``blockcache`` filesystem for
+    disk caching. Async backends use direct range I/O without a stream cache.
     Supplied streams are owned and must remain immutable. Loading
     is lazy; concurrent requests share one load, and close drains admitted work.
     """
@@ -409,8 +429,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         target_protocol: str | None = None,
         target_options: Mapping[str, object] | None = None,
         fs: AbstractFileSystem | None = None,
-        cache_bytes: int = 16 << 20,
-        verify_external: bool = True,
+        verify_external: bool = False,
         external: str | AbstractFileSystem | None = None,
         external_threshold: int = 16 << 20,
         asynchronous: bool = False,
@@ -432,8 +451,6 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             raise ValueError("external_threshold must be nonnegative")
         if not isinstance(member_spool_bytes, int) or member_spool_bytes <= 0:
             raise ValueError("member_spool_bytes must be a positive integer")
-        if not isinstance(cache_bytes, int) or cache_bytes < 0:
-            raise ValueError("cache_bytes must be a nonnegative integer")
         if fs is not None and (not isinstance(fo, (str, PathLike)) or target_options):
             raise ValueError(
                 "fs requires an archive path and is already configured; omit target_options"
@@ -457,8 +474,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         self._write_lock = asyncio.Lock()
         self._aborting = False
         self._filesystem = fs
-        self.cache_bytes, self.verify_external, self.external, self.external_threshold = (
-            cache_bytes,
+        self.verify_external, self.external, self.external_threshold = (
             verify_external,
             external,
             external_threshold,
@@ -523,24 +539,25 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                     "metadata requires a backend with setxattr(), such as s3fs"
                 )
             if backend_async:
-                stream = asyncio.run_coroutine_threadsafe(
-                    backend.open_async(path, "wb"), loop
-                ).result()
+                stream = cast(
+                    _AsyncOutput,
+                    asyncio.run_coroutine_threadsafe(backend.open_async(path, "wb"), loop).result(),
+                )
                 output = cast(BinaryIO, _AsyncSink(stream, loop))
             else:
                 output = cast(BinaryIO, backend.open(path, "wb", autocommit=False))
                 commit = getattr(output, "commit", None)
                 discard = getattr(output, "discard", None)
             if self._metadata:
-                setxattr_fn = cast(Callable[..., Any], setxattr)
 
                 def update_metadata() -> None:
                     if backend_async:
+                        async_setxattr = cast(_AsyncSetMetadata, setxattr)
                         asyncio.run_coroutine_threadsafe(
-                            setxattr_fn(path, **self._metadata), loop
+                            async_setxattr(path, **self._metadata), loop
                         ).result()
                     else:
-                        setxattr_fn(path, **self._metadata)
+                        cast(_SetMetadata, setxattr)(path, **self._metadata)
 
                 after_commit = update_metadata
         else:
@@ -611,7 +628,6 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             else None
         )
         options: ReaderOptions = {
-            "cache_bytes": self.cache_bytes,
             "verify_external": self.verify_external,
             "resolver": external,
         }
@@ -651,9 +667,8 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             info = await backend._info(path)
             source = _AsyncFsspecSource(backend, path, info["size"])
             return _ArchiveResources(await AsyncArchive.from_source(source, source.size, **options))
-        # A seekable fsspec file fetches ranges. Disable its read-ahead cache:
-        # the indexed reader already owns bounded decoded caching.
-        file = cast(BinaryIO, await asyncio.to_thread(backend.open, path, "rb", cache_type="none"))
+        # Let the backend choose its source cache, including disk-cache wrappers.
+        file = cast(BinaryIO, await asyncio.to_thread(backend.open, path, "rb"))
         try:
             archive = await AsyncArchive.from_file(file, **options)
         except BaseException as primary:
@@ -865,7 +880,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         lpath: str,
         rpath: str,
         mode: str = "overwrite",
-        callback: Any = DEFAULT_CALLBACK,
+        callback: ProgressCallback = DEFAULT_CALLBACK,
         **kwargs: object,
     ) -> None:
         if mode not in {"overwrite", "create"} or kwargs:
@@ -924,7 +939,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         self,
         rpath: str,
         lpath: str | PathLike[str] | BinaryIO | None = None,
-        callback: Any = DEFAULT_CALLBACK,
+        callback: ProgressCallback = DEFAULT_CALLBACK,
         outfile: BinaryIO | None = None,
         **kwargs: object,
     ) -> None:

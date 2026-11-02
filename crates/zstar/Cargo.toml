@@ -14,28 +14,25 @@ categories = ["compression", "filesystem", "asynchronous"]
 default = ["async", "disk"]
 disk = ["dep:tempfile"]
 fs = ["async", "dep:cap-fs-ext", "dep:cap-std"]
-http = ["async", "dep:reqwest", "dep:httpdate"]
+http = ["async", "dep:reqwest"]
 s3 = ["http", "dep:object_store", "dep:quick-xml"]
 async = [
     "dep:tokio",
     "dep:async-trait",
     "dep:bytes",
     "dep:futures-util",
-    "dep:lru",
 ]
 
 [dependencies]
 cap-fs-ext = { workspace = true, optional = true }
 cap-std = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, features = ["aws"] }
-httpdate = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 fastcdc.workspace = true
-lru = { workspace = true, optional = true }
 serde.workspace = true
 ciborium.workspace = true
 sha2.workspace = true

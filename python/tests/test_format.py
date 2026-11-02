@@ -121,30 +121,6 @@ def test_resolver_errors_preserve_the_original_exception(archive_type, source_fa
     assert "private resolver details" not in str(failure.value)
 
 
-def test_indexed_cache_and_python_external_resolver(object_resolver, source_factory, thin_data):
-    data = bytes(_native.pack_file("x", b"hello"))
-
-    source = source_factory(data)
-    archive = zstar._native.IndexedArchive(source, len(data), cache_bytes=65536)
-    assert archive.read("x", 0, 2) == b"he"
-    assert archive.read("x", 2, 3) == b"llo"
-    assert source.calls == 3
-    assert 0 < archive.cache_bytes <= 65536
-
-    data = thin_data
-    source = source_factory(data)
-    archive = zstar._native.IndexedArchive(source, len(data))
-    # The corpus object merges a prefix, the member, and a suffix.
-    expected = b"hello\n"
-
-    resolver = object_resolver
-    assert archive.read("hello.txt", 0, 0, resolver=resolver) == b""
-    assert resolver.calls == 0
-    assert archive.read("hello.txt", resolver=resolver) == expected
-    assert resolver.calls == 1
-    assert source.calls == 2  # no physical pointer/frame fetch needed
-
-
 @pytest.mark.parametrize("verify_external", [True, False])
 def test_indexed_external_policy_cannot_skip_archive_checksums(
     verify_external, corpus_dir, source_factory
@@ -158,7 +134,6 @@ def test_indexed_external_policy_cannot_skip_archive_checksums(
     with pytest.raises(zstar.ZstarError) as caught:
         archive.read("a-b")
     assert caught.value.category == "malformed-frame"
-    assert archive.cache_bytes == 0
     with pytest.raises(zstar.ZstarError):
         archive.read_many([("a-b", 0, 5)])
 
@@ -181,7 +156,6 @@ def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
         b"world\n",
     ]
     assert resolver.calls == 2  # shared within the batch, not across calls
-    assert archive.cache_bytes == 0
 
     class MissingResolver:
         def get_encoded(self, address, hint, max_bytes):
@@ -197,11 +171,10 @@ def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(sour
     data = _native.pack_file("x", payload)
 
     source = source_factory(data)
-    archive = zstar._native.IndexedArchive(source, len(data), cache_bytes=0)
+    archive = zstar._native.IndexedArchive(source, len(data))
     requests = [("x", 10, 4), ("x", 0, len(payload)), ("x", len(payload), 0), ("x", 10, 4)]
     assert archive.read_many(requests) == [payload[10:14], payload, b"", payload[10:14]]
     assert source.calls == 3  # metadata + one shared payload frame, no frame cache
-    assert archive.cache_bytes == 0
     assert archive.read_many([]) == []
     with pytest.raises(zstar.ZstarError):
         archive.read_many([("x", 0, 4), ("x", len(payload), 1)])
@@ -246,11 +219,9 @@ def test_indexed_open_releases_spool_and_close_preserves_borrowed_source(source_
     with zstar._native.IndexedArchive(source, len(data), memory_bytes=1) as archive:
         assert archive.read("x") == b"hello"
         assert not archive.closed
-        assert archive.cache_bytes > 0
         retained = temporary_descriptors() - before
         if Path("/proc/self/fd").exists():
             assert not retained, "decoded spool is released after building the entry index"
-    assert archive.closed and archive.cache_bytes == 0
     assert not source.closed
     assert not retained.intersection(temporary_descriptors())
     archive.close()
@@ -282,7 +253,7 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
                 assert release.wait(5), "read was not released"
             return data[offset : offset + length]
 
-    archive = zstar._native.IndexedArchive(Source(), len(data), memory_bytes=1, cache_bytes=0)
+    archive = zstar._native.IndexedArchive(Source(), len(data), memory_bytes=1)
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(archive.read, "x")
         try:
@@ -296,7 +267,7 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
         assert future.result(timeout=5) == b"hello"
 
 
-@pytest.mark.parametrize("operation", ["close", "closed", "entry_count", "cache_bytes", "members"])
+@pytest.mark.parametrize("operation", ["close", "closed", "entry_count", "members"])
 def test_bytes_reader_locking_releases_gil_while_waiting_for_a_resolver(operation, corpus_dir):
     script = """
 import threading

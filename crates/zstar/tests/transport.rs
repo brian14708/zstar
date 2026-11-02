@@ -98,7 +98,7 @@ fn ranged(request: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn presigned_get_opens_archive_without_head_and_cache_avoids_payload_requests() {
+async fn presigned_get_opens_archive_without_head_and_reloads_content() {
     let mut writer = Builder::new(Vec::new());
     writer.append_bytes("hello", b"hello world").await.unwrap();
     let data = writer.finish().await.unwrap();
@@ -117,7 +117,7 @@ async fn presigned_get_opens_archive_without_head_and_cache_avoids_payload_reque
         reader.read_range("hello", 0..5).await.unwrap(),
         b"hello"[..]
     );
-    assert_eq!(server.requests.lock().unwrap().len(), 4);
+    assert_eq!(server.requests.lock().unwrap().len(), 5);
 }
 
 #[tokio::test]
@@ -230,7 +230,6 @@ impl HttpTransport for ChangingSizeTransport {
             zstar::http::RangeValidator {
                 etag: Some("\"test-snapshot\"".into()),
                 last_modified: None,
-                ..Default::default()
             },
         ))
     }
@@ -293,7 +292,6 @@ impl HttpTransport for CancelFirstTransport {
             zstar::http::RangeValidator {
                 etag: Some("\"test-snapshot\"".into()),
                 last_modified: None,
-                ..Default::default()
             },
         ))
     }
@@ -554,61 +552,6 @@ async fn dropping_range_future_closes_pending_request() {
         .is_err()
     );
     task.await.unwrap();
-}
-
-#[tokio::test]
-async fn decoded_caches_and_member_cursor_honor_response_cache_control() {
-    for (headers, count, retained) in [
-        (
-            "Cache-Control: private, max-age=3600, immutable\r\n",
-            1,
-            true,
-        ),
-        ("Cache-Control: no-store\r\n", 3, false),
-        ("Cache-Control: no-cache\r\n", 3, false),
-        ("Cache-Control: max-age=60\r\nAge: 60\r\n", 3, false),
-        ("Cache-Control: max-age=3600\r\nVary: *\r\n", 3, false),
-    ] {
-        let mut builder = Builder::new(Vec::new());
-        builder.append_bytes("hello", b"hello world").await.unwrap();
-        let data = builder.finish().await.unwrap();
-        let server = server(move |request| {
-            let mut response = ranged(request, &data);
-            let at = response
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .unwrap()
-                + 2;
-            response.splice(at..at, headers.bytes());
-            response
-        })
-        .await;
-        let source = Arc::new(HttpRangeSource::new(
-            Arc::new(ReqwestTransport::new().unwrap()),
-            PresignedRequest::get(&server.url),
-        ));
-        let cache = Arc::new(zstar::MemoryDecodedCache::new(1 << 20));
-        let reader = Archive::open(source)
-            .await
-            .unwrap()
-            .with_shared_decoded_cache(
-                zstar::SharedDecodedCache::new(b"test-snapshot", cache).unwrap(),
-            );
-        let before = server.requests.lock().unwrap().len();
-        assert_eq!(
-            reader.read_range("hello", 0..5).await.unwrap(),
-            b"hello"[..]
-        );
-        let mut cursor = reader.open_cursor("hello").await.unwrap();
-        assert_eq!(cursor.read(&reader, 0, 5).await.unwrap(), b"hello"[..]);
-        assert_eq!(cursor.read(&reader, 6, 5).await.unwrap(), b"world"[..]);
-        assert_eq!(
-            server.requests.lock().unwrap().len() - before,
-            count,
-            "{headers}"
-        );
-        assert_eq!(reader.cache_len_bytes() > 0, retained, "{headers}");
-    }
 }
 
 #[tokio::test]

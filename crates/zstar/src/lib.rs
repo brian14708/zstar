@@ -20,15 +20,13 @@ use std::ops::Range;
 use thiserror::Error;
 #[doc(hidden)]
 pub mod backend;
-pub mod capture;
+#[cfg(any(feature = "fs", all(test, feature = "disk")))]
+mod capture;
 mod cbor;
-mod decoded_cache;
-pub use decoded_cache::{
-    CachedChunk, DecodedCache, DecodedCacheKey, MemoryDecodedCache, SharedDecodedCache,
-};
 pub mod chunking;
+mod decoded_body;
 pub mod manifest;
-pub mod manifest_io;
+mod manifest_io;
 pub mod pack;
 pub use manifest::{Entry, EntryKind, Extent, Source};
 pub type Extensions = std::collections::BTreeMap<String, ciborium::Value>;
@@ -55,7 +53,7 @@ mod parallel;
 mod tar;
 mod tar_encode;
 pub use manifest_io::{
-    EntryCursor, ManifestEncoder, ManifestOptions, ManifestReader, SpillFactory, SpillStore,
+    EntryCursor, ManifestEncoder, ManifestOptions, ManifestReader, SpillFactory, SpillStore, Spool,
     SpoolBudget,
 };
 pub use tar::{TarHeader, parse_header_prefix as parse_member_header};

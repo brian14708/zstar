@@ -18,7 +18,7 @@ func TestCanonicalSequenceAcrossStorageBoundaries(t *testing.T) {
 	values := []any{bytes.Repeat([]byte{7}, 65530), uint64(1 << 40), string(bytes.Repeat([]byte{'x'}, 70<<10))}
 	for _, memoryBytes := range []uint64{1 << 20, 128} {
 		t.Run(strconv.FormatUint(memoryBytes, 10), func(t *testing.T) {
-			spool := &manifestSpool{options: (ManifestOptions{MemoryBytes: memoryBytes}).defaults()}
+			spool := &manifestSpool{options: (ManifestReaderOptions{MemoryBytes: memoryBytes}).defaults()}
 			t.Cleanup(func() {
 				if err := spool.close(); err != nil {
 					t.Error(err)
@@ -90,7 +90,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	var out bytes.Buffer
 	rootBytes := []byte{7}
 	attributes := Extensions{"x-bytes": []byte{7}}
-	w, err := NewEntryArchiveWriter(&out, 512, ManifestOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1})
+	w, err := NewEntryArchiveWriter(&out, 512, ManifestWriterOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestOptions{})
+	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	// The low-level manifest writer also snapshots caller data before flushing.
 	out.Reset()
 	out.Write(make([]byte, 1000))
-	metadata, err := NewManifestWriter(&out, 1000, ManifestOptions{})
+	metadata, err := NewManifestWriter(&out, 1000, ManifestWriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	if err = metadata.Close(); err != nil {
 		t.Fatal(err)
 	}
-	next, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestOptions{})
+	next, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestDirectManifestTupleIntegerBoundaries(t *testing.T) {
 func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 	ctx := context.Background()
 	var output bytes.Buffer
-	w, err := NewEntryArchiveWriter(&output, 512, ManifestOptions{MemoryBytes: 1})
+	w, err := NewEntryArchiveWriter(&output, 512, ManifestWriterOptions{MemoryBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(ctx, memoryRange(output.Bytes()), ManifestOptions{})
+	m, err := OpenManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 			raw.Write(header)
 		}
 		raw.Write(make([]byte, 1024))
-		codec, err := NewEntryArchiveWriter(&archive, 2048, ManifestOptions{})
+		codec, err := NewEntryArchiveWriter(&archive, 2048, ManifestWriterOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -232,7 +232,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 		testClose(t, codec.codec)
 		checkCleanup(t, codec.frames.close())
 		checkCleanup(t, codec.records.close())
-		metadata, err := NewManifestWriter(&archive, codec.encoded, ManifestOptions{})
+		metadata, err := NewManifestWriter(&archive, codec.encoded, ManifestWriterOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +244,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 		if err = metadata.Close(); err != nil {
 			t.Fatal(err)
 		}
-		m, err := OpenManifest(ctx, memoryRange(archive.Bytes()), ManifestOptions{MemoryBytes: 1})
+		m, err := OpenManifest(ctx, memoryRange(archive.Bytes()), ManifestReaderOptions{MemoryBytes: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -257,7 +257,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 }
 
 func TestObservedRankSortBoundedMultipleRuns(t *testing.T) {
-	s := manifestSpool{options: (ManifestOptions{MemoryBytes: 1}).defaults()}
+	s := manifestSpool{options: (ManifestReaderOptions{MemoryBytes: 1}).defaults()}
 	defer func() { checkCleanup(t, s.close()) }()
 	buffer := make([]byte, 0, 64<<10)
 	for rank := uint64(30000); rank > 0; rank-- {

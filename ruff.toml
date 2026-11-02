@@ -3,6 +3,7 @@ line-length = 100
 
 [lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PERF", "RET", "PLW"]
+extend-select = ["ANN401", "ASYNC", "A", "C4", "FLY", "ISC", "PIE"]
 
 [lint.per-file-ignores]
 "**/test_*.py" = ["B", "PLW"]
