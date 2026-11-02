@@ -13,7 +13,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 mod spool;
-pub(crate) use spool::sort_records;
+pub use spool::sort_records;
 pub use spool::{SpillFactory, SpillStore, Spool, SpoolBudget};
 
 const MEMORY_DEFAULT: u64 = 8 << 20;
@@ -311,7 +311,7 @@ pub struct EntryCursor {
 }
 
 #[cfg(feature = "async")]
-pub(crate) enum EntryLookup {
+pub enum EntryLookup {
     NeedsWorker,
     Ready(Option<Entry>),
 }
@@ -325,7 +325,7 @@ pub struct ManifestReader {
     cursor_owner: Arc<()>,
 }
 /// Segments are authenticated as bytes before the sequence is parsed.
-pub(crate) struct ManifestIngest {
+pub struct ManifestIngest {
     footer: Footer,
     spool: Spool,
     at: u64,

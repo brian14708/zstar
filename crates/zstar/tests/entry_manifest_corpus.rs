@@ -17,7 +17,19 @@ fn cases() -> Vec<Value> {
     let manifest: Value = serde_json::from_slice(&artifact("manifest.json")).unwrap();
     assert_eq!(manifest["schema_version"], 1);
     assert_eq!(manifest["format"], "entry-manifest");
-    manifest["cases"].as_array().unwrap().clone()
+    manifest["archives"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .flat_map(|(path, archive)| {
+            archive["cases"].as_array().unwrap().iter().map(|case| {
+                let mut case = case.clone();
+                case["archive"] = Value::String(path.clone());
+                case["archive_sha256"] = archive["sha256"].clone();
+                case
+            })
+        })
+        .collect()
 }
 struct Objects(HashMap<[u8; 32], Vec<u8>>);
 impl Objects {
@@ -104,7 +116,7 @@ fn entry_manifest_operations_match_independent_corpus() {
                     offset,
                     length,
                     resolver,
-                    case["verify_external"].as_bool().unwrap_or(true),
+                    case["verify_external"].as_bool().unwrap_or(false),
                 )?;
                 assert_eq!(
                     actual,
@@ -189,7 +201,7 @@ mod asynchronous {
                     ReaderOptions {
                         manifest: options(&case),
                         resolver: Some(Arc::new(Objects::from_case(&case))),
-                        verify_external: case["verify_external"].as_bool().unwrap_or(true),
+                        verify_external: case["verify_external"].as_bool().unwrap_or(false),
                         ..Default::default()
                     },
                 )
@@ -220,12 +232,12 @@ mod asynchronous {
                     artifact(case["range_result"].as_str().unwrap())
                 );
                 if operation == "external-range" {
-                    if case["verify_external"].as_bool() == Some(false) {
-                        assert_ne!(report.external_objects_unchecked, [] as [[u8; 32]; 0]);
-                        assert_eq!(report.external_objects_sha256_checked.len(), 0);
-                    } else {
+                    if case["verify_external"].as_bool().unwrap_or(false) {
                         assert_ne!(report.external_objects_sha256_checked, [] as [[u8; 32]; 0]);
                         assert_eq!(report.external_objects_unchecked.len(), 0);
+                    } else {
+                        assert_ne!(report.external_objects_unchecked, [] as [[u8; 32]; 0]);
+                        assert_eq!(report.external_objects_sha256_checked.len(), 0);
                     }
                 }
                 Ok(())

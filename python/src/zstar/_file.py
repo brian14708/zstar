@@ -54,9 +54,8 @@ class ArchiveFile(io.RawIOBase):
     """A read-only, seekable member stream borrowing its parent archive.
 
     Allocating reads obey the archive's returned-read budget. readinto may fill
-    larger caller-owned buffers in bounded chunks. Each stream retains one
-    validated native chunk independently of the shared cache. A per-stream
-    lock covers reads, cursor updates, and close.
+    larger caller-owned buffers in bounded chunks. A per-stream lock covers reads,
+    cursor updates, and close.
     """
 
     def __init__(self, archive: "Archive", name: str, size: int) -> None:

@@ -311,19 +311,16 @@ def test_sync_readers_close_after_context_exception_without_closing_source(range
         pass
 
 
-def test_default_bytes_archive_external_reuse_and_bounded_closure_verification(
-    object_resolver, thin_data
-):
+def test_external_closure_verification_obeys_read_budget(object_resolver, thin_data):
     from zstar import Archive
 
     encoded = thin_data
 
     objects = object_resolver
-    archive = Archive(encoded, max_read_bytes=1, resolver=objects)
+    archive = Archive(encoded, max_read_bytes=1, resolver=objects, verify_external=True)
     report = archive.verify(external=True)
     assert report["external_closure_validated"]
     assert report["external_objects_sha256_checked"]
-    assert objects.calls == 1
     assert archive.read("world.txt", 0, 1) == b"w"
     with pytest.raises(zstar.ZstarError, match="budget"):
         archive.read("world.txt")

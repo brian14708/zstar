@@ -74,7 +74,7 @@ class _WriteSession:
                     ),
                     compression_level=self.compression_level,
                 )
-                self.writer.add_external(info, external)
+                self.writer._add_external(info, external)
             else:
                 self.writer.addfile(info, body)
         except BaseException:

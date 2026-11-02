@@ -281,13 +281,6 @@ pub async fn put_archive(
         .map_err(storage_error)
 }
 
-pub(crate) fn response_cache_policy(attributes: &Attributes) -> crate::http::CachePolicy {
-    crate::http::CachePolicy::from_headers(
-        attributes.get(&Attribute::CacheControl).map(AsRef::as_ref),
-        None,
-    )
-}
-
 struct PinnedMeta {
     object: ObjectMeta,
     manifest: Option<Range<u64>>,
@@ -319,7 +312,6 @@ pub struct S3RangeSource {
     path: Path,
     meta: OnceCell<PinnedMeta>,
     max_range_bytes: u64,
-    cache_policy: std::sync::Mutex<crate::http::CachePolicy>,
 }
 impl S3RangeSource {
     pub fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
@@ -328,7 +320,6 @@ impl S3RangeSource {
             path,
             meta: OnceCell::new(),
             max_range_bytes: 64 << 20,
-            cache_policy: std::sync::Mutex::new(crate::http::CachePolicy::default()),
         }
     }
     /// Override the transport allocation bound independently of reader budgets.
@@ -351,10 +342,6 @@ impl S3RangeSource {
                     )
                     .await
                     .map_err(storage_error)?;
-                self.cache_policy
-                    .lock()
-                    .unwrap()
-                    .observe(response_cache_policy(&result.attributes));
                 let manifest = manifest_hint(&result.attributes);
                 let meta = result.meta;
                 if meta.e_tag.as_deref().is_none_or(str::is_empty)
@@ -378,9 +365,6 @@ impl S3RangeSource {
 }
 #[async_trait::async_trait]
 impl AsyncRangeReader for S3RangeSource {
-    fn cache_allowed(&self) -> bool {
-        self.cache_policy.lock().unwrap().allows_reuse()
-    }
     async fn size(&self) -> Result<u64> {
         Ok(self.metadata().await?.object.size)
     }
@@ -426,9 +410,7 @@ impl AsyncRangeReader for S3RangeSource {
                 "storage range or identity changed",
             )));
         }
-        let policy = response_cache_policy(&result.attributes);
         let bytes = read_exact(result, range.end - range.start).await?;
-        self.cache_policy.lock().unwrap().observe(policy);
         Ok(bytes)
     }
 }
@@ -463,7 +445,6 @@ pub struct S3BlobStore {
     store: Arc<dyn ObjectStore>,
     key: Arc<dyn Fn([u8; 32]) -> Path + Send + Sync>,
     permits: Arc<Semaphore>,
-    policies: std::sync::Mutex<lru::LruCache<[u8; 32], crate::http::CachePolicy>>,
 }
 impl S3BlobStore {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: Path, concurrency: NonZeroUsize) -> Self {
@@ -480,10 +461,6 @@ impl S3BlobStore {
             concurrency,
         )
     }
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
-    )]
     pub fn with_key_mapper(
         store: Arc<dyn ObjectStore>,
         key: impl Fn([u8; 32]) -> Path + Send + Sync + 'static,
@@ -493,7 +470,6 @@ impl S3BlobStore {
             store,
             key: Arc::new(key),
             permits: Arc::new(Semaphore::new(concurrency.get())),
-            policies: std::sync::Mutex::new(lru::LruCache::new(NonZeroUsize::new(1024).unwrap())),
         }
     }
     #[must_use]
@@ -503,14 +479,6 @@ impl S3BlobStore {
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
-    )]
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "The guard intentionally covers this short state update."
     )]
     /// Fetch one bounded encoded object. The encoded-size hint does not limit
     /// fetches; decoding and address verification belong to the reader.
@@ -538,14 +506,7 @@ impl S3BlobStore {
                 "partial storage object response".into(),
             ));
         }
-        let policy = response_cache_policy(&result.attributes);
         let bytes = read_exact(result, size).await?;
-        let mut policies = self.policies.lock().unwrap();
-        if let Some(previous) = policies.get_mut(&digest) {
-            previous.observe(policy);
-        } else {
-            policies.put(digest, policy);
-        }
         Ok(bytes)
     }
     #[expect(
@@ -699,13 +660,6 @@ impl crate::http::RequestProvider for S3RequestProvider {
 
 #[async_trait::async_trait]
 impl crate::ObjectResolver for S3BlobStore {
-    fn cache_allowed(&self, digest: [u8; 32]) -> bool {
-        self.policies
-            .lock()
-            .unwrap()
-            .get(&digest)
-            .is_some_and(crate::http::CachePolicy::allows_reuse)
-    }
     async fn get_encoded(&self, digest: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes> {
         Self::get_encoded(self, digest, hint, max_bytes).await
     }

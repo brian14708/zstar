@@ -1,6 +1,6 @@
 //! Concurrent selective reads for the entry manifest, without a frame table.
 use crate::backend::{decode_content, decode_object};
-use crate::decoded_cache::{BuiltinLookup, DecodedBody, DecodedCacheKey, SharedDecodedCache};
+use crate::decoded_body::DecodedBody;
 use crate::manifest::{ENCODED_FRAME_MAX, Entry, EntryKind, Extent};
 use crate::manifest_io::{
     EntryCursor, EntryLookup, ManifestIngest, ManifestOptions, ManifestReader, Spool,
@@ -8,7 +8,6 @@ use crate::manifest_io::{
 use crate::{AsyncRangeReader, Error, MAX_BATCH_REQUESTS, ReadRequest, Result};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
-use lru::LruCache;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
@@ -20,10 +19,6 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 /// and the configured hash policy.
 #[async_trait::async_trait]
 pub trait ObjectResolver: Send + Sync {
-    /// Whether retained content for this address may be reused.
-    fn cache_allowed(&self, _address: [u8; 32]) -> bool {
-        true
-    }
     /// Returns a complete encoded object of at most `max_bytes` bytes.
     ///
     /// `hint` is an advisory encoded size, not a decoded-size bound. Return
@@ -60,13 +55,11 @@ pub struct ObjectRequest {
     pub hint: u64,
     pub max_bytes: u64,
 }
-/// Metadata, cache, concurrency, and external-object policies for an [`Archive`].
+/// Metadata, concurrency, and external-object policies for an [`Archive`].
 #[derive(Clone)]
 pub struct ReaderOptions {
     /// Metadata parsing and storage limits, including the returned-read budget.
     pub manifest: ManifestOptions,
-    /// Charged retained decoded content. Active jobs/results are additional.
-    pub cache_bytes: usize,
     /// Bounds both outstanding content requests and detached decode jobs.
     pub concurrent_chunks: usize,
     /// Fixed reader-local external hash policy. Data checksums are mandatory.
@@ -78,9 +71,8 @@ impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             manifest: ManifestOptions::default(),
-            cache_bytes: 16 << 20,
             concurrent_chunks: 8,
-            verify_external: true,
+            verify_external: false,
             resolver: None,
         }
     }
@@ -89,7 +81,6 @@ impl std::fmt::Debug for ReaderOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReaderOptions")
             .field("manifest", &self.manifest)
-            .field("cache_bytes", &self.cache_bytes)
             .field("concurrent_chunks", &self.concurrent_chunks)
             .field("verify_external", &self.verify_external)
             .field("resolver", &self.resolver.as_ref().map(|_| "configured"))
@@ -146,29 +137,6 @@ impl Key {
             crate::manifest::Source::Archive(at) => Self::Archive(at, extent.encoded_size),
             crate::manifest::Source::Object(hash) => Self::Object(hash),
         }
-    }
-}
-struct Cache {
-    entries: LruCache<Key, DecodedBody>,
-    limit: usize,
-    used: usize,
-}
-impl Cache {
-    const OVERHEAD: usize = 256;
-    fn put(&mut self, key: Key, raw: DecodedBody) {
-        let charge = raw.allocated().saturating_add(Self::OVERHEAD);
-        if charge > self.limit {
-            return;
-        }
-        if let Some(previous) = self.entries.pop(&key) {
-            self.used -= previous.allocated() + Self::OVERHEAD;
-        }
-        while self.used > self.limit - charge {
-            let (_, previous) = self.entries.pop_lru().unwrap();
-            self.used -= previous.allocated() + Self::OVERHEAD;
-        }
-        self.used += charge;
-        self.entries.put(key, raw);
     }
 }
 struct Flight {
@@ -282,7 +250,7 @@ impl<R: AsyncRangeReader + ?Sized> crate::RangeReader for VerificationSource<R> 
 /// An indexed archive backed by an immutable [`AsyncRangeReader`].
 ///
 /// Opening authenticates the complete manifest and retains a sorted index in
-/// O(N) memory. Clones share the source, index, cache, and concurrency limits.
+/// O(N) memory. Clones share the source, index, and concurrency limits.
 /// Selected content is validated before it is returned. Use [`Self::verify`]
 /// to check the physical archive or its external-object closure.
 ///
@@ -306,11 +274,9 @@ pub struct Archive<R: AsyncRangeReader + ?Sized> {
     options: ReaderOptions,
     semaphore: Arc<Semaphore>,
     metadata_semaphore: Arc<Semaphore>,
-    cache: Arc<Mutex<Cache>>,
     flights: Arc<Flights>,
     metadata_digest: [u8; 32],
     data_end: u64,
-    shared_cache: Option<SharedDecodedCache>,
 }
 impl Archive<Bytes> {
     #[expect(
@@ -330,11 +296,9 @@ impl<R: AsyncRangeReader + ?Sized> Clone for Archive<R> {
             options: self.options.clone(),
             semaphore: self.semaphore.clone(),
             metadata_semaphore: self.metadata_semaphore.clone(),
-            cache: self.cache.clone(),
             flights: self.flights.clone(),
             metadata_digest: self.metadata_digest,
             data_end: self.data_end,
-            shared_cache: self.shared_cache.clone(),
         }
     }
 }
@@ -657,38 +621,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             manifest: Arc::new(manifest),
             semaphore: Arc::new(Semaphore::new(options.concurrent_chunks)),
             metadata_semaphore: Arc::new(Semaphore::new(2)),
-            cache: Arc::new(Mutex::new(Cache {
-                entries: LruCache::unbounded(),
-                limit: options.cache_bytes,
-                used: 0,
-            })),
             flights: Arc::new(Mutex::new(HashMap::new())),
             options,
             metadata_digest,
             data_end,
-            shared_cache: None,
-        })
-    }
-    /// Attach a caller-owned decoded cache before sharing this reader.
-    /// The binding identity must name an immutable encoded archive snapshot.
-    #[must_use]
-    pub fn with_shared_decoded_cache(mut self, shared: SharedDecodedCache) -> Self {
-        self.shared_cache = Some(shared);
-        self
-    }
-    pub(crate) fn cache_allowed(&self, key: &Key, resolver: Option<&dyn ObjectResolver>) -> bool {
-        match key {
-            Key::Archive(..) => self.source.cache_allowed(),
-            Key::Object(address) => resolver.is_some_and(|r| r.cache_allowed(*address)),
-        }
-    }
-    fn shared_key(&self, key: &Key) -> Option<DecodedCacheKey> {
-        self.shared_cache.as_ref().and_then(|shared| match key {
-            Key::Archive(at, size) => Some(shared.archive_key(self.metadata_digest, *at, *size)),
-            Key::Object(hash) if self.options.verify_external => {
-                Some(DecodedCacheKey::Object(*hash))
-            }
-            Key::Object(_) => None,
         })
     }
     async fn metadata<T: Send + 'static>(
@@ -795,15 +731,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
     }
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
-    )]
-    /// Returns charged bytes retained by this archive's decoded cache.
-    #[must_use]
-    pub fn cache_len_bytes(&self) -> usize {
-        self.cache.lock().unwrap().used
-    }
     pub(crate) fn owns_cursor(&self, owner: &std::sync::Weak<ManifestReader>) -> bool {
         std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&self.manifest))
     }
@@ -835,10 +762,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 .await?
                 .into_bytes());
         }
-        let cached = self.cache.lock().unwrap().entries.get(key).cloned();
-        if let Some(raw) = cached.filter(|_| self.cache_allowed(key, resolver)) {
-            return Ok(raw.into_bytes());
-        }
         let flight = {
             let mut flights = self.flights.lock().unwrap();
             if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
@@ -867,10 +790,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         if let Some(error) = flight.failure.lock().unwrap().as_ref() {
             return Err(error.duplicate());
         }
-        let cached = self.cache.lock().unwrap().entries.get(key).cloned();
-        if let Some(raw) = cached.filter(|_| self.cache_allowed(key, resolver)) {
-            return Ok(raw.into_bytes());
-        }
         let raw = match self.load_content(key, hint, resolver, encoded).await {
             Ok(raw) => raw,
             Err(error) => {
@@ -882,10 +801,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 return Err(error);
             }
         };
-        // Failed or cancelled loads never enter the cache or flight result.
-        if self.cache_allowed(key, resolver) {
-            self.cache.lock().unwrap().put(key.clone(), raw.clone());
-        }
         *flight.value.lock().unwrap() = Some(raw.clone());
         Ok(raw.into_bytes())
     }
@@ -896,32 +811,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         resolver: Option<&dyn ObjectResolver>,
         prefetched: Option<Bytes>,
     ) -> Result<DecodedBody> {
-        let shared_key = self
-            .cache_allowed(key, resolver)
-            .then(|| self.shared_key(key))
-            .flatten();
-        if let (Some(cache_key), Some(shared)) = (shared_key, self.shared_cache.clone()) {
-            let cache_hit = match shared.memory_get(&cache_key) {
-                BuiltinLookup::Result(value) => value,
-                BuiltinLookup::Unavailable => {
-                    let permit = self
-                        .semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::Unsupported("reader closed"))?;
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        shared.get(&cache_key)
-                    })
-                    .await
-                    .map_err(worker_error)?
-                }
-            };
-            if let Some(raw) = cache_hit {
-                return Ok(raw);
-            }
-        }
         let permit = self
             .semaphore
             .clone()
@@ -952,14 +841,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         };
         let key_copy = key.clone();
         let verify = self.options.verify_external;
-        let shared = self
-            .cache_allowed(key, resolver)
-            .then(|| self.shared_cache.clone())
-            .flatten();
-        let shared_key = self
-            .cache_allowed(key, resolver)
-            .then(|| self.shared_key(key))
-            .flatten();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let raw = match key_copy {
@@ -972,9 +853,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 crate::verify_sha256(&raw, hash)?;
             }
             let raw = DecodedBody::from_vec(raw);
-            if let (Some(shared), Some(shared_key)) = (shared.as_ref(), shared_key) {
-                shared.put(shared_key, raw.clone());
-            }
             Ok::<_, Error>(raw)
         })
         .await
@@ -983,16 +861,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     async fn plan(&self, requests: &[ReadRequest<'_>]) -> Result<Plan> {
         if requests.len() > MAX_BATCH_REQUESTS {
             return Err(Error::Budget("batch request count"));
-        }
-        // Small batches use the immutable in-memory index directly, avoiding
-        // path copies and a blocking worker round trip. Keep larger batches
-        // off the runtime thread; extent-copy budgets still apply to both.
-        if requests.len() <= 16 {
-            return build_plan(
-                requests.iter().map(|r| (r.path, r.offset, r.length)),
-                self.options.manifest.max_read_bytes,
-                |path| Ok(self.manifest.range_entry(path)),
-            );
         }
         let requests: Vec<_> = requests
             .iter()
@@ -1184,23 +1052,15 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         resolver: Option<&dyn ObjectResolver>,
     ) -> Result<BTreeMap<Key, Bytes>> {
         let mut output = BTreeMap::new();
-        // Advisory custom shared caches can require blocking callbacks. Let
-        // existing content loads consult them before issuing speculative I/O.
-        if self.shared_cache.is_some() {
-            return Ok(output);
-        }
         let missing: Vec<_> = window
             .iter()
             .filter(|(key, _)| {
-                (!self.cache_allowed(key, resolver)
-                    || !self.cache.lock().unwrap().entries.contains(key))
-                    && self
-                        .flights
-                        .lock()
-                        .unwrap()
-                        .get(key)
-                        .and_then(Weak::upgrade)
-                        .is_none()
+                self.flights
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .and_then(Weak::upgrade)
+                    .is_none()
             })
             .collect();
         let mut cursor = 0;
@@ -1474,15 +1334,9 @@ mod tests {
     #[tokio::test]
     async fn selective_and_batch_reads_share_chunks_and_validate_before_content_io() {
         let source = Arc::new(Source::new(fixture()));
-        let reader = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let reader = Archive::open_with_options(source.clone(), ReaderOptions::default())
+            .await
+            .unwrap();
         assert_eq!(source.calls.load(Ordering::SeqCst), 2); // footer + read-ahead metadata
         reader.validate_metadata().await.unwrap();
         let requests = [
@@ -1561,15 +1415,9 @@ mod tests {
     async fn concurrent_misses_coalesce_even_without_a_retained_cache() {
         let source = Arc::new(Source::new(fixture()));
         let reader = Arc::new(
-            Archive::open_with_options(
-                source.clone(),
-                ReaderOptions {
-                    cache_bytes: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap(),
+            Archive::open_with_options(source.clone(), ReaderOptions::default())
+                .await
+                .unwrap(),
         );
         source.blocked.store(true, Ordering::SeqCst);
         let jobs: Vec<_> = (0..8)
@@ -1599,7 +1447,6 @@ mod tests {
         for job in jobs {
             assert_eq!(job.await.unwrap(), b"hello".as_slice());
         }
-        assert_eq!(reader.cache_len_bytes(), 0);
         assert!(reader.flights.lock().unwrap().is_empty());
     }
     #[tokio::test]
@@ -1610,7 +1457,6 @@ mod tests {
                 source.clone(),
                 ReaderOptions {
                     concurrent_chunks: 1,
-                    cache_bytes: 0,
                     ..Default::default()
                 },
             )
@@ -1646,24 +1492,12 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn small_cached_reads_do_not_need_a_metadata_worker_slot() {
+    async fn reads_and_batches_share_the_metadata_path() {
         let reader =
             Archive::open_with_options(Arc::new(Source::new(fixture())), ReaderOptions::default())
                 .await
                 .unwrap();
         reader.read_range("a", 0..5).await.unwrap();
-        let _first = reader
-            .metadata_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .unwrap();
-        let _second = reader
-            .metadata_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .unwrap();
         let raw = timeout(Duration::from_secs(1), reader.read_range("a", 1..4))
             .await
             .unwrap()
@@ -1717,238 +1551,9 @@ mod tests {
         ];
         assert!(matches!(reader.read_many(&bad).await, Err(Error::Range)));
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-    )]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "The branch or bounded fixture establishes a nonnegative value."
-    )]
-    #[tokio::test]
-    async fn fragmented_range_reads_do_not_wait_for_metadata_workers() {
-        let payload: Vec<_> = (0..100_000).map(|i| (i % 251) as u8).collect();
-        let mut writer =
-            BlockingBuilder::with_options(Vec::new(), 512, 3, ManifestOptions::default()).unwrap();
-        writer
-            .add_file(
-                Entry::file("file"),
-                payload.len() as u64,
-                &mut payload.as_slice(),
-            )
-            .unwrap();
-        let reader = Archive::from_bytes(writer.finish().unwrap()).await.unwrap();
-        assert!(reader.entry("file").await.unwrap().unwrap().extents.len() > 64);
-        let _permits = reader
-            .metadata_semaphore
-            .clone()
-            .acquire_many_owned(2)
-            .await
-            .unwrap();
-        for (offset, size) in [(99_500, 500), (99_000, 750), (100_000, 0)] {
-            let result = timeout(
-                Duration::from_secs(1),
-                reader.read_range("file", offset..offset + size),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                result.as_ref(),
-                &payload[offset as usize..(offset + size) as usize]
-            );
-        }
-        assert!(matches!(
-            reader.read_range("file", 100_000..100_001).await,
-            Err(Error::Range)
-        ));
-    }
-    #[tokio::test]
-    async fn cache_is_bounded_and_selected_bytes_keep_their_owner_after_eviction() {
-        let source = Arc::new(Source::new(fixture()));
-        let reader = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: usize::MAX,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let owned = reader.read_range("a", 0..5).await.unwrap();
-        let one_chunk_budget = reader.cache_len_bytes();
-        reader.cache.lock().unwrap().limit = one_chunk_budget;
-        assert_eq!(
-            reader.read_range("b", 0..5).await.unwrap(),
-            b"world".as_slice()
-        );
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 1);
-        reader.read_range("c", 9000..9001).await.unwrap();
-        reader.read_range("a", 0..5).await.unwrap();
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 3);
-        assert!(reader.cache_len_bytes() <= one_chunk_budget);
-        drop(reader);
-        assert_eq!(owned, b"hello".as_slice());
-    }
     struct Objects {
         bytes: Bytes,
         calls: AtomicUsize,
-    }
-    #[tokio::test]
-    async fn shared_cache_reuses_sync_content_and_isolates_new_snapshots() {
-        use crate::{MemoryDecodedCache, SharedDecodedCache};
-        let raw = fixture();
-        let memory = Arc::new(MemoryDecodedCache::new(1 << 20));
-        let binding = SharedDecodedCache::new(b"snapshot-one", memory.clone()).unwrap();
-        let mut sync = crate::backend::BlockingArchive::open(
-            crate::SliceReader::new(&raw),
-            ManifestOptions::default(),
-        )
-        .unwrap();
-        sync.set_shared_decoded_cache(Some(binding.clone()));
-        sync.read("a", 0, 5, None, true).unwrap();
-        drop(sync);
-        let source = Arc::new(Source::new(raw));
-        let reader = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .with_shared_decoded_cache(binding);
-        let owned = reader.read_range("a", 0..5).await.unwrap();
-        assert_eq!(owned, b"hello".as_slice());
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 0);
-        drop(reader);
-        let replaced = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .with_shared_decoded_cache(
-            SharedDecodedCache::new(b"snapshot-two", memory.clone()).unwrap(),
-        );
-        assert_eq!(
-            replaced.read_range("a", 0..5).await.unwrap(),
-            b"hello".as_slice()
-        );
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 1);
-        let third = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-        .with_shared_decoded_cache(
-            SharedDecodedCache::new(b"snapshot-two", memory.clone()).unwrap(),
-        );
-        third.read_range("a", 0..5).await.unwrap();
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 1);
-        memory.clear();
-        drop(replaced);
-        drop(third);
-        assert_eq!(owned, b"hello".as_slice());
-    }
-
-    struct BlockedCache {
-        calls: AtomicUsize,
-        started: Notify,
-        released: (Mutex<bool>, std::sync::Condvar),
-    }
-    impl crate::DecodedCache for BlockedCache {
-        #[expect(
-            clippy::significant_drop_tightening,
-            reason = "The guard intentionally covers this short state update."
-        )]
-        fn get(&self, _: &crate::DecodedCacheKey) -> std::io::Result<Option<crate::CachedChunk>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.started.notify_one();
-            let (lock, notify) = &self.released;
-            let mut released = lock.lock().unwrap();
-            while !*released {
-                released = notify.wait(released).unwrap();
-            }
-            Ok(None)
-        }
-        fn put(&self, _: crate::CachedChunk) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    #[expect(
-        clippy::items_after_statements,
-        reason = "Keep local helpers next to the operation that uses them."
-    )]
-    #[tokio::test]
-    async fn cancelled_cache_callbacks_keep_their_worker_permit_until_completion() {
-        let cache = Arc::new(BlockedCache {
-            calls: AtomicUsize::new(0),
-            started: Notify::new(),
-            released: (Mutex::new(false), std::sync::Condvar::new()),
-        });
-        // Release blocking workers even if an assertion unwinds the test.
-        struct Release(Arc<BlockedCache>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                *self.0.released.0.lock().unwrap() = true;
-                self.0.released.1.notify_all();
-            }
-        }
-        let release = Release(cache.clone());
-        let source = Arc::new(Source::new(fixture()));
-        let reader = Arc::new(
-            Archive::open_with_options(
-                source.clone(),
-                ReaderOptions {
-                    cache_bytes: 0,
-                    concurrent_chunks: 1,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .with_shared_decoded_cache(
-                crate::SharedDecodedCache::new(b"immutable", cache.clone()).unwrap(),
-            ),
-        );
-        reader.entry("a").await.unwrap();
-        reader.entry("c").await.unwrap();
-        let first = {
-            let reader = reader.clone();
-            tokio::spawn(async move { reader.read_range("a", 0..5).await })
-        };
-        timeout(Duration::from_secs(2), cache.started.notified())
-            .await
-            .unwrap();
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
-        assert_eq!(reader.semaphore.available_permits(), 0);
-        let mut next = {
-            let reader = reader.clone();
-            tokio::spawn(async move { reader.read_range("c", 9000..9001).await })
-        };
-        assert!(timeout(Duration::from_millis(30), &mut next).await.is_err());
-        assert_eq!(cache.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(source.data_calls.load(Ordering::SeqCst), 0);
-        drop(release);
-        assert_eq!(
-            timeout(Duration::from_secs(2), next)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            [7].as_slice()
-        );
-        assert_eq!(reader.semaphore.available_permits(), 1);
     }
     #[async_trait::async_trait]
     impl ObjectResolver for Objects {
@@ -1958,19 +1563,13 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn object_hints_are_not_cache_identity_and_hash_policy_is_explicit() {
+    async fn object_hints_are_advisory_and_hash_policy_is_explicit() {
         let source = Arc::new(Source::new(
             include_bytes!("../../../testdata/entry-manifest/thin.zstar").to_vec(),
         ));
-        let reader = Archive::open_with_options(
-            source.clone(),
-            ReaderOptions {
-                cache_bytes: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let reader = Archive::open_with_options(source.clone(), ReaderOptions::default())
+            .await
+            .unwrap();
         let objects = Objects {
             bytes: crate::encode_frame(b"hello\nworld\n", 3).unwrap().into(),
             calls: AtomicUsize::new(0),
@@ -2002,13 +1601,21 @@ mod tests {
             bytes: crate::encode_frame(b"wrong\nbytes\n", 3).unwrap().into(),
             calls: AtomicUsize::new(0),
         };
+        let checked = Archive::open_with_options(
+            source.clone(),
+            ReaderOptions {
+                verify_external: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
-            reader
+            checked
                 .read_range_with_resolver("hello.txt", 0, 6, Some(&wrong))
                 .await
                 .is_err()
         );
-        assert_eq!(reader.cache_len_bytes(), 0);
         let unchecked = Archive::open_with_options(
             source,
             ReaderOptions {
@@ -2025,7 +1632,6 @@ mod tests {
         assert_eq!(raw, b"wrong\n".as_slice());
         assert_eq!(report.external_objects_unchecked.len(), 1);
         assert_eq!(report.external_objects_sha256_checked, [] as [[u8; 32]; 0]);
-        assert_eq!(unchecked.cache_len_bytes(), 0);
         // Same address, different unchecked resolvers: no cache or flight reuse.
         let prior_calls = wrong.calls.load(Ordering::SeqCst);
         let (first, second) = tokio::join!(
@@ -2035,7 +1641,6 @@ mod tests {
         assert_eq!(first.unwrap(), b"hello\n".as_slice());
         assert_eq!(second.unwrap(), b"wrong\n".as_slice());
         assert_eq!(wrong.calls.load(Ordering::SeqCst), prior_calls + 1);
-        assert_eq!(unchecked.cache_len_bytes(), 0);
         let short = Objects {
             bytes: crate::encode_frame(b"hello\n", 3).unwrap().into(),
             calls: AtomicUsize::new(0),
@@ -2046,7 +1651,6 @@ mod tests {
             )),
             ReaderOptions {
                 verify_external: false,
-                cache_bytes: 0,
                 ..Default::default()
             },
         )
@@ -2076,7 +1680,6 @@ mod tests {
             reader.read_range("a-b", 0..5).await,
             Err(Error::MalformedFrame(_))
         ));
-        assert_eq!(reader.cache_len_bytes(), 0);
         let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/metadata-hash.zstar");
         assert!(
             Archive::open_with_options(
@@ -2094,15 +1697,9 @@ mod tests {
         bytes[12] ^= 0xff; // damage the first data frame
         let source = Arc::new(Source::new(bytes));
         let reader = Arc::new(
-            Archive::open_with_options(
-                source.clone(),
-                ReaderOptions {
-                    cache_bytes: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap(),
+            Archive::open_with_options(source.clone(), ReaderOptions::default())
+                .await
+                .unwrap(),
         );
         source.blocked.store(true, Ordering::SeqCst);
         let jobs: Vec<_> = (0..8)

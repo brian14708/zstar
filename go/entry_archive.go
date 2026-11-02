@@ -21,7 +21,7 @@ import (
 type EntryArchiveWriter struct {
 	output                io.Writer
 	codec                 *zstd.Encoder
-	options               ManifestOptions
+	options               manifestOptions
 	target                int
 	pending               []byte
 	raw, emitted, encoded uint64
@@ -32,7 +32,7 @@ type EntryArchiveWriter struct {
 
 // NewEntryArchiveWriter creates an archive encoder with bounded frame and
 // metadata storage. Zero frameSize selects 1 MiB. The caller owns output.
-func NewEntryArchiveWriter(output io.Writer, frameSize int, options ManifestOptions) (*EntryArchiveWriter, error) {
+func NewEntryArchiveWriter(output io.Writer, frameSize int, config ManifestWriterOptions) (*EntryArchiveWriter, error) {
 	if output == nil {
 		return nil, errors.New("zstar: nil destination")
 	}
@@ -42,7 +42,7 @@ func NewEntryArchiveWriter(output io.Writer, frameSize int, options ManifestOpti
 	if frameSize < 512 || frameSize > maxFrameSize || frameSize%512 != 0 {
 		return nil, errors.New("zstar: invalid frame target")
 	}
-	options = options.defaults()
+	options := config.defaults()
 	if err := validateExtensions(options.RootExtensions); err != nil {
 		return nil, err
 	}
@@ -257,7 +257,7 @@ func (w *EntryArchiveWriter) finish() (err error) {
 	if err := w.flush(); err != nil {
 		return err
 	}
-	metadata, err := NewManifestWriter(w.output, w.encoded, w.options)
+	metadata, err := NewManifestWriter(w.output, w.encoded, w.options.writerOptions())
 	if err != nil {
 		return err
 	}

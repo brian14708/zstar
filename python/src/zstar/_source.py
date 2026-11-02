@@ -37,6 +37,6 @@ class _FileSource:
                         break
                     chunks.append(chunk)
                     remaining -= len(chunk)
-                return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+                return b"".join(chunks)
             finally:
                 self.file.seek(position)

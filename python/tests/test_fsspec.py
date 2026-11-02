@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import io
+import random
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -80,7 +81,7 @@ def test_filesystems_are_not_instance_cached(tmp_path):
         second.close()
 
 
-@pytest.mark.parametrize("cache_type, expected", [(None, 12), ("readahead", 5242892)])
+@pytest.mark.parametrize("cache_type, expected", [(None, 12), ("readahead", 12)])
 def test_sparse_reads_avoid_unrequested_logical_bytes(monkeypatch, cache_type, expected):
     # Observe member ranges, independently of compression ratio or frame size.
     from zstar._fsspec import _MemberFile
@@ -192,7 +193,7 @@ def test_close_drains_admitted_loads_and_rejects_new_work(monkeypatch):
         from fsspec.asyn import sync
 
         async def wait_for_close():
-            while not fs._closed:
+            while not fs._closed:  # noqa: ASYNC110 - observing filesystem close state
                 await asyncio.sleep(0)
 
         sync(fs.loop, wait_for_close)
@@ -246,7 +247,7 @@ def test_external_missing_object(thin_data):
 def test_local_snapshot_survives_atomic_path_replacement(tmp_path):
     path = tmp_path / "snapshot.zstar"
     path.write_bytes(_native.pack_file("x", b"AAAAAA"))
-    fs = ZstarFileSystem(fo=path, cache_bytes=0)
+    fs = ZstarFileSystem(fo=path)
     try:
         with fs.open("x", block_size=1) as member:
             assert member.read(6) == b"AAAAAA"
@@ -305,11 +306,10 @@ def test_backend_options_survive_chaining(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fsspec, "filesystem", capture)
     fs, member = fsspec.core.url_to_fs(
-        f"zstar://x::{path.as_uri()}", file={"auto_mkdir": True}, zstar={"cache_bytes": 1024}
+        f"zstar://x::{path.as_uri()}", file={"auto_mkdir": True}, zstar={"verify_external": True}
     )
     try:
         assert fs.info(member)["size"] == 5
-        assert fs.cache_bytes == 1024
         assert received == [("file", {"auto_mkdir": True})]
     finally:
         fs.close()
@@ -397,7 +397,7 @@ def test_dropping_member_on_io_loop_closes_owned_filesystem(loaded):
     async def drop():
         handles.clear()
         gc.collect()
-        while not source.closed:
+        while not source.closed:  # noqa: ASYNC110 - finalizer exposes no asyncio event
             await asyncio.sleep(0.001)
 
     sync(loop, drop, timeout=5)
@@ -406,7 +406,11 @@ def test_dropping_member_on_io_loop_closes_owned_filesystem(loaded):
 
 class RangeFile(fsspec.spec.AbstractBufferedFile):
     def __init__(self, fs, path, **options):
-        super().__init__(fs, path, size=len(fs.data), **options)
+        options.setdefault("cache_type", fs.default_cache_type)
+        if options.get("block_size") is None:
+            options["block_size"] = fs.default_block_size
+        options.setdefault("size", len(fs.data))
+        super().__init__(fs, path, **options)
 
     def _fetch_range(self, start, end):
         self.fs.ranges.append((start, end))
@@ -418,11 +422,18 @@ class RangeFileSystem(fsspec.spec.AbstractFileSystem):
     cachable = False
     instances: ClassVar[list] = []
 
-    def __init__(self, data, credential=None, **options):
+    def __init__(
+        self, data, credential=None, default_cache_type="none", default_block_size=256, **options
+    ):
         super().__init__(**options)
         self.data, self.credential = data, credential
+        self.default_cache_type = default_cache_type
+        self.default_block_size = default_block_size
         self.ranges, self.opened = [], []
         self.instances.append(self)
+
+    def info(self, path, **kwargs):
+        return {"name": path, "size": len(self.data), "type": "file"}
 
     def _open(self, path, mode="rb", **options):
         self.opened.append((path, mode, options.copy()))
@@ -448,7 +459,6 @@ def test_chaining_uses_resolved_filesystem_and_exact_ranges(monkeypatch):
     backend = RangeFileSystem.instances[-1]
     assert backend.credential is credential
     assert backend.opened[0][0:2] == ("archive", "rb")
-    assert backend.opened[0][2]["cache_type"] == "none"
     assert backend.ranges
     assert all(end - start < len(data) for start, end in backend.ranges)
     assert sum(end - start for start, end in backend.ranges) < len(data)
@@ -461,10 +471,51 @@ def test_injected_filesystem_is_borrowed_and_keeps_credentials():
         assert fs.cat_file("x") == b"hello"
     finally:
         fs.close()
-    assert backend.opened[0][2]["cache_type"] == "none"
     # Closing Zstar's stream leaves the caller's filesystem usable.
     with backend.open("archive", cache_type="none") as stream:
         assert stream.read(4) == backend.data[:4]
+
+
+@pytest.mark.parametrize("cache_type", ["none", "blockcache"])
+def test_source_honors_backend_cache_defaults(cache_type):
+    backend = RangeFileSystem(
+        bytes(_native.pack_file("x", b"hello" * 1000)), default_cache_type=cache_type
+    )
+    with ZstarFileSystem(fo="archive", fs=backend) as fs:
+        assert fs.cat_file("x", start=0, end=5) == b"hello"
+        requests = len(backend.ranges)
+        assert fs.cat_file("x", start=0, end=5) == b"hello"
+        if cache_type == "blockcache":
+            assert len(backend.ranges) == requests
+        else:
+            assert len(backend.ranges) > requests
+
+
+def test_disk_blockcache_chaining_reuses_source_across_opens(tmp_path):
+    payload = random.Random(0).randbytes(5 << 20)
+    data = bytes(_native.pack_file("x", payload))
+    fsspec.register_implementation(RangeFileSystem.protocol, RangeFileSystem, clobber=True)
+    options = {
+        "blockcache": {
+            "cache_storage": str(tmp_path / "cache"),
+            "check_files": True,
+            "skip_instance_cache": True,
+        },
+        "zstar-test-range": {"data": data},
+    }
+    url = "zstar://x::blockcache::zstar-test-range://archive"
+    fs, path = fsspec.core.url_to_fs(url, **options)
+    with fs, fs.open(path) as member:
+        assert member.read(5) == payload[:5]
+    backend = RangeFileSystem.instances[-1]
+    assert backend.ranges
+    assert sum(end - start for start, end in backend.ranges) < len(data)
+    fs, path = fsspec.core.url_to_fs(url, **options)
+    with fs, fs.open(path) as member:
+        assert member.read(5) == payload[:5]
+    reopened_backend = RangeFileSystem.instances[-1]
+    assert reopened_backend is not backend
+    assert not reopened_backend.ranges
 
 
 def test_fsspec_is_required_and_s3fs_is_separate():
@@ -550,7 +601,6 @@ def test_s3_preserves_backend_credentials(monkeypatch, source):
         backend = MockS3.instances[-1]
     assert backend.credential is credential
     assert backend.opened[0][0] == "bucket/archive.zstar"
-    assert backend.opened[0][2]["cache_type"] == "none"
 
 
 def test_bulk_helpers_and_batched_ranges(tmp_path, monkeypatch):

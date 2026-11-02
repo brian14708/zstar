@@ -8,11 +8,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use zstar::{
-    Entry, Error, ObjectRequest, ObjectResolver,
-    manifest_io::{ManifestOptions, Spool},
-    pack::*,
-};
+use zstar::{Entry, Error, ManifestOptions, ObjectRequest, ObjectResolver, Spool, pack::*};
 
 #[derive(Default)]
 struct Memory {
@@ -222,7 +218,6 @@ async fn packs_deduplicate_coalesce_and_reconstruct_unchanged_v1() {
     let archive = builder.finish().unwrap();
     let options = zstar::ReaderOptions {
         resolver: Some(resolver),
-        cache_bytes: 0,
         ..Default::default()
     };
     let reader = zstar::Archive::open_with_options(Arc::new(Bytes::from(archive)), options)
@@ -587,57 +582,6 @@ async fn global_requests_are_bounded_and_cancellation_releases_shared_flights() 
     assert_eq!(waiter.await.unwrap().unwrap().len(), 1);
     assert_eq!(store.active.load(Ordering::SeqCst), 0);
 }
-#[tokio::test]
-async fn sequential_streams_coalesce_and_seeks_reset_read_ahead() {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let store = Arc::new(Memory::default());
-    let mut packs = PackWriter::new(
-        store.clone(),
-        Catalog::default(),
-        PackWriterOptions::default(),
-    )
-    .unwrap();
-    let mut entry = Entry::file("stream");
-    let mut expected = Vec::new();
-    for n in 0..8 {
-        let raw = vec![n; 4096];
-        expected.extend_from_slice(&raw);
-        entry
-            .extents
-            .push(packs.put_chunk(Bytes::from(raw)).await.unwrap());
-    }
-    let catalog = packs.finish().await.unwrap();
-    let resolver = Arc::new(
-        PackedObjectResolver::new(store.clone(), catalog, ResolverOptions::default()).unwrap(),
-    );
-    let mut b = zstar::backend::BlockingBuilder::new(Vec::new()).unwrap();
-    b.add_metadata(entry).unwrap();
-    let archive = zstar::Archive::open_with_options(
-        Arc::new(Bytes::from(b.finish().unwrap())),
-        zstar::ReaderOptions {
-            resolver: Some(resolver),
-            cache_bytes: 0,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let mut file = archive.open_file("stream").await.unwrap();
-    let mut actual = Vec::new();
-    file.read_to_end(&mut actual).await.unwrap();
-    assert_eq!(actual, expected);
-    assert_eq!(
-        store.gets.load(Ordering::SeqCst),
-        3,
-        "first frame then bounded groups of four"
-    );
-    let before = store.gets.load(Ordering::SeqCst);
-    file.seek(std::io::SeekFrom::Start(4 * 4096)).await.unwrap();
-    let mut selected = [0; 1];
-    file.read_exact(&mut selected).await.unwrap();
-    assert_eq!(selected, [4]);
-    assert_eq!(store.gets.load(Ordering::SeqCst) - before, 1);
-}
 
 struct FailureStore {
     memory: Memory,
@@ -786,7 +730,6 @@ async fn reader_windows_preserve_physical_pack_order() {
         Arc::new(Bytes::from(builder.finish().unwrap())),
         zstar::ReaderOptions {
             resolver: Some(resolver),
-            cache_bytes: 0,
             ..Default::default()
         },
     )

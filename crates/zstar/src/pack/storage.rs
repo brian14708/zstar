@@ -16,10 +16,6 @@ use std::{
 /// immutable and uniquely keyed. A range must match the supplied identity and
 /// exact length; cancelling its future cancels pending requests.
 pub trait PackStore: Send + Sync {
-    /// Whether retained content may be reused under this snapshot's response policy.
-    fn cache_allowed(&self, _snapshot: &Snapshot) -> bool {
-        true
-    }
     fn put(&self, key: String, data: Spool) -> impl Future<Output = Result<Snapshot>> + Send;
     fn get_range(
         &self,
@@ -305,7 +301,6 @@ pub struct ResolverOptions {
     pub max_range_bytes: u64,
     pub max_overfetch_bytes: u64,
     pub max_batch_bytes: u64,
-    pub cache_bytes: usize,
     /// Global concurrent range requests, including overlapping batches.
     pub concurrent_requests: usize,
 }
@@ -315,24 +310,17 @@ impl Default for ResolverOptions {
             max_range_bytes: 8 << 20,
             max_overfetch_bytes: 0,
             max_batch_bytes: 64 << 20,
-            cache_bytes: 0,
             concurrent_requests: 8,
         }
     }
 }
 type Flight = tokio::sync::Mutex<Option<Bytes>>;
-struct EncodedCache {
-    entries: BTreeMap<[u8; 32], Bytes>,
-    used: usize,
-}
-/// A resolver owns one immutable catalog. Encoded flights/caches are separate
-/// from the archive's decoded cache and never bypass its hash policy.
+/// Resolves an immutable catalog using bounded ranges and concurrent loads.
 pub struct PackedObjectResolver<S> {
     store: Arc<S>,
     catalog: Arc<Catalog>,
     options: ResolverOptions,
     flights: Mutex<BTreeMap<[u8; 32], Weak<Flight>>>,
-    cache: Mutex<EncodedCache>,
     requests: tokio::sync::Semaphore,
 }
 impl<S: PackStore> PackedObjectResolver<S> {
@@ -355,10 +343,6 @@ impl<S: PackStore> PackedObjectResolver<S> {
             requests: tokio::sync::Semaphore::new(options.concurrent_requests),
             options,
             flights: Mutex::new(BTreeMap::new()),
-            cache: Mutex::new(EncodedCache {
-                entries: BTreeMap::new(),
-                used: 0,
-            }),
         })
     }
     #[expect(
@@ -420,14 +404,7 @@ impl<S: PackStore> PackedObjectResolver<S> {
                     flight
                 }
             };
-            let mut guard = flight.lock_owned().await;
-            if guard.is_none()
-                && self
-                    .store
-                    .cache_allowed(&self.catalog.packs()[&chunk.pack].snapshot)
-            {
-                *guard = self.cache.lock().unwrap().entries.get(&digest).cloned();
-            }
+            let guard = flight.lock_owned().await;
             guards.push((digest, *chunk, guard));
         }
         let mut misses: Vec<_> = guards
@@ -492,25 +469,6 @@ impl<S: PackStore> PackedObjectResolver<S> {
                         ..(offset - start + chunk.encoded_length) as usize],
                 );
                 *guards[index].2 = Some(bytes.clone());
-                let charge = bytes.len() + 128;
-                if charge <= self.options.cache_bytes
-                    && self
-                        .store
-                        .cache_allowed(&self.catalog.packs()[&chunk.pack].snapshot)
-                {
-                    let mut cache = self.cache.lock().unwrap();
-                    while cache.used > self.options.cache_bytes - charge {
-                        if let Some((_, removed)) = cache.entries.pop_first() {
-                            cache.used -= removed.len() + 128;
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some(previous) = cache.entries.insert(chunk.digest, bytes) {
-                        cache.used -= previous.len() + 128;
-                    }
-                    cache.used += charge;
-                }
             }
         }
         let values: BTreeMap<_, _> = guards
@@ -525,12 +483,6 @@ impl<S: PackStore> PackedObjectResolver<S> {
 }
 #[async_trait::async_trait]
 impl<S: PackStore> ObjectResolver for PackedObjectResolver<S> {
-    fn cache_allowed(&self, address: [u8; 32]) -> bool {
-        self.catalog.chunks().get(&address).is_some_and(|chunk| {
-            self.store
-                .cache_allowed(&self.catalog.packs()[&chunk.pack].snapshot)
-        })
-    }
     async fn get_encoded(&self, address: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes> {
         Ok(self
             .get_many(&[crate::archive::ObjectRequest {

@@ -69,14 +69,6 @@ type Source struct {
 	etag, version                *string
 	manifestOffset, manifestSize uint64
 	hasManifest                  bool
-	policy                       zstar.ContentCachePolicy
-}
-
-// CacheAllowed reports decoded-cache admission under the pinned object's headers.
-func (s *Source) CacheAllowed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.known && s.policy.AllowsReuse()
 }
 
 // NewSource creates a read-only source that pins size and ETag or version on
@@ -116,7 +108,6 @@ func (s *Source) Size(ctx context.Context) (int64, error) {
 	}
 	s.manifestOffset, s.manifestSize, s.hasManifest = parseManifestPosition(meta.Metadata)
 	s.known = true
-	s.policy.Observe(zstar.NewContentCachePolicy(aws.ToString(meta.CacheControl)))
 	return s.size, nil
 }
 
@@ -172,9 +163,6 @@ func (s *Source) ReadRange(ctx context.Context, offset, length int64) ([]byte, e
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	s.policy.Observe(zstar.NewContentCachePolicy(aws.ToString(result.CacheControl)))
-	s.mu.Unlock()
 	return raw, nil
 }
 
@@ -204,12 +192,10 @@ type BlobStoreOptions struct {
 // BlobStore reads and writes independent compressed content-addressed objects.
 // Its methods and caller-supplied key function must support concurrent calls.
 type BlobStore struct {
-	client   BlobClient
-	bucket   string
-	key      func([32]byte) string
-	slots    chan struct{}
-	policyMu sync.Mutex
-	policies map[[32]byte]zstar.ContentCachePolicy
+	client BlobClient
+	bucket string
+	key    func([32]byte) string
+	slots  chan struct{}
 }
 
 // NewBlobStore creates a reusable bounded external object resolver and uploader.
@@ -232,15 +218,7 @@ func NewBlobStore(client BlobClient, bucket string, options BlobStoreOptions) (*
 			return prefix + "/" + suffix
 		}
 	}
-	return &BlobStore{client: client, bucket: bucket, key: key, slots: make(chan struct{}, options.Concurrency), policies: make(map[[32]byte]zstar.ContentCachePolicy)}, nil
-}
-
-// ObjectCacheAllowed reports admission from the last successful object GET.
-func (b *BlobStore) ObjectCacheAllowed(digest [32]byte) bool {
-	b.policyMu.Lock()
-	defer b.policyMu.Unlock()
-	policy, ok := b.policies[digest]
-	return ok && policy.AllowsReuse()
+	return &BlobStore{client: client, bucket: bucket, key: key, slots: make(chan struct{}, options.Concurrency)}, nil
 }
 
 // ObjectKey maps a decoded digest to its configured storage key.
@@ -290,17 +268,6 @@ func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	b.policyMu.Lock()
-	if len(b.policies) >= 1024 {
-		for key := range b.policies {
-			delete(b.policies, key)
-			break
-		}
-	}
-	policy := b.policies[digest]
-	policy.Observe(zstar.NewContentCachePolicy(aws.ToString(result.CacheControl)))
-	b.policies[digest] = policy
-	b.policyMu.Unlock()
 	return data, nil
 }
 

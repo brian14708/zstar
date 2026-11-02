@@ -5,7 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"sort"
+	"slices"
+	"strings"
 )
 
 // sequenceReader frames one bounded CBOR item at a time across storage segments.
@@ -130,6 +131,27 @@ func (r *sequenceReader) next() (any, error) {
 	return value, nil
 }
 
+type manifestSortRecord struct {
+	path  string
+	value any // Preserve the decoder's boxed CBOR value for re-encoding.
+}
+
+func (s *manifestSpool) readSortRecord(at *uint64) (manifestSortRecord, error) {
+	value, err := s.readRecord(at)
+	if err != nil {
+		return manifestSortRecord{}, err
+	}
+	fields, ok := value.([]any)
+	if !ok || len(fields) == 0 {
+		return manifestSortRecord{}, rejected("malformed-toc", "invalid entry sort record")
+	}
+	path, ok := fields[0].(string)
+	if !ok {
+		return manifestSortRecord{}, rejected("malformed-toc", "invalid entry sort path")
+	}
+	return manifestSortRecord{path: path, value: value}, nil
+}
+
 // External merge sorting keeps both records and the run directory spillable.
 func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error) {
 	options := input.options
@@ -141,7 +163,6 @@ func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error
 			err = errors.Join(err, runs.close())
 		}
 	}()
-	key := func(v any) string { return v.([]any)[0].(string) } //nolint:errcheck // Records have already passed tuple and path validation before sorting.
 	addRun := func(dir *manifestSpool, start, end uint64) error {
 		var b [16]byte
 		binary.LittleEndian.PutUint64(b[:], start)
@@ -149,26 +170,28 @@ func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error
 		return dir.append(b[:])
 	}
 	count := uint64(0)
+	values := []manifestSortRecord{}
 	for at := uint64(0); at < input.size; {
 		begin := at
-		values := []any{}
 		for at < input.size && (at-begin < 64<<10 || len(values) == 0) {
-			v, e := input.readRecord(&at)
+			v, e := input.readSortRecord(&at)
 			if e != nil {
 				return nil, e
 			}
 			values = append(values, v)
 		}
-		sort.Slice(values, func(i, j int) bool { return key(values[i]) < key(values[j]) })
+		slices.SortFunc(values, func(a, b manifestSortRecord) int { return strings.Compare(a.path, b.path) })
 		start := runs.size
 		for _, v := range values {
-			if e := runs.appendRecord(v); e != nil {
+			if e := runs.appendRecord(v.value); e != nil {
 				return nil, e
 			}
 		}
 		if e := addRun(directory, start, runs.size); e != nil {
 			return nil, e
 		}
+		clear(values)
+		values = values[:0]
 		count++
 	}
 	if e := input.close(); e != nil {
@@ -180,9 +203,8 @@ func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error
 		failed := func() error {
 			for pos := uint64(0); pos < count; pos += 8 {
 				n := int(min(8, count-pos))
-				starts := make([]uint64, n)
-				ends := make([]uint64, n)
-				values := make([]any, n)
+				var starts, ends [8]uint64
+				var values [8]manifestSortRecord
 				for i := range n {
 					b, e := directory.read((pos+uint64(i))*16, 16)
 					if e != nil {
@@ -190,7 +212,7 @@ func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error
 					}
 					starts[i] = binary.LittleEndian.Uint64(b)
 					ends[i] = binary.LittleEndian.Uint64(b[8:])
-					values[i], e = runs.readRecord(&starts[i])
+					values[i], e = runs.readSortRecord(&starts[i])
 					if e != nil {
 						return e
 					}
@@ -198,21 +220,21 @@ func sortManifestRecords(input *manifestSpool) (result *manifestSpool, err error
 				start := next.size
 				for {
 					best := -1
-					for i, v := range values {
-						if v != nil && (best < 0 || key(v) < key(values[best])) {
+					for i, v := range values[:n] {
+						if v.value != nil && (best < 0 || v.path < values[best].path) {
 							best = i
 						}
 					}
 					if best < 0 {
 						break
 					}
-					if e := next.appendRecord(values[best]); e != nil {
+					if e := next.appendRecord(values[best].value); e != nil {
 						return e
 					}
-					values[best] = nil
+					values[best] = manifestSortRecord{}
 					if starts[best] < ends[best] {
 						var e error
-						values[best], e = runs.readRecord(&starts[best])
+						values[best], e = runs.readSortRecord(&starts[best])
 						if e != nil {
 							return e
 						}

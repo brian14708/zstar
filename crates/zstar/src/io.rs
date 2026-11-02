@@ -20,10 +20,6 @@ pub struct ReadRequest<'a> {
 /// cancels pending work; implementations must not detach network requests.
 #[async_trait::async_trait]
 pub trait AsyncRangeReader: Send + Sync {
-    /// Whether retained decoded content may be reused under the source policy.
-    fn cache_allowed(&self) -> bool {
-        true
-    }
     /// Returns the immutable archive size in bytes.
     async fn size(&self) -> Result<u64>;
     /// Optional location hint for the encoded manifest region, excluding the footer.

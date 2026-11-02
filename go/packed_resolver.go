@@ -14,17 +14,21 @@ type ObjectRequest struct {
 	Hint, MaxBytes uint64
 }
 
-// BatchEncodedContentResolver communicates bounded miss plans optionally.
+// BatchEncodedContentResolver optionally resolves a miss plan in one call.
 type BatchEncodedContentResolver interface {
 	EncodedContentResolver
 	GetEncodedMany(context.Context, []ObjectRequest) ([][]byte, error)
+}
+
+// EncodedContentIndex optionally exposes physical encoded lengths for planning.
+type EncodedContentIndex interface {
 	EncodedLength([32]byte) (uint64, bool)
 }
 
-// PackedResolverOptions independently bounds ranges, overfetch, batches and retention.
+// PackedResolverOptions independently bounds ranges, overfetch and batches.
 type PackedResolverOptions struct {
-	MaxRangeBytes, MaxOverfetchBytes, MaxBatchBytes, CacheBytes uint64
-	Concurrency                                                 int
+	MaxRangeBytes, MaxOverfetchBytes, MaxBatchBytes uint64
+	Concurrency                                     int
 }
 type packedFlight struct {
 	gate chan struct{}
@@ -32,15 +36,13 @@ type packedFlight struct {
 	data []byte
 }
 
-// PackedObjectResolver owns one immutable catalog and a separate encoded cache.
+// PackedObjectResolver owns one immutable catalog and coalesces in-flight loads.
 type PackedObjectResolver struct {
 	store   PackStore
 	catalog *PackedCatalog
 	options PackedResolverOptions
 	mu      sync.Mutex
 	flights map[[32]byte]*packedFlight
-	cache   map[[32]byte][]byte
-	used    uint64
 	slots   chan struct{}
 }
 
@@ -58,7 +60,7 @@ func NewPackedObjectResolver(store PackStore, catalog *PackedCatalog, o PackedRe
 	if store == nil || catalog == nil || o.MaxRangeBytes > o.MaxBatchBytes || o.MaxBatchBytes > 256<<20 || o.MaxOverfetchBytes > o.MaxRangeBytes || o.Concurrency < 1 || o.Concurrency > 32 {
 		return nil, errors.New("zstar: invalid packed resolver options")
 	}
-	return &PackedObjectResolver{store: store, catalog: catalog, options: o, flights: make(map[[32]byte]*packedFlight), cache: make(map[[32]byte][]byte), slots: make(chan struct{}, o.Concurrency)}, nil
+	return &PackedObjectResolver{store: store, catalog: catalog, options: o, flights: make(map[[32]byte]*packedFlight), slots: make(chan struct{}, o.Concurrency)}, nil
 }
 
 // EncodedLength returns the catalog representation length, independent of hints.
@@ -68,18 +70,6 @@ func (r *PackedObjectResolver) EncodedLength(d [32]byte) (uint64, bool) {
 		return 0, false
 	}
 	return r.catalog.chunks[i].EncodedLength, true
-}
-
-// ObjectCacheAllowed follows the containing pack's response policy.
-func (r *PackedObjectResolver) ObjectCacheAllowed(d [32]byte) bool {
-	if policy, ok := r.store.(interface{ PackCacheAllowed(PackSnapshot) bool }); ok {
-		index, found := r.catalog.byChunk[d]
-		if !found {
-			return false
-		}
-		return policy.PackCacheAllowed(r.catalog.packs[r.catalog.byPack[r.catalog.chunks[index].Pack]].Snapshot)
-	}
-	return true
 }
 
 // GetEncoded returns one owned complete frame under the actual-byte limit.
@@ -155,11 +145,7 @@ func (r *PackedObjectResolver) GetEncodedMany(ctx context.Context, requests []Ob
 			r.mu.Unlock()
 			return nil, ctx.Err()
 		}
-		if f.data == nil && r.ObjectCacheAllowed(d) {
-			r.mu.Lock()
-			f.data = r.cache[d]
-			r.mu.Unlock()
-		}
+
 	}
 	misses := make([]PackedChunk, 0)
 	for _, d := range digests {
@@ -221,23 +207,7 @@ func (r *PackedObjectResolver) GetEncodedMany(ctx context.Context, requests []Ob
 					for _, c := range g.chunks {
 						frame := bytes.Clone(data[c.Offset-g.start : c.Offset-g.start+c.EncodedLength])
 						held[c.Digest].data = frame
-						charge := uint64(cap(frame)) + 128
-						if charge <= r.options.CacheBytes && r.ObjectCacheAllowed(c.Digest) {
-							r.mu.Lock()
-							for r.used > r.options.CacheBytes-charge {
-								for d, old := range r.cache {
-									delete(r.cache, d)
-									r.used -= uint64(cap(old)) + 128
-									break
-								}
-							}
-							if old := r.cache[c.Digest]; old != nil {
-								r.used -= uint64(cap(old)) + 128
-							}
-							r.cache[c.Digest] = frame
-							r.used += charge
-							r.mu.Unlock()
-						}
+
 					}
 					return nil
 				}()

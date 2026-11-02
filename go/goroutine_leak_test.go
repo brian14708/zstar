@@ -23,7 +23,7 @@ func settledGoroutines(want int) int {
 
 func TestContentLoadsDoNotLeakGoroutinesAfterCancellation(t *testing.T) {
 	object := encodedFixture(t, "objects/4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92.zst")
-	m := openThinManifest(t, ManifestOptions{ConcurrentChunks: 2})
+	m := openThinManifest(t, ManifestReaderOptions{ConcurrentChunks: 2})
 	runtime.GC()
 	baseline := runtime.NumGoroutine()
 	for range 20 {
@@ -89,8 +89,12 @@ func TestArchiveFileSeekReadAtWriteTo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = dir.Close() }()                               //nolint:errcheck // Test cleanup.
-	if _, err := dir.(io.Seeker).Seek(0, io.SeekStart); err == nil { //nolint:errcheck // Type assertion is the point of the test.
+	defer func() { _ = dir.Close() }() //nolint:errcheck // Test cleanup.
+	dirSeeker, ok := dir.(io.Seeker)
+	if !ok {
+		t.Fatal("directory does not implement io.Seeker")
+	}
+	if _, err := dirSeeker.Seek(0, io.SeekStart); err == nil {
 		t.Fatal("directory seek accepted")
 	}
 }

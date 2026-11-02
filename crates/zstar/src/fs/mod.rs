@@ -56,7 +56,7 @@ impl Default for ExtractOptions {
     fn default() -> Self {
         Self {
             allow_special_bits: false,
-            verify_external: true,
+            verify_external: false,
             max_directory_handles: 64,
             manifest: ManifestOptions::default(),
         }

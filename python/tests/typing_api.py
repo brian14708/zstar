@@ -21,7 +21,6 @@ from zstar import (
 from zstar._fsspec import FileInfo
 from zstar.types import (
     BinaryWriter,
-    DecodedCache,
     EntryTuple,
     ErrorCategory,
     ObjectResolver,
@@ -38,10 +37,9 @@ async def provider(method: Literal["GET", "PUT"], force_refresh: bool) -> Signed
     return {"url": "https://example.com/archive", "expires_in": 300}
 
 
-def synchronous(source: RangeSource, resolver: ObjectResolver, cache: DecodedCache) -> None:
+def synchronous(source: RangeSource, resolver: ObjectResolver) -> None:
     options: ReaderOptions = {
         "resolver": resolver,
-        "shared_cache": cache,
         "create_spill_store": BytesIO,
     }
     with Archive.from_source(source, 1024, **options) as archive:
@@ -62,7 +60,6 @@ def synchronous(source: RangeSource, resolver: ObjectResolver, cache: DecodedCac
             assert_type(file.readinto(bytearray(4)), int)
             assert_type(file.iter_chunks(), Iterator[bytes])
         archive.read("hello", offset="zero")  # pyrefly: ignore[bad-argument-type]
-    Archive(b"", cache_bytes="large")  # pyrefly: ignore[bad-argument-type]
     Archive(b"", unknown_option=True)  # pyrefly: ignore[unexpected-keyword]
     with ArchiveWriter(BytesIO(), create_spill_store=BytesIO) as writer:
         writer.addfile(StandardTarInfo("empty"))

@@ -9,7 +9,7 @@ import (
 
 func spoolOf(t *testing.T, b []byte) *manifestSpool {
 	t.Helper()
-	s := &manifestSpool{options: ManifestOptions{}.defaults()}
+	s := &manifestSpool{options: ManifestReaderOptions{}.defaults()}
 	if err := s.append(b); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestSequenceRejectsOversizedItemsBeforeAllocating(t *testing.T) {
 	}
 }
 
-func buildEntriesArchive(t *testing.T, n int, opts ManifestOptions) []byte {
+func buildEntriesArchive(t *testing.T, n int, opts ManifestWriterOptions) []byte {
 	t.Helper()
 	var out bytes.Buffer
 	out.WriteByte(0)
@@ -59,8 +59,8 @@ func buildEntriesArchive(t *testing.T, n int, opts ManifestOptions) []byte {
 }
 
 func TestManifestEntryBudgets(t *testing.T) {
-	data := buildEntriesArchive(t, 50, ManifestOptions{})
-	for name, o := range map[string]ManifestOptions{
+	data := buildEntriesArchive(t, 50, ManifestWriterOptions{})
+	for name, o := range map[string]ManifestReaderOptions{
 		"count": {MaxEntries: 10},
 		"bytes": {MaxRetainedEntryBytes: 1000},
 	} {
@@ -69,12 +69,12 @@ func TestManifestEntryBudgets(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(data), ManifestOptions{MaxEntries: 50})
+	m, err := OpenManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
 	testClose(t, m)
-	_, err = OpenManifest(context.Background(), memoryRange(data), ManifestOptions{MaxEntries: 1})
+	_, err = OpenManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 1})
 	if _, ok := errors.AsType[*FormatError](err); !ok {
 		t.Fatal("not a FormatError")
 	}

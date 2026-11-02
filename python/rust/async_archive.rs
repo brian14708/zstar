@@ -61,11 +61,10 @@ impl AsyncArchive {
     async fn open_source(
         source: Arc<dyn AsyncRangeReader>,
         options: ReaderOptions,
-        shared_cache: Option<zstar::SharedDecodedCache>,
         failures: Option<Arc<FailureSlot>>,
     ) -> PyResult<Self> {
         let resolver = options.resolver.clone();
-        let reader = open_reader(source, options, shared_cache)
+        let reader = open_reader(source, options)
             .await
             .map_err(|error| match &failures {
                 Some(failures) => failures.annotate(error),
@@ -239,9 +238,8 @@ impl AsyncArchive {
         signature = (
             data,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -250,8 +248,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -262,7 +258,6 @@ impl AsyncArchive {
     fn from_bytes<'py>(
         py: Python<'py>,
         data: &Bound<'py, PyAny>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -273,13 +268,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -290,14 +282,12 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let source: Arc<dyn AsyncRangeReader> =
             Arc::new(bytes::Bytes::from(super::buffer_vec(py, data)?));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, shared_cache, None).await
+            Self::open_source(source, options, None).await
         })
     }
     /// Open an immutable local archive using bounded positional file reads.
@@ -306,9 +296,8 @@ impl AsyncArchive {
         signature = (
             path,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -317,8 +306,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -329,7 +316,6 @@ impl AsyncArchive {
     fn from_file(
         py: Python<'_>,
         path: std::path::PathBuf,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -340,13 +326,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -357,8 +340,6 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -367,7 +348,7 @@ impl AsyncArchive {
                     .await
                     .map_err(super::local_source_error)?,
             );
-            Self::open_source(source, options, shared_cache, None).await
+            Self::open_source(source, options, None).await
         })
     }
     /// Borrow a seekable Python file object; sizing and reads run off-loop.
@@ -376,9 +357,8 @@ impl AsyncArchive {
         signature = (
             fileobj,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -387,8 +367,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -399,7 +377,6 @@ impl AsyncArchive {
     fn from_fileobj(
         py: Python<'_>,
         fileobj: Py<PyAny>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -410,13 +387,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -427,8 +401,6 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -449,12 +421,11 @@ impl AsyncArchive {
                 )))
             })??;
             let source: Arc<dyn AsyncRangeReader> = Arc::new(super::PythonSource {
-                cache_policy: Arc::new(std::sync::Mutex::new(zstar::http::CachePolicy::default())),
                 object: Arc::new(object),
                 size,
                 permits: Arc::new(tokio::sync::Semaphore::new(8)),
             });
-            Self::open_source(source, options, shared_cache, None).await
+            Self::open_source(source, options, None).await
         })
     }
     /// Open an immutable synchronous `read_range(offset, length)` source.
@@ -465,9 +436,8 @@ impl AsyncArchive {
             source,
             size,
             *,
-            cache_bytes = 16 << 20,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -476,8 +446,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -489,7 +457,6 @@ impl AsyncArchive {
         py: Python<'_>,
         source: Py<PyAny>,
         size: u64,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -500,13 +467,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -517,18 +481,15 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let source: Arc<dyn AsyncRangeReader> = Arc::new(super::PythonSource {
-            cache_policy: Arc::new(std::sync::Mutex::new(zstar::http::CachePolicy::default())),
             object: Arc::new(source),
             size,
             permits: Arc::new(tokio::sync::Semaphore::new(8)),
         });
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, shared_cache, None).await
+            Self::open_source(source, options, None).await
         })
     }
 
@@ -539,9 +500,8 @@ impl AsyncArchive {
             *,
             headers = None,
             provider = None,
-            cache_bytes = 16_777_216,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -550,8 +510,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -564,7 +522,6 @@ impl AsyncArchive {
         url: Option<String>,
         headers: Option<BTreeMap<String, String>>,
         provider: Option<Py<PyAny>>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -575,13 +532,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -592,8 +546,6 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let failures = Arc::new(FailureSlot::default());
@@ -606,7 +558,7 @@ impl AsyncArchive {
             failures.clone(),
         )?);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, shared_cache, Some(failures)).await
+            Self::open_source(source, options, Some(failures)).await
         })
     }
     #[staticmethod]
@@ -622,9 +574,8 @@ impl AsyncArchive {
             access_key_id = None,
             secret_access_key = None,
             session_token = None,
-            cache_bytes = 16_777_216,
             concurrent_chunks = 8,
-            verify_external = true,
+            verify_external = false,
             memory_bytes = 8 << 20,
             max_encoded_bytes = 4 << 30,
             max_decoded_bytes = 4 << 30,
@@ -633,8 +584,6 @@ impl AsyncArchive {
             max_entries = 0,
             max_spool_bytes = 4 << 30,
             create_spill_store = None,
-            shared_cache = None,
-            shared_cache_identity = None,
             resolver = None,
         )
     )]
@@ -653,7 +602,6 @@ impl AsyncArchive {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
-        cache_bytes: usize,
         concurrent_chunks: usize,
         verify_external: bool,
         memory_bytes: u64,
@@ -664,13 +612,10 @@ impl AsyncArchive {
         max_entries: u64,
         max_spool_bytes: u64,
         create_spill_store: Option<Py<PyAny>>,
-        shared_cache: Option<Py<PyAny>>,
-        shared_cache_identity: Option<Vec<u8>>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'_, PyAny>> {
-        let (options, shared_cache) = reader_options(
+        let options = reader_options(
             py,
-            cache_bytes,
             concurrent_chunks,
             verify_external,
             memory_bytes,
@@ -681,8 +626,6 @@ impl AsyncArchive {
             max_entries,
             max_spool_bytes,
             create_spill_store,
-            shared_cache,
-            shared_cache_identity,
             resolver,
         )?;
         let builder = super::s3::builder(
@@ -698,7 +641,7 @@ impl AsyncArchive {
             let mut options = options;
             let source = super::s3::source(builder, key, object_prefix, &mut options)
                 .map_err(super::core_error)?;
-            Self::open_source(source, options, shared_cache, None).await
+            Self::open_source(source, options, None).await
         })
     }
     /// Batch logical ranges with chunk sharing and cancellation propagation.
@@ -849,13 +792,6 @@ impl AsyncArchive {
                 })
                 .await
         })
-    }
-    #[getter]
-    fn cache_bytes(&self) -> usize {
-        super::lock_state(&self.state)
-            .open
-            .as_ref()
-            .map_or(0, |state| state.reader.cache_len_bytes())
     }
     #[getter]
     fn closed(&self) -> bool {

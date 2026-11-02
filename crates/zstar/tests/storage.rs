@@ -59,6 +59,7 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
         Arc::new(S3RangeSource::new(store.clone(), archive_path.clone())),
         ReaderOptions {
             resolver: Some(blobs.clone()),
+            verify_external: true,
             ..Default::default()
         },
     )
@@ -67,7 +68,6 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
     let (raw, report) = reader.read_range_with_report("remote", 0..4).await.unwrap();
     assert_eq!(raw, b"aaaa"[..]);
     assert_eq!(report.external_objects_sha256_checked, vec![digest]);
-    assert!(reader.cache_len_bytes() > 0);
     store
         .put(
             &blobs.object_path(digest),
@@ -75,15 +75,15 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        reader.read_range("remote", 0..4).await.unwrap(),
-        b"aaaa"[..]
-    );
+    assert!(matches!(
+        reader.read_range("remote", 0..4).await,
+        Err(Error::Integrity)
+    ));
     let uncached = Archive::open_with_options(
         Arc::new(S3RangeSource::new(store.clone(), archive_path.clone())),
         ReaderOptions {
-            cache_bytes: 0,
             resolver: Some(blobs.clone()),
+            verify_external: true,
             ..Default::default()
         },
     )
@@ -96,7 +96,6 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
     let unchecked = Archive::open_with_options(
         Arc::new(S3RangeSource::new(store.clone(), archive_path)),
         ReaderOptions {
-            cache_bytes: 0,
             resolver: Some(blobs.clone()),
             verify_external: false,
             ..Default::default()

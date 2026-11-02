@@ -257,10 +257,6 @@ pub fn encoded_len(value: &Value) -> Result<usize> {
     encoded_len_at(value, 0)
 }
 pub fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "Explicit branches keep validation and state transitions readable."
-    )]
     fn visit(value: &Value, depth: usize, items: &mut usize) -> Result<usize> {
         if depth > 64 || *items >= 16_000_000 {
             return Err(Error::Budget("CBOR nesting or item budget"));
@@ -288,19 +284,12 @@ pub fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
             }
             Value::Map(values) => {
                 let mut len = head_len(values.len() as u64);
-                // Most attributes/root maps have only a few keys. A bounded
-                // linear check avoids a hash-table allocation in those cases.
-                let mut keys = (values.len() > 8)
-                    .then(|| std::collections::HashSet::with_capacity(values.len()));
-                for (i, (key, value)) in values.iter().enumerate() {
+                let mut keys = std::collections::HashSet::with_capacity(values.len());
+                for (key, value) in values {
                     let Value::Text(key_text) = key else {
                         return Err(invalid("CBOR map key must be text"));
                     };
-                    let duplicate = if let Some(keys) = &mut keys {
-                        !keys.insert(key_text.as_str())
-                    } else {
-                        values[..i].iter().any(|(previous, _)| previous == key)
-                    };
+                    let duplicate = !keys.insert(key_text.as_str());
                     if duplicate {
                         return Err(invalid("duplicate CBOR map key"));
                     }
@@ -391,23 +380,7 @@ pub fn append_validated(out: &mut Vec<u8>, value: &Value) {
             }
         }
         Value::Map(values) => {
-            fn key_text(key: &Value) -> &str {
-                match key {
-                    Value::Text(text) => text.as_str(),
-                    _ => unreachable!(),
-                }
-            }
             append_head(out, 5, values.len() as u64);
-            if values
-                .windows(2)
-                .all(|pair| text_order(key_text(&pair[0].0), key_text(&pair[1].0)).is_lt())
-            {
-                for (key, value) in values {
-                    append_validated(out, key);
-                    append_validated(out, value);
-                }
-                return;
-            }
             let mut pairs: Vec<_> = values.iter().collect();
             pairs.sort_unstable_by(|(a, _), (b, _)| {
                 let (Value::Text(a), Value::Text(b)) = (a, b) else {

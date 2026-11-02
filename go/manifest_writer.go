@@ -21,7 +21,7 @@ type ManifestWriter struct {
 	encoder                         *zstd.Encoder
 	start, position, decoded, count uint64
 	hash                            hash.Hash
-	options                         ManifestOptions
+	options                         manifestOptions
 	entries                         manifestSpool
 	external                        bool
 	err                             error
@@ -30,11 +30,11 @@ type ManifestWriter struct {
 
 // NewManifestWriter creates a bounded manifest encoder for data ending at
 // dataEnd. The caller owns the destination and must close the encoder.
-func NewManifestWriter(output io.Writer, dataEnd uint64, options ManifestOptions) (*ManifestWriter, error) {
+func NewManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOptions) (*ManifestWriter, error) {
 	if output == nil || dataEnd == 0 {
 		return nil, errors.New("zstar: invalid metadata destination")
 	}
-	options = options.defaults()
+	options := config.defaults()
 	if err := validateExtensions(options.RootExtensions); err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 	if err := add("version", uint64(1)); err != nil {
 		return err
 	}
-	features := []any{}
+	features := []string{}
 	if w.external {
 		features = append(features, "external-content")
 	}

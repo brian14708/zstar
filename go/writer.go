@@ -30,7 +30,7 @@ type Header struct {
 // A zero FrameSize selects 1 MiB; nonzero values must be multiples of 512
 // between 512 bytes and 16 MiB.
 type WriterOptions struct {
-	Manifest  ManifestOptions
+	Manifest  ManifestWriterOptions
 	FrameSize int
 }
 

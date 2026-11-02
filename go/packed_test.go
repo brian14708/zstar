@@ -112,7 +112,7 @@ func TestPackedSharedFixtures(t *testing.T) {
 				t.Fatal(err)
 			}
 			data := read("thin.zstar")
-			r, err := OpenWithOptions(context.Background(), ReaderAtSource{Reader: bytes.NewReader(data), Length: int64(len(data))}, ReaderOptions{Resolver: resolver, DisableContentCache: true})
+			r, err := OpenWithOptions(context.Background(), ReaderAtSource{Reader: bytes.NewReader(data), Length: int64(len(data))}, ReaderOptions{Resolver: resolver})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -185,7 +185,7 @@ func TestPackWriterReuseBudgetsAndPublication(t *testing.T) {
 	if len(reuse.CompletedPacks()) != 0 {
 		t.Fatal("base reuploaded")
 	}
-	r, err := NewPackedObjectResolver(store, c, PackedResolverOptions{CacheBytes: 1024})
+	r, err := NewPackedObjectResolver(store, c, PackedResolverOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,44 +223,6 @@ func TestPackWriterReuseBudgetsAndPublication(t *testing.T) {
 	decoded, err := DecodePackedGeneration(raw)
 	if err != nil || decoded.Archive != g.Archive {
 		t.Fatal("publication", err)
-	}
-}
-
-func TestPackedWarmReaderSkipsEncodedRequests(t *testing.T) {
-	root := "../testdata/packed-objects"
-	encoded, err := os.ReadFile(filepath.Join(root, "catalog.cbor"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := DecodePackedCatalog(encoded, CatalogLimits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := &testPackStore{root: root}
-	resolver, err := NewPackedObjectResolver(store, c, PackedResolverOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	thin, err := os.ReadFile(filepath.Join(root, "thin.zstar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := OpenWithOptions(context.Background(), ReaderAtSource{Reader: bytes.NewReader(thin), Length: int64(len(thin))}, ReaderOptions{Resolver: resolver})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := reader.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	for range 2 {
-		if _, err = reader.Read(context.Background(), "payload", 0, 21); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if store.gets != 1 {
-		t.Fatalf("warm GETs: %d", store.gets)
 	}
 }
 

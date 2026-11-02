@@ -30,8 +30,6 @@ clap = "4"
 futures-util = "0.3"
 fastcdc = "5.0"
 hex = "0.4"
-httpdate = "1"
-lru = "0.19"
 object_store = { version = "0.14", default-features = false }
 proptest = "1.9"
 pyo3 = "0.30"

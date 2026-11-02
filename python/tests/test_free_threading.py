@@ -69,7 +69,7 @@ def test_native_module_does_not_re_enable_the_gil():
 def test_shared_archive_concurrent_reads_and_metadata():
     files = bodies()
     data = build(files)
-    with zstar.Archive(data, cache_bytes=8192) as archive:
+    with zstar.Archive(data) as archive:
 
         def work(index):
             for round_ in range(20):
@@ -81,7 +81,6 @@ def test_shared_archive_concurrent_reads_and_metadata():
                     assert stream.read(100) == files[name][3:103]
                 assert archive.read_many([(name, 0, 10)]) == [files[name][:10]]
                 assert archive.entry_count == len(files)
-                assert archive.cache_bytes >= 0
             assert sum(1 for _ in archive.names()) == len(files)
 
         run_threads(work)
@@ -137,7 +136,7 @@ def test_close_races_with_reads_end_in_closed_errors_only():
 def test_shared_async_archive_used_from_many_threads_with_their_own_loops():
     files = bodies(16)
     data = build(files)
-    archive = asyncio.run(zstar.AsyncArchive.from_bytes(data, cache_bytes=4096))
+    archive = asyncio.run(zstar.AsyncArchive.from_bytes(data))
 
     async def use(index):
         for round_ in range(10):
@@ -172,56 +171,6 @@ def test_concurrent_fsspec_load_failures_do_not_wedge(monkeypatch):
         fs.close()
 
 
-def test_shared_decoded_memory_cache_between_archives_and_threads():
-    files = bodies(16)
-    data = build(files)
-    cache = _native.DecodedMemoryCache(1 << 20)
-    archives = [
-        zstar.Archive(data, shared_cache=cache, shared_cache_identity=b"snapshot", cache_bytes=0)
-        for _ in range(3)
-    ]
-
-    def work(index):
-        archive = archives[index % 3]
-        for round_ in range(30):
-            name = f"f{(index + round_) % 16:03d}"
-            assert archive.read(name) == files[name]
-            assert cache.used_bytes >= 0
-            if index == 0 and round_ % 10 == 0:
-                cache.clear()
-
-    run_threads(work)
-    for archive in archives:
-        archive.close()
-
-
-def test_python_decoded_cache_callbacks_run_without_native_locks():
-    files = bodies(8)
-    data = build(files)
-    store, lock = {}, threading.Lock()
-
-    class Cache:
-        def get(self, key):
-            with lock:
-                return store.get(key)
-
-        def put(self, token):
-            with lock:
-                store[token.key] = token
-
-    with zstar.Archive(
-        data, shared_cache=Cache(), shared_cache_identity=b"id", cache_bytes=0
-    ) as archive:
-
-        def work(index):
-            for round_ in range(20):
-                name = f"f{(index + round_) % 8:03d}"
-                assert archive.read(name) == files[name]
-
-        run_threads(work)
-    assert store
-
-
 def test_manifest_archive_rejects_callback_reentry_and_exposes_closed_without_waiting():
     data = build({"f": b"x" * 5000})
     seen = {}
@@ -247,7 +196,7 @@ def test_manifest_archive_rejects_callback_reentry_and_exposes_closed_without_wa
             return data[offset : offset + length]
 
     source = Source()
-    archive = ManifestArchive(source, len(data), cache_bytes=0)
+    archive = ManifestArchive(source, len(data))
     source.archive = archive
     source.armed = True
     assert archive.read("f") == b"x" * 5000
@@ -273,7 +222,7 @@ def test_manifest_archive_waiters_release_the_gil_for_the_running_operation():
             return data[offset : offset + length]
 
     source = Source()
-    archive = ManifestArchive(source, len(data), cache_bytes=0)
+    archive = ManifestArchive(source, len(data))
     source.slow = True
     results = []
     first = threading.Thread(target=lambda: results.append(archive.read("f")))

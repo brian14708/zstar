@@ -242,7 +242,7 @@ fn extracts_thin_objects_without_pointer_leakage() {
 }
 
 #[test]
-fn external_hash_skip_keeps_metadata_codec_tar_pointer_and_path_checks() {
+fn external_hash_policy_keeps_metadata_codec_tar_pointer_and_path_checks() {
     for fixture in [
         "data-checksum",
         "metadata-hash",
@@ -262,8 +262,8 @@ fn external_hash_skip_keeps_metadata_codec_tar_pointer_and_path_checks() {
                 Path::new("--objects"),
                 &objects,
             ];
-            if skip {
-                args.push(Path::new("--skip-external-hash"));
+            if !skip {
+                args.push(Path::new("--verify-external-hash"));
             }
             assert!(
                 !run(&args).status.success(),
@@ -294,8 +294,8 @@ fn external_hash_skip_keeps_metadata_codec_tar_pointer_and_path_checks() {
                 Path::new("--objects"),
                 &objects,
             ];
-            if skip {
-                args.push(Path::new("--skip-external-hash"));
+            if !skip {
+                args.push(Path::new("--verify-external-hash"));
             }
             let result = run(&args);
             assert_eq!(
@@ -320,7 +320,7 @@ fn external_hash_skip_keeps_metadata_codec_tar_pointer_and_path_checks() {
             Path::new("extract"),
             &input,
             &destination,
-            Path::new("--skip-external-hash")
+            Path::new("--verify-external-hash")
         ])
         .status
         .success()

@@ -12,19 +12,16 @@ type (
 	encodedPrefetch    map[manifestChunkKey][]byte
 )
 
-// Admission uses the same global work slots as ordinary content I/O. Shared
-// advisory caches must be consulted by the loader before network work.
+// Prefetch uses the same global work slots as ordinary content I/O.
 func (m *Manifest) prefetch(ctx context.Context, jobs []manifestReadJob, resolver EncodedContentResolver) (context.Context, error) {
-	m.content.mu.Lock()
-	shared := m.content.shared != nil
-	m.content.mu.Unlock()
-	if shared || len(jobs) < 2 {
+	if len(jobs) < 2 {
 		return ctx, nil
 	}
 	frames := make([]Extent, 0)
 	objects := make([]ObjectRequest, 0)
 	var total uint64
 	batch, canBatch := resolver.(BatchEncodedContentResolver)
+	index, hasIndex := resolver.(EncodedContentIndex)
 	for _, job := range jobs {
 		e := job.extent
 		key := chunkKey(e)
@@ -38,10 +35,9 @@ func (m *Manifest) prefetch(ctx context.Context, jobs []manifestReadJob, resolve
 		}
 		if stable {
 			m.content.mu.Lock()
-			cached := m.content.cache[key] != nil
 			active := m.content.flights[key] != nil
 			m.content.mu.Unlock()
-			if cached && m.content.cacheAllowed(e, resolver) || active {
+			if active {
 				continue
 			}
 		}
@@ -53,7 +49,10 @@ func (m *Manifest) prefetch(ctx context.Context, jobs []manifestReadJob, resolve
 			if err != nil {
 				return nil, err
 			}
-			length, ok := batch.EncodedLength(digest)
+			length, ok := uint64(0), false
+			if hasIndex {
+				length, ok = index.EncodedLength(digest)
+			}
 			if !ok {
 				length = 17 << 20
 			}

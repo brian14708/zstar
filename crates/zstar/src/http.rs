@@ -37,118 +37,6 @@ pub(crate) fn artifact_content_type(key: &str) -> &'static str {
     }
 }
 
-/// Cache admission for a private decoded-content cache. An absent policy keeps
-///
-/// the reader's immutable-snapshot caching behavior. Restrictive directives
-/// bypass retention; stale content is fetched again with the pinned validator.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CachePolicy {
-    denied: bool,
-    expires: Option<Instant>,
-}
-impl CachePolicy {
-    /// Parse a native object response Cache-Control value for a private cache.
-    #[must_use]
-    pub fn from_cache_control(control: &str) -> Self {
-        Self::from_headers(Some(control), None)
-    }
-    #[expect(
-        clippy::or_fun_call,
-        reason = "The fallback is a cheap value conversion with no allocation or I/O."
-    )]
-    pub(crate) fn from_headers(control: Option<&str>, age: Option<&str>) -> Self {
-        let mut policy = Self::default();
-        let mut max_age = None;
-        for directive in control.unwrap_or_default().split(',') {
-            let (name, value) = directive
-                .trim()
-                .split_once('=')
-                .unwrap_or((directive.trim(), ""));
-            let name = name.trim();
-            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
-                policy.denied = true;
-            } else if name.eq_ignore_ascii_case("max-age") {
-                let value = value.trim().trim_matches('"').parse::<u64>();
-                if max_age.is_some() || value.is_err() {
-                    policy.denied = true;
-                }
-                max_age = value.ok();
-            }
-        }
-        if let Some(seconds) = max_age {
-            let age = age.unwrap_or("0").parse::<u64>().unwrap_or(u64::MAX);
-            policy.expires =
-                Instant::now().checked_add(Duration::from_secs(seconds.saturating_sub(age)));
-            if policy.expires.is_none() {
-                policy.denied = true;
-            }
-        }
-        policy
-    }
-    fn from_response(headers: &reqwest::header::HeaderMap, requested: Instant) -> Self {
-        let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-        let now = std::time::SystemTime::now();
-        let date = header(reqwest::header::DATE).and_then(|v| httpdate::parse_http_date(v).ok());
-        let apparent_age = date
-            .and_then(|v| now.duration_since(v).ok())
-            .unwrap_or_default();
-        let age = header(reqwest::header::AGE)
-            .unwrap_or("0")
-            .parse::<u64>()
-            .unwrap_or(u64::MAX);
-        let corrected_age = Duration::from_secs(age)
-            .saturating_add(requested.elapsed())
-            .max(apparent_age);
-        let control = headers
-            .get_all(reqwest::header::CACHE_CONTROL)
-            .iter()
-            .map(|v| v.to_str().unwrap_or("no-store"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut policy = Self::from_headers(Some(&control), None);
-        if let Some(expiry) = policy.expires {
-            policy.expires = Some(
-                expiry
-                    .checked_sub(corrected_age)
-                    .unwrap_or_else(Instant::now),
-            );
-        }
-        if policy.expires.is_none()
-            && !policy.denied
-            && let Some(expires) = header(reqwest::header::EXPIRES)
-        {
-            policy.expires = Some(Instant::now());
-            if let Ok(expires) = httpdate::parse_http_date(expires) {
-                let lifetime = expires
-                    .duration_since(date.unwrap_or(now))
-                    .unwrap_or_default();
-                policy.expires = Instant::now().checked_add(lifetime.saturating_sub(corrected_age));
-                policy.denied = policy.expires.is_none();
-            }
-        }
-        if headers.get_all(reqwest::header::VARY).iter().any(|v| {
-            v.to_str()
-                .unwrap_or("*")
-                .split(',')
-                .any(|v| v.trim() == "*")
-        }) {
-            policy.denied = true;
-        }
-        policy
-    }
-    /// Observe another response for the same source. Retain restrictive
-    /// directives for its lifetime so concurrent reads cannot relax admission.
-    pub const fn observe(&mut self, mut response: Self) {
-        response.denied |= self.denied;
-        *self = response;
-    }
-    /// Whether decoded bytes may be retained and reused without another fetch.
-    #[must_use]
-    pub fn allows_reuse(&self) -> bool {
-        !self.denied && self.expires.is_none_or(|expiry| Instant::now() < expiry)
-    }
-}
-
 #[derive(Clone, Eq, PartialEq)]
 pub struct PresignedRequest {
     pub method: String,
@@ -203,9 +91,7 @@ impl fmt::Display for HttpStatusError {
         }
     }
 }
-/// The remote object was replaced or modified after this source pinned its
-/// first-observed strong `ETag` validator. Carried inside an
-/// `InvalidData` [`std::io::Error`]; test with [`is_source_changed`].
+/// The remote object was replaced after its validator was pinned.
 #[derive(Debug)]
 pub struct SourceChanged;
 impl fmt::Display for SourceChanged {
@@ -229,8 +115,6 @@ pub fn is_source_changed(error: &std::io::Error) -> bool {
 pub struct RangeValidator {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    /// Response policy governing reuse of decoded chunks.
-    pub cache_policy: CachePolicy,
 }
 impl RangeValidator {
     fn pin(self) -> std::io::Result<Self> {
@@ -393,14 +277,6 @@ impl HttpTransport for ReqwestTransport {
         if count > self.max_response_bytes {
             return Err(invalid("response exceeds local budget"));
         }
-        let request_control = request
-            .headers
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
-            .map(|(_, value)| value.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let request_policy = CachePolicy::from_cache_control(&request_control);
         let has_cache_control = request
             .headers
             .iter()
@@ -418,7 +294,6 @@ impl HttpTransport for ReqwestTransport {
         if !has_cache_control {
             req = req.header(reqwest::header::CACHE_CONTROL, "no-transform");
         }
-        let requested = Instant::now();
         let mut response = req.send().await.map_err(redacted)?;
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(status_error(response.status()));
@@ -437,12 +312,10 @@ impl HttpTransport for ReqwestTransport {
                 .and_then(|value| value.to_str().ok())
                 .map(String::from)
         };
-        let mut validator = RangeValidator {
+        let validator = RangeValidator {
             etag: header(reqwest::header::ETAG),
             last_modified: header(reqwest::header::LAST_MODIFIED),
-            cache_policy: CachePolicy::from_response(response.headers(), requested),
         };
-        validator.cache_policy.denied |= request_policy.denied;
         let (content_range, total_size) = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
@@ -589,7 +462,6 @@ pub struct HttpRangeSource {
     transport: Arc<dyn HttpTransport>,
     provider: Arc<dyn RequestProvider>,
     state: Mutex<State>,
-    cache_policy: std::sync::Mutex<CachePolicy>,
 }
 impl HttpRangeSource {
     pub fn new(transport: Arc<dyn HttpTransport>, request: PresignedRequest) -> Self {
@@ -603,7 +475,6 @@ impl HttpRangeSource {
             transport,
             provider,
             state: Mutex::new(State::default()),
-            cache_policy: std::sync::Mutex::new(CachePolicy::default()),
         }
     }
     async fn request(&self, method: &str, force: bool) -> std::io::Result<PresignedRequest> {
@@ -677,15 +548,10 @@ impl HttpRangeSource {
             if state.size.is_some_and(|size| size != response.total_size) {
                 return Err(source_changed());
             }
-            self.cache_policy.lock().unwrap().observe(seen.cache_policy);
             return Ok(response);
         }
         // Hold the lock so concurrent first reads cannot pin different versions.
         let (response, seen) = self.fetch_raw(range, None).await?;
-        self.cache_policy
-            .lock()
-            .unwrap()
-            .observe(seen.cache_policy.clone());
         let pin = seen.pin()?;
         state.size = Some(response.total_size);
         state.pin = Some(pin);
@@ -709,9 +575,6 @@ impl HttpRangeSource {
 }
 #[async_trait::async_trait]
 impl crate::AsyncRangeReader for HttpRangeSource {
-    fn cache_allowed(&self) -> bool {
-        self.cache_policy.lock().unwrap().allows_reuse()
-    }
     async fn size(&self) -> crate::Result<u64> {
         let size = self.state.lock().await.size;
         if let Some(size) = size {
@@ -738,16 +601,11 @@ pub struct HttpEncodedObjectResolver {
     provider: Arc<dyn Fn([u8; 32]) -> Arc<dyn RequestProvider> + Send + Sync>,
     permits: Semaphore,
     max_object_bytes: u64,
-    policies: std::sync::Mutex<lru::LruCache<[u8; 32], CachePolicy>>,
 }
 impl HttpEncodedObjectResolver {
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
     )]
     pub fn new(
         transport: Arc<dyn HttpTransport>,
@@ -766,25 +624,11 @@ impl HttpEncodedObjectResolver {
             provider: Arc::new(provider),
             permits: Semaphore::new(concurrency.get()),
             max_object_bytes,
-            policies: std::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(1024).unwrap(),
-            )),
         })
     }
 }
 #[async_trait::async_trait]
 impl crate::ObjectResolver for HttpEncodedObjectResolver {
-    fn cache_allowed(&self, address: [u8; 32]) -> bool {
-        self.policies
-            .lock()
-            .unwrap()
-            .get(&address)
-            .is_some_and(CachePolicy::allows_reuse)
-    }
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "The guard intentionally covers this short state update."
-    )]
     async fn get_encoded(
         &self,
         address: [u8; 32],
@@ -817,13 +661,6 @@ impl crate::ObjectResolver for HttpEncodedObjectResolver {
             return Err(crate::Error::Budget("encoded object size"));
         }
         let bytes = source.read_range(0..size).await?;
-        let policy = source.cache_policy.lock().unwrap().clone();
-        let mut policies = self.policies.lock().unwrap();
-        if let Some(previous) = policies.get_mut(&address) {
-            previous.observe(policy);
-        } else {
-            policies.put(address, policy);
-        }
         Ok(bytes)
     }
 }
@@ -831,49 +668,6 @@ impl crate::ObjectResolver for HttpEncodedObjectResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn private_cache_respects_directives_age_and_expiry() {
-        for control in [
-            "no-store",
-            "No-Cache=\"Set-Cookie\"",
-            "max-age=0",
-            "max-age=oops",
-            "max-age=60, max-age=120",
-        ] {
-            assert!(
-                !CachePolicy::from_headers(Some(control), None).allows_reuse(),
-                "{control}"
-            );
-        }
-        assert!(
-            CachePolicy::from_headers(
-                Some("private, max-age=60, immutable, s-maxage=0"),
-                Some("5")
-            )
-            .allows_reuse()
-        );
-        assert!(!CachePolicy::from_headers(Some("max-age=60"), Some("60")).allows_reuse());
-        let mut policy = CachePolicy::from_headers(Some("max-age=60"), None);
-        policy.expires = Some(Instant::now());
-        assert!(!policy.allows_reuse());
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.append(
-            reqwest::header::CACHE_CONTROL,
-            "max-age=60".parse().unwrap(),
-        );
-        headers.append(reqwest::header::CACHE_CONTROL, "no-store".parse().unwrap());
-        assert!(!CachePolicy::from_response(&headers, Instant::now()).allows_reuse());
-        headers.remove(reqwest::header::CACHE_CONTROL);
-        headers.insert(
-            reqwest::header::DATE,
-            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
-        );
-        headers.insert(
-            reqwest::header::EXPIRES,
-            "Wed, 21 Oct 2015 07:29:00 GMT".parse().unwrap(),
-        );
-        assert!(!CachePolicy::from_response(&headers, Instant::now()).allows_reuse());
-    }
     #[test]
     fn content_range() {
         assert_eq!(parse_content_range("bytes 2-4/9"), Some((2..5, 9)));

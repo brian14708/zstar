@@ -10,6 +10,7 @@ lint: prepare-python
     cargo doc --locked --workspace --no-deps --all-features
     ruff check .
     ruff format --check .
+    golangci-lint fmt --diff
     golangci-lint run ./...
     go vet ./...
     env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml --search-path python/src python/src/zstar

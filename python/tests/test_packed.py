@@ -45,7 +45,7 @@ def test_native_packed_workflow(tmp_path):
     info.size = len(data)
     thin = io.BytesIO()
     with ArchiveWriter(thin) as writer:
-        writer.add_external(info, body)
+        writer._add_external(info, body)
     catalog = packs.finish()
     assert catalog.chunk_count < body.chunk_count
     assert packs.completed_packs()
@@ -69,7 +69,7 @@ def test_async_native_packed_workflow(tmp_path):
         info = TarInfo("file")
         info.size = body.size
         with ArchiveWriter(thin) as writer:
-            writer.add_external(info, body)
+            writer._add_external(info, body)
         catalog = await packs.finish_async()
         resolver = _native.PackedObjectResolver(store, catalog)
         async with await zstar.AsyncArchive.from_bytes(

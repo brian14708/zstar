@@ -42,7 +42,6 @@ def test_async_iteration_reads_reports_verification_and_close(ranged, inline_dat
             verified = await archive.verify()
             assert verified["full_archive_verified"] and verified["tar_members"] == len(expected)
             pending = archive.members()
-        assert archive.closed and archive.cache_bytes == 0
         assert not source.closed
         await archive.close()
         with pytest.raises(ValueError, match="closed"):

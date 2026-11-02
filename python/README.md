@@ -24,7 +24,10 @@ The stable public surface is intentionally small:
 - `fsspec.filesystem("zstar", ...)` provides the standard fsspec filesystem API.
 - `zstar.types` contains protocols and typed option dictionaries for low-level APIs.
 
-The `_native` module and underscored Python modules are implementation details.
+The `_native` module, underscored Python modules, and underscored methods are
+implementation details. Use the fsspec filesystem interface for packed-object
+writing; the archive writers expose `addfile()`, `add_entry()`, and `write_bytes()`
+for supported direct writes.
 
 ## Filesystem interface
 
@@ -52,7 +55,7 @@ Standard helpers such as `glob`, `find`, `cat`, `get(..., recursive=True)`, and
 borrowed binary output stream and fsspec progress callbacks. `cat_ranges()` batches
 member ranges in Rust, supports negative offsets, and follows fsspec's per-range
 error handling. Pass `reader_options={"concurrent_chunks": 4, ...}` to tune native
-reader limits or supply a shared decoded cache; use `external=` for external content.
+reader limits; use `external=` for external content.
 
 For backends that expose fsspec's `setxattr()` operation, pass string metadata:
 the archive is uploaded first, then the backend updates object metadata. With s3fs
@@ -84,6 +87,45 @@ with fsspec.filesystem("zstar", fo="bucket/archive.zstar", fs=s3, mode="w") as f
 
 The adapter uses fsspec for S3 storage; it does not create a native S3 client.
 S3 credentials, endpoints, retries, and transport caching come from `s3fs`.
+Source streams honor the backend's caching defaults. For example, configure
+in-memory S3 block caching through standard s3fs options:
+
+```python
+with fsspec.filesystem(
+    "zstar",
+    fo="s3://bucket/archive.zstar",
+    target_options={
+        "profile": "work",
+        "default_cache_type": "blockcache",
+        "default_block_size": 4 << 20,
+    },
+) as fs:
+    data = fs.cat_file("docs/readme.txt")
+```
+
+Set `default_cache_type="none"` to fetch only requested encoded ranges. For a
+persistent, disk-backed block cache, compose standard fsspec filesystems:
+
+```python
+fs, path = fsspec.core.url_to_fs(
+    "zstar://docs/readme.txt::blockcache::s3://bucket/archive.zstar",
+    blockcache={"cache_storage": "/path/to/zstar-cache", "check_files": True},
+    s3={"profile": "work", "default_block_size": 4 << 20},
+)
+with fs, fs.open(path) as member:
+    data = member.read()
+```
+
+The disk cache stores compressed source blocks in sparse files and reuses them
+across opens. Close the archive filesystem to persist cache metadata. Reopen
+partially cached objects with the same block size and manage the cache directory's
+disk usage. `check_files=True` checks the source identity before reuse; keep source
+objects immutable while an archive is open.
+
+Member streams read exact logical ranges without a decoded-content cache.
+Backends configured with `asynchronous=True` use direct async range I/O and bypass
+stream caching; use a synchronous backend or disk-cache wrapper for source caching.
+
 Direct HTTP reads use the native range transport; chained HTTP URLs use fsspec
 and require the `http` extra.
 
@@ -98,8 +140,8 @@ with fsspec.filesystem("zstar", fo="bucket/archive.zstar", fs=s3, external=objec
 Objects are named `<lowercase sha256>.zst`. Files of 16 MiB or larger are
 externalized using FastCDC (2 MiB minimum, 8 MiB target, 16 MiB maximum). The
 external filesystem can use a
-different backend or credentials. It remains caller-owned; Zstar verifies and
-caches decoded content. Custom `resolver=` implementations are supported by the
+different backend or credentials. It remains caller-owned. Zstar checks object
+availability and extent lengths; pass `verify_external=True` to verify SHA-256. Custom `resolver=` implementations are supported by the
 low-level readers only.
 
 A writer accepts `wb`/`wt` member streams, `mkdir`, `makedirs`, `pipe_file`, and
@@ -209,12 +251,9 @@ while the raw writer calls the encoder synchronously. Results do not establish
 remote S3 performance. See the [benchmark methodology](../tools/bench/README.md).
 
 
-Keep the filesystem open across reads so metadata and decoded frames can be reused.
-Use async calls within an event loop to avoid the synchronous facade's per-call
-loop handoff. For many related ranges, the raw `read_many()` method shares native
-work; fsspec's `cat_ranges()` uses it too. Disable redundant backing-store read-ahead;
-Zstar already maintains a bounded
-decoded cache (`cache_bytes`).
+Keep the filesystem open across reads to reuse parsed metadata. For related ranges,
+use `read_many()` or fsspec's `cat_ranges()` to share work within one operation.
+Decoded content is not retained between calls.
 
 Use `put_file()` for local files and `pipe_file()` for bytes: known-size inputs
 stream straight to the encoder. Writable `open()` members spool because the tar
