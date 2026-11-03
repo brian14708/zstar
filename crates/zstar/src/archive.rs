@@ -1,7 +1,7 @@
 //! Concurrent selective reads for the entry manifest, without a frame table.
-use crate::backend::{decode_content, decode_object};
+use crate::backend::{decode_content_with_limits, decode_object};
 use crate::decoded_body::DecodedBody;
-use crate::manifest::{ENCODED_FRAME_MAX, Entry, EntryKind, Extent};
+use crate::manifest::{Entry, EntryKind, Extent};
 use crate::manifest_io::{
     EntryCursor, EntryLookup, ManifestIngest, ManifestOptions, ManifestReader, Spool,
 };
@@ -28,13 +28,8 @@ pub trait ObjectResolver: Send + Sync {
     fn supports_batch(&self) -> bool {
         false
     }
-    /// Actual stored frame length when cheaply known from an immutable catalog.
+    /// Actual stored frame length when cheaply known from resolver metadata.
     fn encoded_length(&self, _address: [u8; 32]) -> Option<u64> {
-        None
-    }
-    /// Optional immutable physical location for callers planning explicit batches.
-    /// The token groups one pack; offsets locate frames within that pack.
-    fn encoded_location(&self, _address: [u8; 32]) -> Option<([u8; 32], u64)> {
         None
     }
     async fn get_encoded_many(&self, requests: &[ObjectRequest]) -> Result<Vec<Bytes>> {
@@ -408,6 +403,16 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .entry(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
+        self.cursor_from_entry(entry).await
+    }
+    /// Opens a borrowed cursor from metadata obtained from this archive.
+    ///
+    /// The caller must supply this archive's unmodified entry. This avoids a
+    /// second metadata lookup after inspecting the entry kind.
+    ///
+    /// # Errors
+    /// Returns an error for non-file entries or invalid extent selections.
+    pub async fn cursor_from_entry(&self, entry: Entry) -> Result<crate::FileCursor> {
         let mut cursor = if entry.extents.len() <= 64 {
             crate::FileCursor::new(entry)?
         } else {
@@ -715,10 +720,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         })
         .await
     }
-    #[doc(hidden)]
-    pub async fn validate_metadata(&self) -> Result<()> {
-        self.metadata(ManifestReader::validate_metadata).await
-    }
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
@@ -818,17 +819,18 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             Key::Object(hash) => {
                 resolver
                     .ok_or(Error::Unsupported("external read requires resolver"))?
-                    .get_encoded(*hash, hint, ENCODED_FRAME_MAX)
+                    .get_encoded(*hash, hint, self.options.manifest.limits.encoded_limit())
                     .await?
             }
         };
         let key_copy = key.clone();
         let verify = self.options.verify_external;
+        let limits = self.options.manifest.limits;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let raw = match key_copy {
-                Key::Archive(..) => decode_content(&encoded, true)?,
-                Key::Object(_) => decode_object(&encoded)?,
+                Key::Archive(..) => decode_content_with_limits(&encoded, true, limits)?,
+                Key::Object(_) => decode_object(&encoded, limits)?,
             };
             if let Key::Object(hash) = key_copy
                 && verify
@@ -966,7 +968,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 let whole = raw;
                 let slice = whole.slice(copy.source.clone());
                 // A small borrowed slice would pin the whole decoded frame
-                // (up to 16 MiB) for as long as the caller keeps it. Copy
+                // for as long as the caller keeps it. Copy
                 // out when the slice is under a quarter of the frame.
                 return Ok(vec![if slice.len() < whole.len() / 4 {
                     Bytes::copy_from_slice(&slice)
@@ -1202,7 +1204,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.calls.load(Ordering::SeqCst), 2); // footer + read-ahead metadata
-        reader.validate_metadata().await.unwrap();
         let requests = [
             ReadRequest {
                 path: "a",
@@ -1539,7 +1540,6 @@ mod tests {
         )
         .await
         .unwrap();
-        reader.validate_metadata().await.unwrap();
         assert!(matches!(
             reader.read_range("a-b", 0..5).await,
             Err(Error::MalformedFrame(_))

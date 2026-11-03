@@ -21,13 +21,13 @@ func TestSequenceRejectsOversizedItemsBeforeAllocating(t *testing.T) {
 	// Byte string claiming 4 GiB, then truncated; must be a limit error, not
 	// a "truncated" error and not an allocation.
 	giant := []byte{0x5b, 0, 0, 0, 1, 0, 0, 0, 0}
-	r := &sequenceReader{spool: spoolOf(t, giant), limit: manifestEntryMax}
+	r := &sequenceReader{spool: spoolOf(t, giant), limit: 8 << 20}
 	if _, err := r.next(); ErrorCategory(err) != CategoryResourceLimit {
 		t.Fatalf("giant bstr: %v", err)
 	}
 	// Claimed length within the spool but above the cap.
 	big := append([]byte{0x5a, 0, 0x90, 0, 0}, make([]byte, 0x900000)...)
-	r = &sequenceReader{spool: spoolOf(t, big), limit: manifestEntryMax}
+	r = &sequenceReader{spool: spoolOf(t, big), limit: 8 << 20}
 	if _, err := r.next(); ErrorCategory(err) != CategoryResourceLimit {
 		t.Fatalf("oversized bstr: %v", err)
 	}

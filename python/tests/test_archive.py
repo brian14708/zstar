@@ -79,11 +79,10 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
         assert member.closed and not archive.closed
         with pytest.raises(ValueError):
             member.read()
-        with archive.open("dir/link") as linked:
-            assert linked.read() == b"hello\nworld\n"
+        with pytest.raises(tarfile.ExtractError, match="symlink"):
+            archive.open("dir/link")
         assert archive.read_link("dir/link") == "file"
         assert archive.read_range("dir/file", 6, 12) == b"world\n"
-        archive.validate_metadata()
         with pytest.raises(KeyError):
             archive.getinfo("missing")
         with pytest.raises(KeyError):
@@ -120,6 +119,20 @@ def test_sync_local_open_and_borrowed_file_preserve_ownership_and_cursor(tmp_pat
         assert archive.read("dir/file", 0, 5) == b"hello"
         assert borrowed.tell() == 7
     assert not borrowed.closed and borrowed.tell() == 7
+
+
+def test_sync_reader_inside_running_event_loop(encoded_archive):
+    async def exercise():
+        with zstar.Archive(encoded_archive) as archive:
+            assert archive.read("dir/file") == b"hello\nworld\n"
+            assert list(archive.names()) == ["dir", "dir/file", "dir/link"]
+        borrowed = io.BytesIO(encoded_archive)
+        borrowed.seek(7)
+        with zstar.Archive.from_file(borrowed) as archive:
+            assert archive.read("dir/file") == b"hello\nworld\n"
+        assert borrowed.tell() == 7 and not borrowed.closed
+
+    asyncio.run(exercise())
 
 
 def test_sync_and_async_verification_share_one_report_schema(object_resolver, thin_data):
@@ -165,7 +178,11 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
                     with pytest.raises(zstar.ZstarError) as caught:
                         await archive.read_with_report("dir/file", 13, length)
                     assert caught.value.category == "invalid-range"
-                async with archive.open("dir/link") as member:
+                with pytest.raises(tarfile.ExtractError, match="symlink"):
+                    async with archive.open("dir/link"):
+                        pytest.fail("symlink opened as a file")
+                assert await archive.read_link("dir/link") == "file"
+                async with archive.open("dir/file") as member:
                     assert await member.read(5) == b"hello"
                     assert await member.tell() == 5
                     assert await member.seek(6) == 6
@@ -217,18 +234,38 @@ def test_iteration_crosses_metadata_batches_and_close_invalidates_buffered_entri
     asyncio.run(exercise())
 
 
-def test_open_resolves_only_archive_links_and_rejects_cycles():
+def test_open_rejects_symlinks_without_resolving_targets():
     output = io.BytesIO()
+    links = [("a", "b"), ("b", "a"), ("absolute", "/etc/passwd"), ("dangling", "missing")]
     with ArchiveWriter(output) as archive:
-        for name, target in [("a", "b"), ("b", "a"), ("absolute", "/etc/passwd")]:
+        for name, target in links:
             info = tarfile.TarInfo(name)
             info.type, info.linkname = tarfile.SYMTYPE, target
             archive.addfile(info)
-    with zstar.Archive(output.getvalue()) as archive:
-        with pytest.raises(tarfile.ExtractError, match="cyclic"):
-            archive.open("a")
-        with pytest.raises(KeyError):
-            archive.open("absolute")
+    data = output.getvalue()
+    with zstar.Archive(data) as archive:
+        for name, target in links:
+            assert archive.getinfo(name).issym()
+            assert archive.read_link(name) == target
+            for member in (name, archive.getinfo(name)):
+                with pytest.raises(tarfile.ExtractError, match="symlink"):
+                    archive.open(member)
+            with pytest.raises(zstar.ZstarError):
+                archive.read(name)
+
+    async def exercise():
+        async with await zstar.AsyncArchive.from_bytes(data) as archive:
+            for name, target in links:
+                assert (await archive.getinfo(name)).issym()
+                assert await archive.read_link(name) == target
+                for member in (name, await archive.getinfo(name)):
+                    with pytest.raises(tarfile.ExtractError, match="symlink"):
+                        async with archive.open(member):
+                            pytest.fail("symlink opened as a file")
+                with pytest.raises(zstar.ZstarError):
+                    await archive.read(name)
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("timestamp", ["1e1000000", "-1e1000000"])
@@ -448,7 +485,7 @@ def test_raw_s3_requires_explicit_configuration(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "environment-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "environment-secret")
     with pytest.raises(ValueError, match="region is required"):
-        _native.IndexedArchive.from_s3("bucket", "archive")
+        _native.SyncArchive.from_s3("bucket", "archive")
     with pytest.raises(ValueError, match="requires access_key_id"):
         zstar.Archive.from_s3("bucket", "archive", region="us-east-1")
     with pytest.raises(ValueError, match="cannot include credentials"):
@@ -478,7 +515,6 @@ def test_prefix_iteration_and_async_metadata(encoded_archive):
             assert await archive.read_link("dir/link") == "file"
             assert await archive.read_range("dir/file", 0, 5) == b"hello"
             assert [name async for name in archive.names("dir/f")] == ["dir/file"]
-            await archive.validate_metadata()
 
     asyncio.run(run())
 
@@ -519,3 +555,65 @@ def test_lossless_entry_writing():
             assert await archive.entry("missing") is None
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_member_streams_share_native_bounds_and_buffer_semantics(asynchronous):
+    from contextlib import AsyncExitStack
+
+    data = bytes(_native.pack_file("data", b"hello world"))
+
+    async def exercise():
+        async with AsyncExitStack() as stack:
+            if asynchronous:
+                archive = await stack.enter_async_context(
+                    await zstar.AsyncArchive.from_bytes(data, max_read_bytes=3)
+                )
+                member = await stack.enter_async_context(archive.open("data"))
+            else:
+                archive = stack.enter_context(zstar.Archive(data, max_read_bytes=3))
+                member = stack.enter_context(archive.open("data"))
+
+            async def call(name, *args):
+                result = getattr(member, name)(*args)
+                return await result if asynchronous else result
+
+            assert member.size == 11
+            assert await call("read", 2) == b"he"
+            for size in (None, -1, 1 << 100):
+                with pytest.raises(zstar.ZstarError) as caught:
+                    await call("read", size)
+                assert caught.value.category == "resource-limit"
+                assert await call("tell") == 2
+            with pytest.raises(TypeError):
+                await call("read", 1.5)
+            for offset, whence, error in (
+                (-1, os.SEEK_SET, ValueError),
+                (0, 123, ValueError),
+                (1 << 64, os.SEEK_SET, OverflowError),
+            ):
+                with pytest.raises(error):
+                    await call("seek", offset, whence)
+                assert await call("tell") == 2
+
+            target = bytearray(b"?" * 16)
+            with memoryview(target)[2:14] as view:
+                assert await call("readinto", view) == 9
+            assert target == b"??llo world?????"
+            assert await call("tell") == 11
+            target.extend(b"!")  # Native buffer exports have been released.
+            assert await call("seek", -3, os.SEEK_END) == 8
+            assert await call("read", 1 << 100) == b"rld"
+            assert await call("seek", (1 << 64) - 1) == (1 << 64) - 1
+            assert await call("read") == b""
+            assert await call("readinto", target) == 0
+            with pytest.raises(OverflowError):
+                await call("seek", 1, os.SEEK_CUR)
+            assert await call("seek", 0) == 0
+            with pytest.raises(TypeError, match="writable"):
+                await call("readinto", b"readonly")
+            with memoryview(target)[::2] as view, pytest.raises(TypeError):
+                await call("readinto", view)
+            assert await call("tell") == 0
+
+    asyncio.run(exercise())

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-import posixpath
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
-from tarfile import ExtractError, TarInfo
+from tarfile import TarInfo
 from types import TracebackType
 from typing import Generic, Self, TypeVar, Unpack
 
@@ -15,7 +14,6 @@ from typing_extensions import Buffer
 from . import _native
 from ._file import ArchiveFile, AsyncArchiveFile
 from ._info import _from_entry
-from ._source import _FileSource
 from .types import (
     CborValue,
     EntryTuple,
@@ -37,47 +35,21 @@ def _name(member: str | TarInfo) -> str:
     return member
 
 
-def _link_target(info: TarInfo) -> str:
-    return posixpath.normpath(posixpath.join(posixpath.dirname(info.name), info.linkname))
-
-
-def _member(archive: Archive, member: str | TarInfo) -> TarInfo:
-    """Resolve archive-internal symlinks to the final member (like ``stat``)."""
-    info = archive.getinfo(_name(member))
-    visited: set[str] = set()
-    while info.issym():
-        if info.name in visited:
-            raise ExtractError("cyclic archive symlink")
-        visited.add(info.name)
-        info = archive.getinfo(_link_target(info))
-    return info
-
-
-async def _amember(archive: AsyncArchive, member: str | TarInfo) -> TarInfo:
-    info = await archive.getinfo(_name(member))
-    visited: set[str] = set()
-    while info.issym():
-        if info.name in visited:
-            raise ExtractError("cyclic archive symlink")
-        visited.add(info.name)
-        info = await archive.getinfo(_link_target(info))
-    return info
-
-
-_DEFAULT_MAX_READ_BYTES = 64 << 20
-_Reader = TypeVar("_Reader", _native.IndexedArchive, _native.AsyncArchive)
+_Reader = TypeVar("_Reader", _native.SyncArchive, _native.AsyncArchive)
 
 
 class _Metadata(Generic[_Reader]):
     _reader: _Reader
-    _max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
 
     @classmethod
-    def _wrap(cls, reader: _Reader, options: ReaderOptions) -> Self:
+    def _wrap(cls, reader: _Reader) -> Self:
         archive = cls.__new__(cls)
         archive._reader = reader
-        archive._max_read_bytes = options.get("max_read_bytes", _DEFAULT_MAX_READ_BYTES)
         return archive
+
+    @property
+    def _max_read_bytes(self) -> int:
+        return self._reader.max_read_bytes
 
     @property
     def closed(self) -> bool:
@@ -99,13 +71,12 @@ class _Metadata(Generic[_Reader]):
         return self._reader.entry_count
 
 
-class Archive(_Metadata[_native.IndexedArchive]):
+class Archive(_Metadata[_native.SyncArchive]):
     """Synchronous indexed reader. Opening validates metadata; verify checks all content."""
 
     def __init__(self, data: Buffer, **options: Unpack[ReaderOptions]) -> None:
         """Open any bytes-like snapshot; the archive keeps one private copy."""
-        self._reader = _native.IndexedArchive.from_bytes(data, **options)
-        self._max_read_bytes = options.get("max_read_bytes", _DEFAULT_MAX_READ_BYTES)
+        self._reader = _native.SyncArchive.from_bytes(data, **options)
 
     def getinfo(self, name: str) -> TarInfo:
         """Return an owned TarInfo snapshot; raise KeyError for a missing name."""
@@ -122,7 +93,7 @@ class Archive(_Metadata[_native.IndexedArchive]):
 
     @classmethod
     def from_source(cls, source: RangeSource, size: int, **options: Unpack[ReaderOptions]) -> Self:
-        return cls._wrap(_native.IndexedArchive(source, size, **options), options)
+        return cls._wrap(_native.SyncArchive.from_source(source, size, **options))
 
     @classmethod
     def from_file(
@@ -132,9 +103,8 @@ class Archive(_Metadata[_native.IndexedArchive]):
     ) -> Self:
         """Open a local path or borrow a seekable binary file object."""
         if not isinstance(file, (str, os.PathLike)):
-            source = _FileSource(file)
-            return cls.from_source(source, source.size, **options)
-        return cls._wrap(_native.IndexedArchive.from_file(os.fspath(file), **options), options)
+            return cls._wrap(_native.SyncArchive.from_fileobj(file, **options))
+        return cls._wrap(_native.SyncArchive.from_file(os.fspath(file), **options))
 
     @classmethod
     def from_url(
@@ -145,7 +115,7 @@ class Archive(_Metadata[_native.IndexedArchive]):
         **options: Unpack[ReaderOptions],
     ) -> Self:
         """Open HTTP ranges pinned to one strong ETag, without requiring HEAD."""
-        return cls._wrap(_native.IndexedArchive.from_url(url, headers=headers, **options), options)
+        return cls._wrap(_native.SyncArchive.from_url(url, headers=headers, **options))
 
     @classmethod
     def from_s3(
@@ -167,7 +137,7 @@ class Archive(_Metadata[_native.IndexedArchive]):
         AWS environment variables and credential discovery are not used.
         """
         return cls._wrap(
-            _native.IndexedArchive.from_s3(
+            _native.SyncArchive.from_s3(
                 bucket,
                 key,
                 endpoint=endpoint,
@@ -179,7 +149,6 @@ class Archive(_Metadata[_native.IndexedArchive]):
                 session_token=session_token,
                 **options,
             ),
-            options,
         )
 
     def iter_entries(self, prefix: str | None = None) -> Iterator[EntryTuple]:
@@ -202,15 +171,15 @@ class Archive(_Metadata[_native.IndexedArchive]):
         return self.members()
 
     def open(self, member: str | TarInfo) -> ArchiveFile:
-        """Open a read-only member stream, following archive links.
+        """Open a read-only regular-file stream without following symlinks.
 
-        Missing members raise KeyError; directories raise IsADirectoryError.
+        Missing members raise KeyError; directories raise IsADirectoryError;
+        symlinks raise tarfile.ExtractError without resolving their targets.
         The stream borrows this archive and must be closed before its owner.
         """
-        info = _member(self, member)
-        if info.isdir():
-            raise IsADirectoryError(info.name)
-        return ArchiveFile(self, info.name, info.size)
+        self._check_open()
+        name = _name(member)
+        return ArchiveFile(self, name, self._reader._open_member(name))
 
     def read(
         self,
@@ -233,11 +202,6 @@ class Archive(_Metadata[_native.IndexedArchive]):
         """Return a symlink's stored target without resolving it."""
         self._check_open()
         return self._reader.read_link(name)
-
-    def validate_metadata(self) -> None:
-        """Validate the full authenticated manifest without reading payloads."""
-        self._check_open()
-        self._reader.validate_metadata()
 
     def read_many(
         self, requests: Sequence[tuple[str, int, int]], *, resolver: ObjectResolver | None = None
@@ -300,13 +264,13 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
 
     @classmethod
     async def from_bytes(cls, data: Buffer, **options: Unpack[ReaderOptions]) -> Self:
-        return cls._wrap(await _native.AsyncArchive.from_bytes(data, **options), options)
+        return cls._wrap(await _native.AsyncArchive.from_bytes(data, **options))
 
     @classmethod
     async def from_source(
         cls, source: RangeSource, size: int, **options: Unpack[ReaderOptions]
     ) -> Self:
-        return cls._wrap(await _native.AsyncArchive.from_source(source, size, **options), options)
+        return cls._wrap(await _native.AsyncArchive.from_source(source, size, **options))
 
     @classmethod
     async def from_file(
@@ -318,8 +282,8 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         if not isinstance(file, (str, os.PathLike)):
             # File sizing is a synchronous caller-owned operation. Perform it
             # on a native callback worker with the rest of metadata opening.
-            return cls._wrap(await _native.AsyncArchive.from_fileobj(file, **options), options)
-        return cls._wrap(await _native.AsyncArchive.from_file(os.fspath(file), **options), options)
+            return cls._wrap(await _native.AsyncArchive.from_fileobj(file, **options))
+        return cls._wrap(await _native.AsyncArchive.from_file(os.fspath(file), **options))
 
     @classmethod
     async def from_url(
@@ -332,7 +296,6 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     ) -> Self:
         return cls._wrap(
             await _native.AsyncArchive.from_url(url, headers=headers, provider=provider, **options),
-            options,
         )
 
     @classmethod
@@ -363,7 +326,6 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
                 session_token=session_token,
                 **options,
             ),
-            options,
         )
 
     async def iter_entries(self, prefix: str | None = None) -> AsyncIterator[EntryTuple]:
@@ -387,21 +349,18 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     def __aiter__(self) -> AsyncIterator[TarInfo]:
         return self.members()
 
-    async def _open_member(self, member: str | TarInfo) -> AsyncArchiveFile:
-        info = await _amember(self, member)
-        if info.isdir():
-            raise IsADirectoryError(info.name)
-        cursor = await self._reader._open_member(info.name)
-        return AsyncArchiveFile(self, info.name, info.size, cursor)
-
     @asynccontextmanager
     async def open(self, member: str | TarInfo) -> AsyncGenerator[AsyncArchiveFile]:
         """Open a member with ``async with archive.open(name)``.
 
-        Follow archive links. Missing members raise KeyError; directories raise
-        IsADirectoryError. The member closes on context exit; its owner stays open.
+        Missing members raise KeyError; directories raise IsADirectoryError;
+        symlinks raise tarfile.ExtractError without resolving their targets.
+        The member closes on context exit; its owner stays open.
         """
-        async with await self._open_member(member) as stream:
+        self._check_open()
+        name = _name(member)
+        cursor = await self._reader._open_member(name)
+        async with AsyncArchiveFile(self, name, cursor) as stream:
             yield stream
 
     async def read(
@@ -425,11 +384,6 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         """Return a symlink's stored target without resolving it."""
         self._check_open()
         return await self._reader.read_link(name)
-
-    async def validate_metadata(self) -> None:
-        """Validate the full authenticated manifest without reading payloads."""
-        self._check_open()
-        await self._reader.validate_metadata()
 
     async def read_many(
         self, requests: Sequence[tuple[str, int, int]], *, resolver: ObjectResolver | None = None

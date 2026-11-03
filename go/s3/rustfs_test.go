@@ -37,7 +37,6 @@ func TestRustFSNativeArchiveObjectsAndPresignedRanges(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	t.Run("packed multipart and publication", func(t *testing.T) { testPackedRustFS(ctx, t, client, bucket) })
 	t.Run("presigned GET and PUT", func(t *testing.T) {
 		testPresignedGETAndPUT(ctx, t, client, bucket)
 	})
@@ -178,115 +177,6 @@ func TestRustFSNativeArchiveObjectsAndPresignedRanges(t *testing.T) {
 	}
 	if _, err = source.ReadRange(ctx, 0, 1); err == nil {
 		t.Fatal("replaced archive accepted")
-	}
-}
-
-func testPackedRustFS(ctx context.Context, t *testing.T, client *awss3.Client, bucket string) {
-	t.Helper()
-	store := NewPackStore(client, bucket, "packed", UploadOptions{PartSize: 5 << 20, Concurrency: 2})
-	writer, err := zstar.NewPackWriter(store, nil, zstar.PackWriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := writer.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	extents := make([]zstar.Extent, 0, 3)
-	expected := make([]byte, 0, 12<<20)
-	state := uint64(123)
-	for range 3 {
-		raw := make([]byte, 0, 4<<20)
-		for range (4 << 20) / 8 {
-			state ^= state << 13
-			state ^= state >> 7
-			state ^= state << 17
-			for i := range 8 {
-				raw = append(raw, byte(state>>(i*8)))
-			}
-		}
-		e, err := writer.Put(ctx, raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		extents = append(extents, e)
-		expected = append(expected, raw...)
-	}
-	catalog, err := writer.Finish(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot := catalog.Packs()[0].Snapshot
-	assertObjectHeaders(ctx, t, client, bucket, "packed/"+snapshot.Key, zstdContentType, immutableCacheControl)
-	if snapshot.Length <= 10<<20 {
-		t.Fatal("multipart path not exercised")
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		listed, err := client.ListObjectsV2(cleanupCtx, &awss3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String("packed/")})
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		for _, object := range listed.Contents {
-			if _, err := client.DeleteObject(cleanupCtx, &awss3.DeleteObjectInput{Bucket: aws.String(bucket), Key: object.Key}); err != nil {
-				t.Error(err)
-			}
-		}
-	}()
-	resolver, err := zstar.NewPackedObjectResolver(store, catalog, zstar.PackedResolverOptions{MaxRangeBytes: 16 << 20})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var thin bytes.Buffer
-	archiveWriter, err := zstar.NewWriter(&thin, zstar.WriterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = archiveWriter.Add(ctx, zstar.Header{Path: "file", Mode: 0o644, Extents: extents}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err = archiveWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	archive, err := zstar.OpenWithOptions(ctx, zstar.ReaderAtSource{Reader: bytes.NewReader(thin.Bytes()), Length: int64(thin.Len())}, zstar.ReaderOptions{Resolver: resolver})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := archive.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	out, err := archive.Read(ctx, "file", 0, uint64(len(expected)))
-	if err != nil || !bytes.Equal(out, expected) {
-		t.Fatal("packed reconstruction", err)
-	}
-	descriptor, g, err := zstar.PublishPackedGeneration(ctx, store, "run", bytes.NewReader(thin.Bytes()), catalog, map[string]any{"implementation": "Go"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, artifact := range []struct{ key, kind string }{{descriptor.Key, "application/cbor"}, {g.Archive.Key, zstdContentType}, {g.Catalog.Key, "application/cbor"}} {
-		assertObjectHeaders(ctx, t, client, bucket, "packed/"+artifact.key, artifact.kind, immutableCacheControl)
-	}
-	raw, err := store.ReadPackedRange(ctx, descriptor, 0, descriptor.Length)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := zstar.DecodePackedGeneration(raw)
-	if err != nil || decoded.Archive != g.Archive {
-		t.Fatal("generation", err)
-	}
-	raw, err = store.ReadPackedRange(ctx, snapshot, 0, snapshot.Length)
-	if err != nil {
-		t.Fatal(err)
-	}
-	alternative := NewPackStore(client, bucket, "packed", UploadOptions{PartSize: 8 << 20, Concurrency: 2})
-	reused, err := alternative.PutPack(ctx, snapshot.Key, bytes.NewReader(raw), snapshot.Length)
-	if err != nil || reused != snapshot {
-		t.Fatal("immutable reuse", err)
 	}
 }
 

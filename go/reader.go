@@ -98,12 +98,6 @@ func (r *Reader) Cursor() *ManifestCursor { return r.manifest.Cursor() }
 // Callbacks may read the archive. The first callback error stops visitation.
 func (r *Reader) VisitEntries(visit func(Entry) error) error { return r.manifest.VisitEntries(visit) }
 
-// ValidateMetadata confirms authenticated metadata remains open and observes
-// cancellation. It does not validate physical archive content.
-func (r *Reader) ValidateMetadata(ctx context.Context) error {
-	return r.manifest.ValidateMetadata(ctx)
-}
-
 // Read returns an owned buffer containing exactly size bytes at the logical
 // member offset. The range must fit within the member and MaxReadBytes.
 // Symlinks are never followed. ctx bounds this operation only.

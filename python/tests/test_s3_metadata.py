@@ -4,7 +4,7 @@ import struct
 
 import pytest
 import zstar
-from zstar._s3 import s3_archive_metadata
+from zstar._native import s3_archive_metadata
 
 
 @pytest.mark.parametrize("wrapper", [bytes, bytearray, memoryview])

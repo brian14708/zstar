@@ -44,6 +44,7 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 				ExpectedVerification    map[string]any `json:"expected_verification"`
 				Objects, Members, Links map[string]string
 				Limits                  struct {
+					Policy          Limits `json:"limits"`
 					MaxDecodedBytes uint64 `json:"max_decoded_bytes"`
 					MaxReadBytes    uint64 `json:"max_read_bytes"`
 				}
@@ -82,13 +83,13 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 				}
 				resolver := manifestCorpusObjects{root, test.Objects}
 				verify := test.VerifyExternal != nil && *test.VerifyExternal
-				m, err := OpenWithOptions(ctx, memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{MemoryBytes: 1, MaxDecodedBytes: test.Limits.MaxDecodedBytes, MaxReadBytes: test.Limits.MaxReadBytes}, Resolver: resolver, VerifyExternalHash: verify})
+				m, err := OpenWithOptions(ctx, memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{Limits: test.Limits.Policy, MemoryBytes: 1, MaxDecodedBytes: test.Limits.MaxDecodedBytes, MaxReadBytes: test.Limits.MaxReadBytes}, Resolver: resolver, VerifyExternalHash: verify})
 				var report VerificationReport
 				if err == nil {
 					defer testClose(t, m)
 					switch test.Operation {
 					case "metadata":
-						err = m.ValidateMetadata(ctx)
+						// Opening has already authenticated and validated metadata.
 					case "full-archive", "external-closure":
 						report, err = m.Verify(ctx, test.Operation == "external-closure")
 					case "inline-range", "external-range":

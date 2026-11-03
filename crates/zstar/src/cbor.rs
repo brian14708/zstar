@@ -46,7 +46,7 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         self.item_max = item_max;
         self
     }
-    fn charge(&mut self, len: u64) -> Result<()> {
+    const fn charge(&mut self, len: u64) -> Result<()> {
         let cap = if self.index == 0 {
             self.first_max
         } else {
@@ -54,12 +54,11 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         };
         self.consumed = self.consumed.saturating_add(len);
         if self.consumed > cap {
-            // Entries have a normative format bound (malformed); the header's
-            // bound is a local budget.
+            // Header and entry item caps are local parser budgets.
             return Err(if self.index == 0 {
                 Error::Budget("manifest header size")
             } else {
-                invalid("CBOR item exceeds size maximum")
+                Error::Budget("CBOR item size")
             });
         }
         Ok(())
@@ -443,7 +442,7 @@ mod tests {
         assert!(matches!(d.next(), Err(Error::Budget(_))));
         let mut d = SequenceDecoder::<_>::new(raw.as_slice(), u64::MAX).with_item_limits(99, 16);
         d.index = 1;
-        assert!(matches!(d.next(), Err(Error::MalformedToc(m)) if m.contains("size maximum")));
+        assert!(matches!(d.next(), Err(Error::Budget(_))));
         // Per-item, not cumulative: many small items pass.
         let many = vec![0x01; 100];
         let mut d = SequenceDecoder::<_>::new(many.as_slice(), 100).with_item_limits(16, 1);

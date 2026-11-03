@@ -10,7 +10,7 @@ import (
 )
 
 func validateObjectExtents(extents []Extent) error {
-	if len(extents) == 0 || len(extents) > manifestExtentsMax {
+	if len(extents) == 0 {
 		return rejected("malformed-pointer", "extent count")
 	}
 	var total uint64
@@ -25,6 +25,7 @@ func validateObjectExtents(extents []Extent) error {
 			return rejected("malformed-pointer", "file size overflow")
 		}
 		total += e.Size
+
 	}
 	return nil
 }
@@ -39,18 +40,15 @@ func EncodeContentReference(extents []Extent) ([]byte, error) {
 		values[i] = e.value()
 	}
 	raw, err := manifestEncode(map[string]any{"version": uint64(1), "extents": values})
-	if len(raw) > manifestEntryMax {
-		return nil, rejected("malformed-pointer", "reference size limit")
-	}
 	return raw, err
 }
 
 // DecodeContentReference decodes and validates canonical external extent tuples.
 func DecodeContentReference(raw []byte) ([]Extent, error) {
-	if len(raw) == 0 || len(raw) > manifestEntryMax {
+	if len(raw) == 0 {
 		return nil, rejected("malformed-pointer", "reference size limit")
 	}
-	mode, err := (cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF, IndefLength: cbor.IndefLengthForbidden, TagsMd: cbor.TagsForbidden, MaxArrayElements: manifestExtentsMax, MaxMapPairs: 1_000_000, MaxNestedLevels: 64}).DecMode()
+	mode, err := (cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF, IndefLength: cbor.IndefLengthForbidden, TagsMd: cbor.TagsForbidden, MaxArrayElements: 2147483647, MaxMapPairs: 1_000_000, MaxNestedLevels: 64}).DecMode()
 	if err != nil {
 		return nil, err
 	}
@@ -100,22 +98,16 @@ func EncodeContentPointer(extents []Extent) ([]byte, error) {
 			out.WriteString(strconv.FormatUint(e.Offset, 10))
 		}
 		out.WriteByte('\n')
-		if out.Len() > 16<<20 {
-			return nil, rejected("malformed-pointer", "pointer size limit")
-		}
 	}
 	return []byte(out.String()), nil
 }
 
 // DecodeContentPointer decodes and validates canonical external pointer text.
 func DecodeContentPointer(raw []byte) ([]Extent, error) {
-	if len(raw) > 16<<20 || !bytes.HasPrefix(raw, []byte("version zstar-pointer-v1\n")) || len(raw) == 0 || raw[len(raw)-1] != '\n' {
+	if !bytes.HasPrefix(raw, []byte("version zstar-pointer-v1\n")) || len(raw) == 0 || raw[len(raw)-1] != '\n' {
 		return nil, rejected("malformed-pointer", "pointer header or length")
 	}
 	lines := strings.Split(string(raw[len("version zstar-pointer-v1\n"):len(raw)-1]), "\n")
-	if len(lines) > manifestExtentsMax {
-		return nil, rejected("malformed-pointer", "extent count")
-	}
 	var out []Extent
 	for _, line := range lines {
 		fields := strings.Split(line, " ")

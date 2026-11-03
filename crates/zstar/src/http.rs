@@ -25,7 +25,7 @@ pub(crate) const IMMUTABLE_CACHE_CONTROL: &str =
 pub(crate) fn artifact_content_type(key: &str) -> &'static str {
     let name = key.rsplit('/').next().unwrap_or_default();
     let extension = name.rsplit_once('.').map_or("", |(_, extension)| extension);
-    if ["zstar", "zst", "zstp"]
+    if ["zstar", "zst"]
         .iter()
         .any(|suffix| extension.eq_ignore_ascii_case(suffix))
     {
@@ -613,10 +613,10 @@ impl HttpEncodedObjectResolver {
         concurrency: std::num::NonZeroUsize,
         max_object_bytes: u64,
     ) -> std::io::Result<Self> {
-        if max_object_bytes == 0 || max_object_bytes > 17 << 20 {
+        if max_object_bytes == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "encoded object limit must be between 1 and 17 MiB",
+                "encoded object limit must be positive",
             ));
         }
         Ok(Self {

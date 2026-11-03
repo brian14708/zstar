@@ -8,8 +8,8 @@ import pytest
 from zstar import Archive, AsyncArchive, ZstarError
 from zstar._native import (
     EntryArchiveWriter,
-    IndexedArchive,
     ManifestArchive,
+    SyncArchive,
     decode_manifest_block,
     encode_manifest_block,
 )
@@ -64,11 +64,11 @@ def test_reader_factory_temporary_files_and_cold_lookup(kind, inline_data, sourc
         elif kind == "manifest":
             reader = ManifestArchive(source_factory(), len(inline_data), **options)
         else:
-            reader = IndexedArchive(source_factory(), len(inline_data), **options)
+            reader = SyncArchive.from_source(source_factory(), len(inline_data), **options)
         try:
             assert reader.read("a/file", 2047, 3) == bytes([255, 0, 1])
             if kind == "indexed":
-                assert reader._entry("link")["kind"] == "symlink"
+                assert reader.entry("link")[1] == 2
             elif kind == "bytes":
                 assert reader.getinfo("link").linkname == "../a//file"
             else:
@@ -92,7 +92,7 @@ def test_quota_rejected_before_factory_callback(kind, inline_data, source_factor
         elif kind == "manifest":
             ManifestArchive(source_factory(), len(inline_data), **options)
         elif kind == "indexed":
-            IndexedArchive(source_factory(), len(inline_data), **options)
+            SyncArchive.from_source(source_factory(), len(inline_data), **options)
         else:
             writer = EntryArchiveWriter(io.BytesIO(), **options)
             try:

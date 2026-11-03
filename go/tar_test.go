@@ -5,9 +5,59 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
+
+func TestValidateArchiveRejectsPointerBeyondAddressSpace(t *testing.T) {
+	for _, size := range []uint64{1 << 40, uint64(^uint(0)>>1) + 1} {
+		t.Run(strconv.FormatUint(size, 10), func(t *testing.T) { testValidateArchiveRejectsHugePointer(t, size) })
+	}
+}
+
+func testValidateArchiveRejectsHugePointer(t *testing.T, size uint64) {
+	t.Helper()
+	ctx := context.Background()
+	header, err := memberHeader(Header{Path: "pointer", Kind: "file", Mode: 420, Size: size})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, encoder)
+	var output bytes.Buffer
+	output.Write(encoder.EncodeAll(header, nil))
+	writer, err := NewManifestWriter(&output, uint64(output.Len()), ManifestWriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{Path: "pointer", Mode: 420, Extents: []Extent{{
+		Size: 1, Source: mustObjectSource(t, "sha256:"+strings.Repeat("0", 64)), EncodedSize: 1,
+	}}}
+	if err = writer.AddEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := OpenManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, manifest)
+	want := CategoryMalformedTar
+	if size > uint64(^uint(0)>>1) {
+		want = CategoryResourceLimit
+	}
+	if _, err = manifest.ValidateArchive(ctx); ErrorCategory(err) != want {
+		t.Fatalf("oversized pointer: %v", err)
+	}
+}
 
 func tarChecksum(raw []byte) {
 	copy(raw[148:156], []byte("        "))

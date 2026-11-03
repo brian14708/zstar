@@ -218,12 +218,6 @@ impl Spool {
         }
         let size = u64::from(u32::from_le_bytes(self.read(*at, 4)?.try_into().unwrap()));
         *at += 4;
-        // Records are entry tuples; reject before allocating the read buffer.
-        if size > crate::manifest::ENTRY_MAX as u64 {
-            return Err(Error::MalformedToc(
-                "spooled record exceeds entry maximum".into(),
-            ));
-        }
         let raw = self.read(*at, size)?;
         *at += size;
         Ok(Some(crate::cbor::decode(&raw)?))

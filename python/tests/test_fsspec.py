@@ -260,20 +260,25 @@ def test_local_snapshot_survives_atomic_path_replacement(tmp_path):
         fs.close()
 
 
-def test_directory_symlink_listing_preserves_alias(tmp_path):
+def test_symlink_metadata_is_preserved_without_following_links(tmp_path):
     root = tmp_path / "input"
     (root / "dir" / "nested").mkdir(parents=True)
     (root / "dir" / "x").write_bytes(b"hello")
     (root / "link").symlink_to("dir", target_is_directory=True)
     fs = ZstarFileSystem(fo=io.BytesIO(_native.pack_directory(root)))
     try:
-        assert fs.info("link")["type"] == "directory"
-        assert fs.ls("link", detail=False) == ["link/nested", "link/x"]
-        assert fs.info("link/x")["size"] == 5
-        assert fs.modified("link/x") == fs.modified("dir/x")
-        with fs.open("link/x") as member:
+        assert fs.info("link")["type"] == "link"
+        assert fs.ls("link", detail=False) == ["link"]
+        assert next(item for item in fs.ls("") if item["name"] == "link")["type"] == "link"
+        with pytest.raises(OSError, match="symlink"):
+            fs.open("link")
+        with pytest.raises(OSError, match="symlink"):
+            fs.cat_ranges(["link"], [0], [1], on_error="raise")
+        for operation in (fs.info, fs.modified, fs.open, fs.ls):
+            with pytest.raises(FileNotFoundError):
+                operation("link/x")
+        with fs.open("dir/x") as member:
             assert member.read() == b"hello"
-        assert fs.ls("link/nested") == []
         with pytest.raises(FileNotFoundError):
             fs.open("../dir/x")
     finally:

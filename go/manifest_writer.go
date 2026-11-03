@@ -45,10 +45,10 @@ func NewManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOp
 		}
 	}
 	options.RootExtensions = cloneExtensions(options.RootExtensions)
-	if options.BlockTarget < 512 || options.BlockTarget > 1<<20 {
-		return nil, errors.New("zstar: block target must be in [512, 1 MiB]")
+	if options.BlockTarget < 512 {
+		return nil, errors.New("zstar: block target must be at least 512 bytes")
 	}
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(maxFrameSize), zstd.WithEncoderCRC(true), zstd.WithEncoderLevel(manifestCompressionLevel(options.CompressionLevel)))
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(defaultEncoderWindow), zstd.WithEncoderCRC(true), zstd.WithEncoderLevel(manifestCompressionLevel(options.CompressionLevel)))
 	if err != nil {
 		return nil, err
 	}
@@ -73,8 +73,8 @@ func (w *ManifestWriter) AddEntry(entry Entry) error {
 	if err != nil {
 		return err
 	}
-	if len(raw) > manifestEntryMax {
-		return rejected("malformed-toc", "entry maximum")
+	if err := w.options.Limits.entry(entry, len(raw)); err != nil {
+		return err
 	}
 	if w.count == math.MaxUint64 {
 		w.err = rejected("malformed-toc", "entry count overflow")
@@ -109,15 +109,21 @@ func cborHead(major byte, n uint64) []byte {
 }
 
 func (w *ManifestWriter) writeSegment(raw []byte) error {
-	if len(raw) == 0 || len(raw) > manifestBlockMax {
+	if len(raw) == 0 {
 		return rejected("malformed-toc", "metadata segment maximum")
 	}
 	if uint64(len(raw)) > w.options.MaxDecodedBytes-w.decoded {
 		return rejected("resource-limit", "decoded manifest size")
 	}
+	if err := checkLimit(uint64(len(raw)), w.options.Limits.MaxFrameDecodedBytes, "decoded metadata frame size"); err != nil {
+		return err
+	}
 	encoded := w.encoder.EncodeAll(raw, nil)
-	if len(encoded) > 17<<20 {
-		return rejected("malformed-toc", "encoded metadata segment maximum")
+	if err := w.options.Limits.frame(encoded); err != nil {
+		return err
+	}
+	if uint64(len(encoded)) > math.MaxUint32 {
+		return rejected("malformed-toc", "metadata wrapper length")
 	}
 	size := uint64(len(encoded)) + 8
 	if size > w.options.MaxEncodedBytes-(w.position-w.start) || size > math.MaxUint64-w.position {

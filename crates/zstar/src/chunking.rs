@@ -1,10 +1,6 @@
 //! Bounded, segmentation-independent fixed and content-defined chunking.
-use crate::{DATA_FRAME_MAX, Error, Result};
+use crate::{Error, Result};
 use std::io::Read;
-
-/// Implementation provenance: `FastCDC` 2020, level 1, unseeded gear table.
-#[cfg(feature = "async")]
-pub(crate) const FASTCDC_PROFILE: &str = "zstar-fastcdc-2020-level1-v1";
 
 /// Chunk boundaries are reset for each file; empty files have no chunks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,16 +33,16 @@ impl Chunking {
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    pub fn validate(self) -> Result<()> {
+    pub const fn validate(self) -> Result<()> {
         match self {
-            Self::Fixed { size } if (1..=DATA_FRAME_MAX).contains(&size) => Ok(()),
+            Self::Fixed { size } if size > 0 => Ok(()),
             Self::FastCdc { min, target, max }
                 if min >= 64
                     && min <= target
                     && target <= max
-                    && max <= DATA_FRAME_MAX
                     && min.is_multiple_of(2)
                     && target.is_power_of_two()
+                    && (target.ilog2() as usize + 1) < fastcdc::v2020::MASKS.len()
                     && max.is_multiple_of(2) =>
             {
                 Ok(())
@@ -186,16 +182,13 @@ pub async fn external_file<R: tokio::io::AsyncRead + Unpin>(
 ) -> Result<Vec<crate::Extent>> {
     use tokio::io::AsyncReadExt;
     let mut chunker = Chunker::new(strategy)?;
-    if size > (strategy.max_size() as u64) * crate::manifest::EXTENTS_MAX as u64 {
-        return Err(Error::Budget("external file extent count"));
-    }
     let mut input = input.take(size.checked_add(1).ok_or(Error::Range)?);
     let mut total = 0_u64;
     let mut extents = Vec::new();
     while let Some(raw) = chunker.next_async(&mut input).await? {
         total = total.checked_add(raw.len() as u64).ok_or(Error::Range)?;
-        if total > size || extents.len() == crate::manifest::EXTENTS_MAX {
-            return Err(Error::Budget("external file size or extent count"));
+        if total > size {
+            return Err(Error::Budget("external file size"));
         }
         let digest = *crate::Digest::sha256(&raw).as_bytes();
         let length = raw.len() as u64;

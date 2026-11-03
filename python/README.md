@@ -2,16 +2,21 @@
 
 Python bindings for indexed `.tar.zst` archives. Python 3.11 or later is required;
 `fsspec` is a required dependency and provides the uniform filesystem interface.
-Install the optional `http` extra for chained HTTP URLs and explicit HTTP backends.
-Direct native HTTP readers do not require it.
+Install optional fsspec backends separately for the protocols you use.
+Direct native HTTP readers do not require additional dependencies.
 
 ## Installation
 
 ```sh
 pip install zstar-py
 # Optional: fsspec HTTP backends and chained HTTP URLs
-pip install 'zstar-py[http]'
+pip install 'fsspec[http]>=2026.9.0'
+# Optional: fsspec S3 backends and chained S3 URLs
+pip install 's3fs>=2026.9.0'
 ```
+
+Other fsspec protocols work with their corresponding backend packages installed.
+Zstar does not bundle optional backend dependencies or expose extras for them.
 
 The distribution is named `zstar-py`; the import is `zstar`. Run `just check` from
 the repository root for the complete development test suite.
@@ -25,8 +30,11 @@ The stable public surface is intentionally small:
 - `zstar.types` contains protocols and typed option dictionaries for low-level APIs.
 
 The `_native` module, underscored Python modules, and underscored methods are
-implementation details. Use the fsspec filesystem interface for packed-object
-writing; the archive writers expose `addfile()`, `add_entry()`, and `write_bytes()`
+implementation details. Reader factories share native option parsing; metadata
+uses the lossless entry tuples behind the Python `TarInfo` view. Native bindings
+are organized by reader, writer, manifest, storage, and callback support.
+Use the fsspec filesystem interface for external-object writing; the archive
+writers expose `addfile()`, `add_entry()`, and `write_bytes()`
 for supported direct writes.
 
 ## Filesystem interface
@@ -56,24 +64,6 @@ borrowed binary output stream and fsspec progress callbacks. `cat_ranges()` batc
 member ranges in Rust, supports negative offsets, and follows fsspec's per-range
 error handling. Pass `reader_options={"concurrent_chunks": 4, ...}` to tune native
 reader limits; use `external=` for external content.
-
-For backends that expose fsspec's `setxattr()` operation, pass string metadata:
-the archive is uploaded first, then the backend updates object metadata. With s3fs
-this is an S3 `CopyObject` request, so it can create a new object version and is not
-part of the upload transaction. Its single-copy operation supports objects up to
-5 GB. If the metadata update fails, close raises and the completed archive remains
-stored.
-
-```python
-with fsspec.filesystem(
-    "zstar",
-    fo="s3://bucket/archive.zstar",
-    mode="w",
-    target_options={"key": key, "secret": secret},
-    metadata={"application": "zstar"},
-) as fs:
-    fs.pipe_file("hello.txt", b"hello")
-```
 
 Use `Path` objects or strings for local archives. `fo` may also be an owned
 binary sink, or a path understood by another fsspec filesystem. Pass a configured
@@ -127,7 +117,7 @@ Backends configured with `asynchronous=True` use direct async range I/O and bypa
 stream caching; use a synchronous backend or disk-cache wrapper for source caching.
 
 Direct HTTP reads use the native range transport; chained HTTP URLs use fsspec
-and require the `http` extra.
+and require a separately installed `fsspec[http]`.
 
 For external content, pass a filesystem rooted at the object directory:
 
@@ -170,12 +160,16 @@ awaited on the owning event loop. `aiofiles` and `aiofile` objects are not requi
 The lower-level factories are useful when fsspec's filesystem methods do not fit. Use
 `Archive.from_file`, `Archive.from_source`, or `Archive.from_url` for synchronous
 readers and await the corresponding `AsyncArchive` factories for native async reads.
-Readers expose standard `tarfile.TarInfo` metadata.
+Readers expose standard `tarfile.TarInfo` metadata. Lookup and file reads never
+follow symlinks. Opening a symlink as a member stream raises `tarfile.ExtractError`;
+use `read_link()` to inspect its exact stored target. The fsspec adapter likewise
+reports links as links and rejects opening them or traversing through them.
 
 For metadata that does not fit `TarInfo`, `entry()` and `iter_entries()` return
 the lossless manifest tuples, including entry attributes and extent references.
-`root_extensions`, `read_link()`, and `validate_metadata()` expose the matching
-archive-level and validation operations from the Rust reader. Reader options also
+`root_extensions` and `read_link()` expose archive-level metadata and symlink
+targets. Opening completes metadata authentication and validation; use `verify()`
+for physical archive or external-closure validation. Reader options also
 include `concurrent_chunks`; writer options include `workers` and
 `root_extensions`.
 
@@ -230,13 +224,33 @@ chain and is configured independently through `target_options` or `fs=`.
 
 ## Performance
 
+`Archive`, `AsyncArchive`, and fsspec share Rust reader sessions, range resolution,
+and member cursors. Member opens inspect metadata once. Rust handles seek bounds
+and bounded `readinto()` loops; fsspec fetches use positional reads.
+Python provides file interfaces and commits stream positions after successful
+reads. Synchronous calls enter the native runtime directly, while asynchronous
+calls support cancellation and drain admitted operations when closing.
+The two interfaces share source setup, result conversion, and metadata iteration
+in Rust. Synchronous calls release the GIL while waiting on the shared Tokio
+runtime; they do not create a Python event loop. They still block the calling
+thread, so use `AsyncArchive` in event-loop code. fsspec adapts `AsyncArchive` for
+both its synchronous and asynchronous interfaces.
+
+Writers share one synchronous Rust encoder. `AsyncArchiveWriter` offloads calls
+to native blocking workers, with at most eight admitted jobs across writers.
+Queued calls await capacity without blocking the event loop. Running calls retain
+their capacity until completion, even if cancelled; cancellation waits for the
+call to finish before cleaning up its output. The `workers` writer option
+controls compression parallelism separately from this admission limit.
+
 Both interfaces use Rust for archive decoding, validation, and compression. The
 raw path reader uses native positional file I/O. The fsspec reader adds Python
 filesystem dispatch, async scheduling, and backing-stream callbacks. Passing a
 Python stream to the raw reader also incurs callbacks; it is not the same path as
 native file I/O.
 
-A local warm-cache benchmark measured the current interfaces as follows:
+A local warm-cache benchmark measured the interfaces before the shared-reader
+refactor as follows:
 
 | Workload | Raw Python API | fsspec sync API |
 | --- | ---: | ---: |
@@ -248,7 +262,7 @@ A local warm-cache benchmark measured the current interfaces as follows:
 These compare Python APIs backed by Rust, not a standalone Rust application.
 The write paths also differ: fsspec uses a native worker and a backend transaction,
 while the raw writer calls the encoder synchronously. Results do not establish
-remote S3 performance. See the [benchmark methodology](../tools/bench/README.md).
+remote S3 performance.
 
 
 Keep the filesystem open across reads to reuse parsed metadata. For related ranges,
@@ -258,13 +272,23 @@ Decoded content is not retained between calls.
 Use `put_file()` for local files and `pipe_file()` for bytes: known-size inputs
 stream straight to the encoder. Writable `open()` members spool because the tar
 header requires their final size; `member_spool_bytes` controls when they spill to
-disk. The raw writer's `addfile(TarInfo, body)` avoids filesystem dispatch when
+disk. A native staged-writer session tracks members, creates parent directories,
+serializes writes, and prevents finalization after a member failure. Python owns
+temporary-file creation and backend publication. The raw writer's
+`addfile(TarInfo, body)` avoids filesystem dispatch when
 inserting many small members. Increasing async upload concurrency cannot parallelize
 insertion into a single archive.
 
 The fsspec writer always emits the archive index and manifest inside the object.
-S3 user metadata is added only when `metadata=` is supplied and the backend supports
-`setxattr()`; those optional headers are separate from the authenticated archive
-metadata.
+Configure storage object metadata through your backend or storage SDK when
+opening an output sink, then pass that sink to an archive writer.
 
 The [format specification](../spec/v1.md) defines the wire format and validation rules.
+
+Opening processes the complete manifest and retains an index within the configured
+metadata budget. Temporary spooling does not make the index disk-backed. Pass a
+`limits` dictionary to readers and writers to bound frame and window
+bytes, entry bytes, extent counts, and pointer bytes. Zero or omission disables
+each additional limit; aggregate metadata and index budgets remain independent.
+For example, `limits={"max_frame_decoded_bytes": 64 << 20, "max_extents": 100_000}`
+sets caller policy without changing archive validity.

@@ -92,7 +92,7 @@ func (r *Reader) fsEntry(name string) (*Entry, error) {
 		return nil, fs.ErrInvalid
 	}
 	if name == "." {
-		if err := r.manifest.ValidateMetadata(context.Background()); err != nil {
+		if err := r.manifest.checkOpen(context.Background()); err != nil {
 			return nil, err
 		}
 		return &Entry{Path: ".", Type: TypeDirectory, Mode: 0o555}, nil

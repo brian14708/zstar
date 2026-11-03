@@ -12,6 +12,7 @@ __all__ = [
     "EntryTuple",
     "ErrorCategory",
     "ExtentTuple",
+    "Limits",
     "ManifestOptions",
     "ObjectResolver",
     "ProgressCallback",
@@ -39,8 +40,6 @@ EntryTuple: TypeAlias = (
 )
 
 ErrorCategory: TypeAlias = Literal[
-    "malformed-catalog",
-    "changed-pack",
     "not-zstar",
     "malformed-footer",
     "invalid-range",
@@ -108,7 +107,19 @@ class SignedRequest(TypedDict):
 RequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], Awaitable[SignedRequest]]
 
 
+class Limits(TypedDict, total=False):
+    """Caller budgets; zero or omission disables each additional limit."""
+
+    max_frame_encoded_bytes: int
+    max_frame_decoded_bytes: int
+    max_window_bytes: int
+    max_entry_bytes: int
+    max_extents: int
+    max_pointer_bytes: int
+
+
 class WriterOptions(TypedDict, total=False):
+    limits: Limits | None
     workers: int
     root_extensions: dict[str, CborValue] | None
     frame_size: int
@@ -120,6 +131,7 @@ class WriterOptions(TypedDict, total=False):
 
 
 class ManifestOptions(TypedDict, total=False):
+    limits: Limits | None
     memory_bytes: int
     max_encoded_bytes: int
     max_decoded_bytes: int

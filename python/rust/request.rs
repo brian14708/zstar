@@ -27,18 +27,18 @@ use zstar::http::{
 pub struct FailureSlot(std::sync::Mutex<Option<PyErr>>);
 impl FailureSlot {
     fn record(&self, error: PyErr) {
-        let previous = crate::lock_state(&self.0).replace(error);
+        let previous = crate::support::lock_state(&self.0).replace(error);
         drop(previous); // After the guard: dropping may run Python code.
     }
     pub(crate) fn annotate(&self, error: PyErr) -> PyErr {
         Python::attach(|py| {
-            if error.is_instance_of::<crate::ZstarError>(py)
+            if error.is_instance_of::<crate::support::ZstarError>(py)
                 && error
                     .value(py)
                     .to_string()
                     .contains("presigned provider failed")
             {
-                let cause = crate::lock_state(&self.0).take();
+                let cause = crate::support::lock_state(&self.0).take();
                 if let Some(cause) = cause {
                     error.set_cause(py, Some(cause));
                 }
@@ -149,7 +149,8 @@ pub fn source(
     provider: Option<Py<PyAny>>,
     failures: Arc<FailureSlot>,
 ) -> PyResult<HttpRangeSource> {
-    let transport = Arc::new(ReqwestTransport::new().map_err(|e| super::core_error(e.into()))?);
+    let transport =
+        Arc::new(ReqwestTransport::new().map_err(|e| crate::support::core_error(e.into()))?);
     match (url, provider) {
         (Some(url), None) => Ok(HttpRangeSource::new(
             transport,
@@ -214,7 +215,7 @@ pub fn put_presigned<'py>(
     provider: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if data.len() > 64 << 20 {
-        return Err(super::core_error(zstar::Error::Budget(
+        return Err(crate::support::core_error(zstar::Error::Budget(
             "presigned PUT body",
         )));
     }
@@ -225,6 +226,6 @@ pub fn put_presigned<'py>(
         source
             .put(body)
             .await
-            .map_err(|e| failures.annotate(super::core_error(e.into())))
+            .map_err(|e| failures.annotate(crate::support::core_error(e.into())))
     })
 }

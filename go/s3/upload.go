@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // MultipartClient provides the S3 operations needed for bounded multipart upload.
@@ -203,4 +204,13 @@ func immutableCondition(enabled bool) *string {
 		return aws.String("*")
 	}
 	return nil
+}
+
+var errExists = errors.New("zstar s3: immutable object exists")
+
+func immutableError(err error) error {
+	if api, ok := errors.AsType[smithy.APIError](err); ok && api.ErrorCode() == "PreconditionFailed" {
+		return errExists
+	}
+	return redacted(err)
 }

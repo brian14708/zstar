@@ -106,7 +106,7 @@ impl LocalObjects {
 impl EncodedObjectResolver for LocalObjects {
     fn get_encoded(&mut self, digest: [u8; 32], _: u64, max_bytes: u64) -> Result<Vec<u8>> {
         let name = crate::manifest::object_address(&digest);
-        let limit = max_bytes.min(17 << 20);
+        let limit = max_bytes.min(isize::MAX as u64 - 1);
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let file = match self.dir.open_with(format!("{}.zst", &name[7..]), &options) {
@@ -700,7 +700,6 @@ pub fn extract_with_report<R: RangeReader>(
     objects: Option<LocalObjects>,
     options: ExtractOptions,
 ) -> AnyResult<ExtractReport> {
-    reader.manifest().validate_metadata()?;
     if reader
         .manifest()
         .root()

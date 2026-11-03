@@ -7,6 +7,23 @@ import (
 	"sync"
 )
 
+// ObjectRequest selects a complete frame; Hint is advisory.
+type ObjectRequest struct {
+	Digest         [32]byte
+	Hint, MaxBytes uint64
+}
+
+// BatchEncodedContentResolver optionally resolves a miss plan in one call.
+type BatchEncodedContentResolver interface {
+	EncodedContentResolver
+	GetEncodedMany(context.Context, []ObjectRequest) ([][]byte, error)
+}
+
+// EncodedContentIndex optionally exposes physical encoded lengths for planning.
+type EncodedContentIndex interface {
+	EncodedLength([32]byte) (uint64, bool)
+}
+
 type manifestChunkKey struct {
 	source      ExtentSource
 	encodedSize uint64
@@ -35,6 +52,7 @@ type manifestContentFlight struct {
 	err     error
 }
 type manifestContentState struct {
+	limits   Limits
 	decoders frameDecoderPool
 	mu       sync.Mutex
 	source   RangeReader
@@ -45,9 +63,11 @@ type manifestContentState struct {
 
 func newManifestContentState(options manifestOptions, source RangeReader) *manifestContentState {
 	return &manifestContentState{
-		source:  source,
-		flights: make(map[manifestChunkKey]*manifestContentFlight),
-		slots:   make(chan struct{}, options.ConcurrentChunks), closed: make(chan struct{}),
+		limits:   options.Limits,
+		decoders: frameDecoderPool{limits: options.Limits},
+		source:   source,
+		flights:  make(map[manifestChunkKey]*manifestContentFlight),
+		slots:    make(chan struct{}, options.ConcurrentChunks), closed: make(chan struct{}),
 	}
 }
 
@@ -162,7 +182,7 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 			if resolver == nil {
 				return nil, rejected("unsupported-operation", "external resolver required")
 			}
-			encoded, err = resolver.GetEncoded(ctx, digest, extent.EncodedSize, 17<<20)
+			encoded, err = resolver.GetEncoded(ctx, digest, extent.EncodedSize, uint64(addressLimit(s.limits.MaxFrameEncodedBytes)))
 		} else {
 			encoded, err = s.source.ReadRange(ctx, int64(extent.Source.offset), int64(extent.EncodedSize))
 			if err == nil && uint64(len(encoded)) != extent.EncodedSize {
@@ -175,12 +195,8 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(encoded) > 17<<20 {
-			category := "malformed-frame"
-			if object {
-				category = "malformed-external-content"
-			}
-			return nil, rejected(category, "encoded input limit")
+		if err = checkLimit(uint64(len(encoded)), s.limits.MaxFrameEncodedBytes, "encoded input size"); err != nil {
+			return nil, err
 		}
 		if !object && (len(encoded) < 5 || encoded[4]&4 == 0) {
 			return nil, rejected("malformed-frame", "missing data checksum")
@@ -188,7 +204,7 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 		raw, err := s.decoders.decode(encoded, 0)
 		if err != nil {
 			if object {
-				return nil, &FormatError{Category: "malformed-external-content", Cause: err}
+				return nil, categorized("malformed-external-content", err)
 			}
 			return nil, categorized("malformed-frame", err)
 		}

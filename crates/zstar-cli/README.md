@@ -40,36 +40,9 @@ restoration behavior.
 The CLI uses the AWS credential chain and selected `AWS_PROFILE`. Remote
 inspection and extraction download the archive to a temporary file first.
 
-## Packed external objects
-
-Create a local store directory outside the input tree, then capture a thin
-archive into it:
-
-```sh
-mkdir -p object-store
-zstar pack-objects input thin.zstar catalog.cbor --store object-store
-zstar materialize-objects thin.zstar catalog.cbor portable.zstar --store object-store
-zstar extract portable.zstar restored
-```
-
-`pack-objects` supports `--chunking fixed` (default) and `--chunking fastcdc`.
-It publishes a generation descriptor as well as the archive and catalog.
-`materialize-generation <generation-key> <output> --store <directory>` restores
-a portable archive from a store-relative descriptor key.
-
-To export complete external frames for extraction without a catalog:
-
-```sh
-mkdir -p exported
-zstar export-objects catalog.cbor --store object-store --destination exported
-zstar extract thin.zstar restored --objects exported/objects
-```
-
-External-object hashes are not checked by default. Use `--verify-external-hash`
-to opt into SHA-256 verification. Manifest authentication and data checksums remain
-required.
-The Rust library module documentation describes the filesystem restoration
-policy; the [specification][spec] defines the packed storage profile and
-validation scopes.
+External objects can be supplied to extraction with `--objects <directory>`.
+Their hashes are not checked by default; use `--verify-external-hash` to opt into
+SHA-256 verification. Manifest authentication and data checksums remain required.
+The [archive specification][spec] defines validation scopes.
 
 [spec]: https://github.com/brian14708/zstar/blob/main/spec/v1.md

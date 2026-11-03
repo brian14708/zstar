@@ -244,3 +244,111 @@ fn late_parents_and_reverse_insertion_keep_tar_order_and_sort_manifest() {
     assert_eq!(physical, ["z/child", "a"]);
     assert_eq!(reader.read("z/child", 0, 1, None, true).unwrap(), b"z");
 }
+
+#[test]
+fn writer_accepts_more_than_65536_inline_extents() {
+    let size = 512 * 65_537;
+    let mut writer =
+        BlockingBuilder::with_options(Vec::new(), 512, 1, zstar::ManifestOptions::default())
+            .unwrap();
+    writer
+        .add_file(Entry::file("large"), size, &mut io::repeat(7).take(size))
+        .unwrap();
+    let bytes = writer.finish().unwrap();
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
+    let entry = reader.entry("large").unwrap().unwrap();
+    assert_eq!(entry.extents.len(), 65_537);
+    assert_eq!(entry.size().unwrap(), size);
+    assert_eq!(reader.read("large", size - 1, 1, None, false).unwrap(), [7]);
+    reader.validate().unwrap();
+}
+
+#[test]
+fn large_external_entries_and_standalone_references_round_trip() {
+    let input = include_bytes!("../../../testdata/entry-manifest/limits/many-extents.zstar");
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(input), zstar::ManifestOptions::default()).unwrap();
+    let entry = reader.entry("file").unwrap().unwrap();
+    assert_eq!(entry.extents.len(), 65_537);
+    let reference = zstar::manifest::encode_external_reference(&entry.extents).unwrap();
+    assert_eq!(
+        zstar::manifest::decode_external_reference(&reference).unwrap(),
+        entry.extents
+    );
+    let mut writer = BlockingBuilder::new(Vec::new()).unwrap();
+    writer.add_metadata(entry).unwrap();
+    let bytes = writer.finish().unwrap();
+    BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default())
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn impossible_inline_metadata_is_rejected_before_reading_or_writing() {
+    struct Unreadable;
+    impl Read for Unreadable {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("preflight must not consume the body");
+        }
+    }
+    let mut output = Vec::new();
+    let mut writer = BlockingBuilder::with_options(
+        &mut output,
+        1 << 20,
+        3,
+        zstar::ManifestOptions {
+            limits: zstar::Limits {
+                max_entry_bytes: 8 << 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        writer.add_file(Entry::file("huge"), 1 << 50, &mut Unreadable),
+        Err(Error::Budget(_))
+    ));
+    drop(writer);
+    assert_eq!(output, [] as [u8; 0]);
+}
+
+#[test]
+fn frame_sizes_are_caller_policy() {
+    let size = 17 << 20;
+    let mut writer =
+        BlockingBuilder::with_options(Vec::new(), 32 << 20, 1, zstar::ManifestOptions::default())
+            .unwrap();
+    writer
+        .add_file(Entry::file("large"), size, &mut io::repeat(9).take(size))
+        .unwrap();
+    let bytes = writer.finish().unwrap();
+    let mut reader =
+        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
+    assert_eq!(reader.read("large", size - 1, 1, None, false).unwrap(), [9]);
+    reader.validate().unwrap();
+    let options = zstar::ManifestOptions {
+        limits: zstar::Limits {
+            max_frame_decoded_bytes: 16 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(matches!(
+        BlockingArchive::open(SliceReader::new(&bytes), options),
+        Err(Error::Budget(_))
+    ));
+    let options = zstar::ManifestOptions {
+        limits: zstar::Limits {
+            max_frame_decoded_bytes: 16 << 20,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(matches!(
+        BlockingBuilder::with_options(Vec::new(), 32 << 20, 1, options),
+        Err(Error::Budget(_))
+    ));
+}

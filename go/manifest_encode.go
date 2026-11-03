@@ -59,9 +59,6 @@ func encodeEntry(entry Entry) ([]byte, error) {
 		if extent.Offset != 0 {
 			out = appendManifestHead(out, 0, extent.Offset)
 		}
-		if len(out) > manifestEntryMax {
-			return nil, rejected("malformed-toc", "entry maximum")
-		}
 	}
 	if attributes {
 		attrs := make(Extensions, len(entry.Attributes)+1)
@@ -75,8 +72,34 @@ func encodeEntry(entry Entry) ([]byte, error) {
 		}
 		out = append(out, encoded...)
 	}
-	if len(out) > manifestEntryMax {
-		return nil, rejected("malformed-toc", "entry maximum")
-	}
 	return out, nil
+}
+
+// encodedLen measures one extent without allocating a CBOR interface tree.
+func (e Extent) encodedLen() int {
+	length := 1 + manifestHeadLen(e.Size) + manifestHeadLen(e.EncodedSize)
+	if offset, archive := e.Source.ArchiveOffset(); archive {
+		length += manifestHeadLen(offset)
+	} else {
+		length += 73
+	}
+	if e.Offset != 0 {
+		length += manifestHeadLen(e.Offset)
+	}
+	return length
+}
+
+func manifestHeadLen(value uint64) int {
+	switch {
+	case value < 24:
+		return 1
+	case value <= 255:
+		return 2
+	case value <= 65535:
+		return 3
+	case value <= 0xffffffff:
+		return 5
+	default:
+		return 9
+	}
 }

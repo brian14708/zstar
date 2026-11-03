@@ -5,14 +5,13 @@ import io
 import os
 import uuid
 from pathlib import Path
-from tarfile import TarInfo
 from urllib.parse import urlsplit
 
 import pytest
 import zstar
-from zstar import ArchiveWriter, _native
+from zstar import _native
 from zstar._fsspec import ZstarFileSystem
-from zstar._s3 import s3_archive_metadata
+from zstar._native import s3_archive_metadata
 
 
 @pytest.mark.skipif(not os.getenv("ZSTAR_S3_ENDPOINT"), reason="requires local RustFS")
@@ -299,60 +298,6 @@ def test_s3fs_explicit_version_chain_uses_snapshot(backend_async):
 
 
 @pytest.mark.skipif(not os.getenv("ZSTAR_S3_ENDPOINT"), reason="requires local RustFS")
-def test_async_packed_s3_generation():
-    import hashlib
-
-    boto3 = pytest.importorskip("boto3")
-    endpoint = os.environ["ZSTAR_S3_ENDPOINT"]
-    parsed = urlsplit(endpoint)
-    assert parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-    config = {
-        "endpoint": endpoint,
-        "region": "us-east-1",
-        "access_key_id": "zstar-test",
-        "secret_access_key": "zstar-test-secret",
-    }
-    client = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        region_name="us-east-1",
-        aws_access_key_id="zstar-test",
-        aws_secret_access_key="zstar-test-secret",
-    )
-    bucket = "zstar-packed-python-" + uuid.uuid4().hex
-    client.create_bucket(Bucket=bucket)
-
-    async def run():
-        store = _native.PackStore.s3(bucket, part_size=5 << 20, concurrency=2, **config)
-        data = b"".join(
-            hashlib.sha256(i.to_bytes(8, "little")).digest() for i in range((8 << 20) // 32)
-        )
-        async with _native.PackWriter(store) as packs:
-            body = await packs.externalize_async(io.BytesIO(data), len(data))
-            catalog = await packs.finish_async()
-        thin = io.BytesIO()
-        info = TarInfo("file")
-        info.size = len(data)
-        with ArchiveWriter(thin) as writer:
-            writer._add_external(info, body)
-        _key, generation = await _native.publish_packed_generation_async(
-            store, io.BytesIO(thin.getvalue()), catalog
-        )
-        resolver = _native.PackedObjectResolver(store, catalog)
-        async with await zstar.AsyncArchive.from_s3(
-            bucket, generation.archive_key, resolver=resolver, **config
-        ) as archive:
-            assert await archive.read("file") == data
-
-    try:
-        asyncio.run(run())
-    finally:
-        for item in client.list_objects_v2(Bucket=bucket).get("Contents", []):
-            client.delete_object(Bucket=bucket, Key=item["Key"])
-        client.delete_bucket(Bucket=bucket)
-
-
-@pytest.mark.skipif(not os.getenv("ZSTAR_S3_ENDPOINT"), reason="requires local RustFS")
 @pytest.mark.parametrize("cache_type", ["none", "blockcache"])
 def test_fsspec_s3_uses_ranges(tmp_path, cache_type):
     import http.client
@@ -471,13 +416,8 @@ def test_fsspec_s3_writer_commit_and_abort():
             fo=location,
             mode="w",
             target_options=options,
-            metadata={"application": "zstar"},
         ) as fs:
             fs.pipe_file("dir/data", b"hello")
-        assert (
-            client.head_object(Bucket=bucket, Key="archive.zstar")["Metadata"]["application"]
-            == "zstar"
-        )
         original = client.get_object(Bucket=bucket, Key="archive.zstar")["Body"]
         try:
             encoded = original.read()

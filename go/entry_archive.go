@@ -39,10 +39,13 @@ func NewEntryArchiveWriter(output io.Writer, frameSize int, config ManifestWrite
 	if frameSize == 0 {
 		frameSize = 1 << 20
 	}
-	if frameSize < 512 || frameSize > maxFrameSize || frameSize%512 != 0 {
+	if frameSize < 512 || frameSize%512 != 0 {
 		return nil, errors.New("zstar: invalid frame target")
 	}
 	options := config.defaults()
+	if err := checkLimit(uint64(frameSize), options.Limits.MaxFrameDecodedBytes, "writer frame size"); err != nil {
+		return nil, err
+	}
 	if err := validateExtensions(options.RootExtensions); err != nil {
 		return nil, err
 	}
@@ -59,8 +62,8 @@ func (w *EntryArchiveWriter) flush() error {
 		return nil
 	}
 	encoded := w.codec.EncodeAll(w.pending, nil)
-	if len(encoded) > 17<<20 {
-		return rejected("malformed-frame", "encoded frame limit")
+	if err := w.options.Limits.frame(encoded); err != nil {
+		return err
 	}
 	if uint64(len(encoded)) > math.MaxUint64-w.encoded {
 		return rejected("resource-limit", "archive size overflow")
@@ -130,6 +133,9 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 	if err != nil {
 		return err
 	}
+	if err = w.options.Limits.entry(entry, len(entryRaw)); err != nil {
+		return err
+	}
 	if entry.Type != TypeFile && (physicalSize != 0 || body != nil) {
 		return errors.New("zstar: non-file body")
 	}
@@ -140,6 +146,9 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 		pointer, e := EncodeContentPointer(entry.Extents)
 		if e != nil {
 			return e
+		}
+		if err = checkLimit(uint64(len(pointer)), w.options.Limits.MaxPointerBytes, "pointer size"); err != nil {
+			return err
 		}
 		physicalSize = uint64(len(pointer))
 		body = bytes.NewReader(pointer)
@@ -170,6 +179,24 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 	padded := (physicalSize + 511) / 512 * 512
 	if padded > math.MaxUint64-uint64(len(header)) || padded+uint64(len(header)) > math.MaxUint64-w.raw {
 		return rejected("resource-limit", "member size overflow")
+	}
+	if !entry.External() && physicalSize != 0 {
+		pending := len(w.pending)
+		if padded+uint64(len(header)) > uint64(w.target-pending) {
+			pending = 0
+		}
+		offset := uint64((pending + len(header)) % w.target)
+		count := (physicalSize-1)/uint64(w.target) + 1
+		if (physicalSize-1)%uint64(w.target)+offset >= uint64(w.target) {
+			count++
+		}
+		// Every extent needs at least four CBOR bytes, even with tiny fields.
+		if err = checkLimit(count, w.options.Limits.MaxExtents, "entry extent count"); err != nil {
+			return err
+		}
+		if w.options.Limits.MaxEntryBytes != 0 && count > (w.options.Limits.MaxEntryBytes-uint64(len(entryRaw)))/4 {
+			return rejected("resource-limit", "inline entry metadata size")
+		}
 	}
 	mutated = true
 	if len(w.pending) != 0 && padded+uint64(len(header)) > uint64(w.target-len(w.pending)) {
@@ -288,6 +315,7 @@ func (w *EntryArchiveWriter) finish() (err error) {
 		}
 		if entry.Type == TypeFile && !entry.External() && size != 0 {
 			end := start + size
+			extentBytes := 0
 			for {
 				if !loaded {
 					if frameAt >= w.frames.size {
@@ -310,10 +338,13 @@ func (w *EntryArchiveWriter) finish() (err error) {
 				}
 				a, b := max(start, raw), min(end, raw+decoded)
 				if b > a {
-					entry.Extents = append(entry.Extents, Extent{Size: b - a, Source: ArchiveSource(encoded), EncodedSize: encodedSize, Offset: a - raw})
+					extent := Extent{Size: b - a, Source: ArchiveSource(encoded), EncodedSize: encodedSize, Offset: a - raw}
+					entry.Extents = append(entry.Extents, extent)
+					extentBytes += extent.encodedLen()
 				}
-				if len(entry.Extents) > manifestExtentsMax {
-					return rejected("resource-limit", "entry extent maximum")
+				// Leave room for the array head and metadata; AddEntry checks the exact final size.
+				if w.options.Limits.MaxEntryBytes != 0 && uint64(extentBytes) > w.options.Limits.MaxEntryBytes {
+					return rejected("resource-limit", "entry size maximum")
 				}
 				if raw+decoded >= end {
 					break
@@ -331,5 +362,5 @@ func (w *EntryArchiveWriter) finish() (err error) {
 // Frames are independent and never exceed their target. A larger history
 // window cannot improve their compression and only reserves codec memory.
 func frameWindow(target int) int {
-	return max(1024, 1<<bits.Len(uint(target-1)))
+	return max(1024, 1<<min(30, bits.Len(uint(target-1))))
 }

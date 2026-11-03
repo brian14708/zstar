@@ -72,7 +72,7 @@ impl Header {
 /// Compression, metadata, and storage options for a [`Builder`].
 #[derive(Clone, Debug)]
 pub struct WriterOptions {
-    /// Decoded data-frame target: a multiple of 512 bytes from 512 bytes to 16 MiB.
+    /// Decoded data-frame target: at least 512 bytes, subject to manifest limits.
     pub frame_size: usize,
     /// Zstandard compression level; defaults to 3.
     pub compression_level: i32,
