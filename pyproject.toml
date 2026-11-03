@@ -1,5 +1,6 @@
 [dependency-groups]
 test = ["pyrefly>=1.4,<2", "pytest>=8", "fsspec[http]>=2026.9.0", "boto3>=1.34"]
+docs = ["griffe>=2.1,<3"]
 
 [tool.uv]
 python-preference = "only-system"

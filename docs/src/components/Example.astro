@@ -1,0 +1,26 @@
+---
+import { Code } from '@astrojs/starlight/components';
+
+interface Props {
+  source: string;
+  lang: string;
+  region?: string;
+}
+
+const { source, lang, region } = Astro.props;
+let excerpt = source;
+if (region) {
+  const start = new RegExp(`^.*(?:#|//) region ${region}\\r?\\n`, 'm');
+  const end = new RegExp(`^.*(?:#|//) endregion ${region}\\r?$`, 'm');
+  const afterStart = excerpt.split(start)[1];
+  if (afterStart === undefined || !end.test(afterStart)) {
+    throw new Error(`Missing example region: ${region}`);
+  }
+  excerpt = afterStart.split(end)[0];
+}
+const lines = excerpt.replace(/^\s*(?:#|\/\/) (?:end)?region \w+\r?\n/gm, '').trimEnd().split('\n');
+const indent = Math.min(...lines.filter((line) => line.trim()).map((line) => line.match(/^\s*/)![0].length));
+const code = lines.map((line) => line.slice(indent)).join('\n');
+---
+
+<Code code={code} lang={lang} />

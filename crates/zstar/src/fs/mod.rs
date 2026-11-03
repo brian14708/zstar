@@ -19,10 +19,11 @@ use crate::{Entry, EntryKind};
 use crate::{Error, RangeReader, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };

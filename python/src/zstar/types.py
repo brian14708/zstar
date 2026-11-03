@@ -30,7 +30,10 @@ __all__ = [
 CborValue: TypeAlias = (
     bool | int | str | bytes | list["CborValue"] | tuple["CborValue", ...] | dict[str, "CborValue"]
 )
+"""Recursive values accepted in archive and entry extension metadata."""
 ExtentTuple: TypeAlias = tuple[int, int | str, int] | tuple[int, int | str, int, int]
+"""Content extent: decoded size, source, encoded size, and optional decoded offset."""
+#: Entry metadata: path, type, mode, uid, gid, nanosecond mtime, and extents.
 EntryFields: TypeAlias = tuple[str, Literal[0, 2, 5], int, int, int, int, tuple[ExtentTuple, ...]]
 EntryTuple: TypeAlias = (
     EntryFields
@@ -38,6 +41,7 @@ EntryTuple: TypeAlias = (
         str, Literal[0, 2, 5], int, int, int, int, tuple[ExtentTuple, ...], dict[str, CborValue]
     ]
 )
+"""Lossless entry metadata, with an optional final attributes dictionary."""
 
 ErrorCategory: TypeAlias = Literal[
     "not-zstar",
@@ -58,6 +62,7 @@ ErrorCategory: TypeAlias = Literal[
     "resource-limit",
     "io",
 ]
+"""Stable archive and storage error categories reported by ZstarError.category."""
 
 
 class SeekableReader(Reader[bytes], Protocol):
@@ -99,12 +104,15 @@ class ProgressCallback(Protocol):
 
 
 class SignedRequest(TypedDict):
+    """Signed HTTP URL, optional headers, and expiry returned by a request provider."""
+
     url: str
     headers: NotRequired[dict[str, str]]
     expires_in: NotRequired[float]
 
 
 RequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], Awaitable[SignedRequest]]
+"""Async signer receiving an HTTP method and refresh flag, returning a signed request."""
 
 
 class Limits(TypedDict, total=False):
@@ -119,6 +127,8 @@ class Limits(TypedDict, total=False):
 
 
 class WriterOptions(TypedDict, total=False):
+    """Typed archive-writer keyword options for compression, buffering, and storage limits."""
+
     limits: Limits | None
     workers: int
     root_extensions: dict[str, CborValue] | None
@@ -131,6 +141,8 @@ class WriterOptions(TypedDict, total=False):
 
 
 class ManifestOptions(TypedDict, total=False):
+    """Shared metadata, memory, and validation budgets for archive readers."""
+
     limits: Limits | None
     memory_bytes: int
     max_encoded_bytes: int
@@ -143,12 +155,16 @@ class ManifestOptions(TypedDict, total=False):
 
 
 class ReaderOptions(ManifestOptions, total=False):
+    """Typed reader keyword options, including metadata budgets and external content resolution."""
+
     concurrent_chunks: int
     verify_external: bool
     resolver: ObjectResolver | None
 
 
 class ReadReport(TypedDict):
+    """Content and authentication checks performed while reading an archive member."""
+
     metadata_authenticated: bool
     full_archive_validated: bool
     data_frames_checked: list[int]
@@ -157,6 +173,8 @@ class ReadReport(TypedDict):
 
 
 class VerificationReport(TypedDict):
+    """Validation results and content counts returned by archive verification."""
+
     metadata_validated: bool
     full_archive_verified: bool
     tar_members_verified: bool

@@ -26,6 +26,8 @@ _T = TypeVar("_T")
 def _writer_call(operation: Callable[[], _T]) -> Awaitable[_T]: ...
 
 class ZstarError(ValueError):
+    """Archive or storage failure with a stable category for error handling."""
+
     category: ErrorCategory
 
 class MemberCursor:

@@ -1,5 +1,7 @@
 # Zstar
 
+**Compressed archives. Direct access.**
+
 Zstar is an indexed `.tar.zst` archive format for reading individual files and
 byte ranges without decompressing the entire archive. It combines independently
 compressed Zstandard frames with deterministic CBOR metadata. Archives can keep
@@ -33,5 +35,5 @@ nix develop
 just
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, individual checks,
-integration tests, and packaging.
+See [justfile](justfile) for lint, test, integration, and packaging recipes, and
+[docs/README.md](docs/README.md) for documentation builds and previews.

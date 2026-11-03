@@ -15,8 +15,7 @@ from typing import ClassVar
 import fsspec
 import pytest
 import zstar
-from zstar import ArchiveWriter, _native
-from zstar._fsspec import ZstarFileSystem
+from zstar import ArchiveWriter, ZstarFileSystem, _native
 
 
 def test_filesystem_reads_seeks_and_lists():

@@ -1,0 +1,80 @@
+---
+title: "Create your first archive with Python"
+---
+
+import Example from "../../../../components/Example.astro";
+import source from "../../../../../../python/examples/tutorial_file.py?raw";
+
+Create an archive containing a small text file, save it as `example.zstar`,
+and read it back. Then read just the first five bytes and check the archive for
+errors.
+
+The example creates the text for you, so you do not need any input files.
+`example.txt` is the file inside the archive; `example.zstar` is the archive
+saved in your current directory. Running the example again replaces it.
+
+## Set up
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then save
+the complete example below as `tutorial_file.py` and run:
+
+```sh
+uv run tutorial_file.py
+```
+
+The script declares Python 3.11 or later and its dependencies with PEP 723
+metadata. uv installs them in an isolated environment automatically.
+
+## Write the archive
+
+`ArchiveWriter.from_file()` opens the archive for writing. `write_bytes()` adds
+a file named `example.txt` with the text `Hello from Zstar` and a newline.
+Leaving the `with` block finishes writing the archive and closes it.
+
+<Example source={source} lang="python" region="create" />
+
+## Read a file and a byte range
+
+Reopen the archive with `Archive.from_file()`. `read()` returns all the bytes
+of `example.txt`. `read_range()` returns bytes from the start position up to,
+but not including, the end position: `0, 5` selects `Hello`.
+
+The assertions check that both reads return the expected text.
+
+<Example source={source} lang="python" region="read" />
+
+## Verify the archive
+
+`verify()` checks the entire archive for errors, including content you have
+not read. Call it inside the `with` block, before the reader closes.
+
+<Example source={source} lang="python" region="verify" />
+
+You should see:
+
+```text
+Hello from Zstar
+Hello
+Archive verified
+```
+
+## Complete example
+
+<details>
+<summary>Show the complete runnable example</summary>
+
+<Example source={source} lang="python" />
+
+</details>
+
+[View the source](https://github.com/brian14708/zstar/blob/main/python/examples/tutorial_file.py).
+If you have cloned the Zstar repository, run this from its root directory:
+
+```sh
+uv run python/examples/tutorial_file.py
+```
+
+## Next
+
+[Upload and read an S3 archive](/zstar/tutorials/python/s3/), or see
+[advanced usage](/zstar/guides/python/configuration/) for storage and resource limits.

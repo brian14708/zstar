@@ -106,7 +106,7 @@ def metadata(error: ZstarError) -> None:
 
 
 def filesystem() -> None:
-    from zstar._fsspec import ZstarFileSystem
+    from zstar import ZstarFileSystem
 
     fs = ZstarFileSystem(fo=Path("archive.zstar"), target_options={"auto_mkdir": False})
     assert_type(fs.modified("hello"), datetime)
@@ -114,7 +114,7 @@ def filesystem() -> None:
 
 
 async def async_filesystem() -> None:
-    from zstar._fsspec import ZstarFileSystem
+    from zstar import ZstarFileSystem
 
     fs = ZstarFileSystem(fo="archive.zstar", asynchronous=True)
     assert_type(await fs._info("hello"), FileInfo)
