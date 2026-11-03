@@ -10,16 +10,9 @@ pub enum DecodedBody {
     },
 }
 impl DecodedBody {
-    #[cfg(any(feature = "async", test))]
+    #[cfg(feature = "async")]
     pub(crate) fn from_vec(raw: Vec<u8>) -> Self {
-        #[cfg(feature = "async")]
-        {
-            Self::Async { raw: raw.into() }
-        }
-        #[cfg(not(feature = "async"))]
-        {
-            Self::Shared(raw.into())
-        }
+        Self::Async { raw: raw.into() }
     }
     pub(crate) fn compact(raw: Vec<u8>) -> Self {
         Self::Shared(raw.into())

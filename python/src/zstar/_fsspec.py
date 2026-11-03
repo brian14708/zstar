@@ -6,7 +6,7 @@ import asyncio
 import errno
 import io
 import posixpath
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -14,7 +14,7 @@ from os import PathLike, fspath
 from pathlib import Path
 from tarfile import TarInfo
 from types import TracebackType
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast, overload
+from typing import BinaryIO, Literal, TypedDict, cast, overload
 
 from fsspec.archive import AbstractArchiveFileSystem
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem, sync
@@ -26,6 +26,7 @@ from ._archive import AsyncArchive, _link_target
 from ._file import AsyncArchiveFile
 from ._fs_writer import _member_name, _StagedMember, _WriteSession
 from ._info import _nanoseconds
+from ._publication import _Publication
 from ._writer import _writer_call
 from .types import ProgressCallback, ReaderOptions, WriterOptions
 
@@ -127,35 +128,18 @@ class _ExternalObjects:
             if parent or self.fs.protocol == "dir":
                 self.fs.makedirs(parent, exist_ok=True)
             self._prepared = True
-        file = self.fs.open(path, "wb", autocommit=False)
+        publication = _Publication.open(self.fs, path, self.loop)
         try:
             position = 0
             while position < len(encoded):
-                count = file.write(memoryview(encoded)[position:])
+                count = publication.output.write(memoryview(encoded)[position:])
                 if not isinstance(count, int) or count <= 0 or count > len(encoded) - position:
                     raise OSError("invalid external object write count")
                 position += count
-            file.close()
-            commit = getattr(file, "commit", None)
-            if commit is not None:
-                commit()
         except BaseException as primary:
-            try:
-                discard = getattr(file, "discard", None)
-                if discard is not None:
-                    try:
-                        discard()
-                    finally:
-                        if isinstance(file, AbstractBufferedFile):
-                            file.forced = True
-                        file.close()
-                else:
-                    file.close()
-            except BaseException as cleanup:
-                raise BaseExceptionGroup(
-                    "operation and cleanup failed", [primary, cleanup]
-                ) from None
+            publication.finish(abort=True, errors=(primary,))
             raise
+        publication.finish()
         return len(encoded)
 
 
@@ -259,36 +243,6 @@ class _MemberFile(AbstractBufferedFile):
 
     def _fetch_range(self, start: int, end: int) -> bytes:
         return sync(self.fs.loop, self._stream._fetch_range, start, end)
-
-
-class _AsyncOutput(Protocol):
-    async def write(self, data: bytes, /) -> int: ...
-    async def close(self) -> None: ...
-
-
-class _SetMetadata(Protocol):
-    def __call__(self, path: str, /, **metadata: str) -> object: ...
-
-
-class _AsyncSetMetadata(Protocol):
-    async def __call__(self, path: str, /, **metadata: str) -> object: ...
-
-
-class _AsyncSink:
-    """Bridge native worker writes to a caller-supplied async backend."""
-
-    def __init__(self, stream: _AsyncOutput, loop: asyncio.AbstractEventLoop):
-        self.stream, self.loop = stream, loop
-
-    def write(self, data: Buffer) -> int:
-        return asyncio.run_coroutine_threadsafe(self.stream.write(bytes(data)), self.loop).result()
-
-    def flush(self) -> None:
-        # Async streamed backends flush buffered output when closed.
-        pass
-
-    def close(self) -> None:
-        asyncio.run_coroutine_threadsafe(self.stream.close(), self.loop).result()
 
 
 class _AsyncWriterMember:
@@ -527,59 +481,22 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         return _ExternalObjects(self.external, "", loop)
 
     def _new_write_session(self, loop: asyncio.AbstractEventLoop) -> _WriteSession:
-        commit: Callable[[], None] | None = None
-        discard: Callable[[], None] | None = None
-        after_commit: Callable[[], None] | None = None
         if isinstance(self.fo, (str, PathLike)):
             backend, path = self._backend(fspath(self.fo))
-            backend_async = bool(getattr(backend, "asynchronous", False))
-            setxattr = getattr(backend, "_setxattr" if backend_async else "setxattr", None)
-            if self._metadata and not callable(setxattr):
-                raise NotImplementedError(
-                    "metadata requires a backend with setxattr(), such as s3fs"
-                )
-            if backend_async:
-                stream = cast(
-                    _AsyncOutput,
-                    asyncio.run_coroutine_threadsafe(backend.open_async(path, "wb"), loop).result(),
-                )
-                output = cast(BinaryIO, _AsyncSink(stream, loop))
-            else:
-                output = cast(BinaryIO, backend.open(path, "wb", autocommit=False))
-                commit = getattr(output, "commit", None)
-                discard = getattr(output, "discard", None)
-            if self._metadata:
-
-                def update_metadata() -> None:
-                    if backend_async:
-                        async_setxattr = cast(_AsyncSetMetadata, setxattr)
-                        asyncio.run_coroutine_threadsafe(
-                            async_setxattr(path, **self._metadata), loop
-                        ).result()
-                    else:
-                        cast(_SetMetadata, setxattr)(path, **self._metadata)
-
-                after_commit = update_metadata
+            publication = _Publication.open(backend, path, loop, self._metadata)
         else:
-            output = self.fo
+            publication = _Publication(self.fo)
         try:
             external = self._external_store(loop) if self.external is not None else None
             return _WriteSession(
-                output,
+                publication,
                 self.member_spool_bytes,
                 self._writer_options,
-                commit,
-                discard,
-                after_commit,
                 external=external.put_encoded if external is not None else None,
                 external_threshold=self.external_threshold,
             )
-        except BaseException:
-            try:
-                output.close()
-            finally:
-                if discard is not None:
-                    discard()
+        except BaseException as primary:
+            publication.finish(abort=True, errors=(primary,))
             raise
 
     async def _load_writer(self) -> _WriteSession:

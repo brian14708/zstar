@@ -179,6 +179,48 @@ def test_abort_preserves_existing_archive_and_discards_staging(tmp_path):
     assert path.read_bytes() == b"original"
 
 
+@pytest.mark.parametrize("external", [False, True], ids=["archive", "external-object"])
+def test_publication_preserves_commit_and_cleanup_errors(tmp_path, external):
+    commit_error = OSError("commit failed")
+    cleanup_error = OSError("discard failed")
+
+    class BrokenPublication(LocalFileSystem):
+        def _open(self, *args, **kwargs):
+            output = super()._open(*args, **kwargs)
+            discard = output.discard
+
+            def fail_commit():
+                raise commit_error
+
+            def fail_discard():
+                discard()
+                raise cleanup_error
+
+            output.commit, output.discard = fail_commit, fail_discard
+            return output
+
+    backend = BrokenPublication(skip_instance_cache=True)
+    path = tmp_path / "archive"
+    path.write_bytes(b"original")
+    objects = fsspec.filesystem("dir", path=str(tmp_path / "objects"), fs=backend)
+    with (
+        pytest.raises(zstar.ZstarError if external else ExceptionGroup) as caught,
+        ZstarFileSystem(
+            fo=path,
+            fs=None if external else backend,
+            mode="w",
+            external=objects if external else None,
+            external_threshold=0,
+        ) as fs,
+    ):
+        fs.pipe_file("data", b"hello")
+    failure = caught.value.__cause__ if external else caught.value
+    assert isinstance(failure, ExceptionGroup)
+    assert failure.exceptions == (commit_error, cleanup_error)
+    assert path.read_bytes() == b"original"
+    assert not list((tmp_path / "objects").glob("*.zst"))
+
+
 def test_staging_close_failure_still_discards_archive(tmp_path, monkeypatch):
     class BrokenClose(io.BytesIO):
         def close(self):

@@ -227,8 +227,8 @@ async fn packs_deduplicate_coalesce_and_reconstruct_unchanged_v1() {
     assert_eq!(&reader.read("payload").await.unwrap()[..], expected);
     assert_eq!(
         store.gets.load(Ordering::SeqCst) - before,
-        1,
-        "the archive miss plan must reach the packed resolver"
+        catalog.chunks().len(),
+        "each distinct selected object is fetched once"
     );
     let mut cursor = reader.open_cursor("payload").await.unwrap();
     let before = store.gets.load(Ordering::SeqCst);
@@ -241,8 +241,8 @@ async fn packs_deduplicate_coalesce_and_reconstruct_unchanged_v1() {
     );
     assert_eq!(
         store.gets.load(Ordering::SeqCst) - before,
-        1,
-        "member reads must also communicate multiple-frame plans"
+        catalog.chunks().len(),
+        "member reads fetch each distinct selected object once"
     );
     let mut reused =
         PackWriter::new(store.clone(), catalog.clone(), PackWriterOptions::default()).unwrap();
@@ -700,47 +700,6 @@ async fn repacking_changes_storage_without_changing_v1_references() {
         .unwrap();
         assert_eq!(archive.read("file").await.unwrap(), raw);
     }
-}
-
-#[tokio::test]
-async fn reader_windows_preserve_physical_pack_order() {
-    let store = Arc::new(Memory::default());
-    let mut writer = PackWriter::new(
-        store.clone(),
-        Catalog::default(),
-        PackWriterOptions::default(),
-    )
-    .unwrap();
-    let mut entry = Entry::file("ordered");
-    let mut expected = Vec::new();
-    for n in 0..32 {
-        let data = vec![n; 1024];
-        expected.extend_from_slice(&data);
-        entry
-            .extents
-            .push(writer.put_chunk(Bytes::from(data)).await.unwrap());
-    }
-    let catalog = writer.finish().await.unwrap();
-    let resolver = Arc::new(
-        PackedObjectResolver::new(store.clone(), catalog, ResolverOptions::default()).unwrap(),
-    );
-    let mut builder = zstar::backend::BlockingBuilder::new(Vec::new()).unwrap();
-    builder.add_metadata(entry).unwrap();
-    let archive = zstar::Archive::open_with_options(
-        Arc::new(Bytes::from(builder.finish().unwrap())),
-        zstar::ReaderOptions {
-            resolver: Some(resolver),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(archive.read("ordered").await.unwrap(), expected);
-    assert_eq!(
-        store.gets.load(Ordering::SeqCst),
-        4,
-        "32 adjacent frames in four bounded decode windows"
-    );
 }
 
 #[cfg(feature = "fs")]

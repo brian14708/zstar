@@ -24,7 +24,7 @@ pub trait ObjectResolver: Send + Sync {
     /// `hint` is an advisory encoded size, not a decoded-size bound. Return
     /// [`Error::MissingObject`] if the object is unavailable.
     async fn get_encoded(&self, address: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes>;
-    /// Optional planning capability. The fallback preserves existing resolver APIs.
+    /// Whether this resolver supports optimized explicit batch requests.
     fn supports_batch(&self) -> bool {
         false
     }
@@ -32,8 +32,8 @@ pub trait ObjectResolver: Send + Sync {
     fn encoded_length(&self, _address: [u8; 32]) -> Option<u64> {
         None
     }
-    /// Optional immutable physical ordering for bounded reader miss windows.
-    /// The token groups one pack; offsets locate frames only for planning.
+    /// Optional immutable physical location for callers planning explicit batches.
+    /// The token groups one pack; offsets locate frames within that pack.
     fn encoded_location(&self, _address: [u8; 32]) -> Option<([u8; 32], u64)> {
         None
     }
@@ -48,7 +48,7 @@ pub trait ObjectResolver: Send + Sync {
         Ok(output)
     }
 }
-/// One complete encoded object requested by a reader miss plan.
+/// One complete encoded object requested in an explicit resolver batch.
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectRequest {
     pub address: [u8; 32],
@@ -734,33 +734,21 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub(crate) fn owns_cursor(&self, owner: &std::sync::Weak<ManifestReader>) -> bool {
         std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&self.manifest))
     }
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "Explicit branches keep validation and state transitions readable."
+    )]
     pub(crate) async fn content(
         &self,
         key: &Key,
         hint: u64,
         resolver: Option<&dyn ObjectResolver>,
     ) -> Result<Bytes> {
-        self.content_prefetched(key, hint, resolver, None).await
-    }
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "Explicit branches keep validation and state transitions readable."
-    )]
-    async fn content_prefetched(
-        &self,
-        key: &Key,
-        hint: u64,
-        resolver: Option<&dyn ObjectResolver>,
-        encoded: Option<Bytes>,
-    ) -> Result<Bytes> {
         // Per-call resolvers have no stable namespace. Unchecked objects may
         // share a group within a batch, but cannot share retained bytes or a
         // flight with another operation's resolver.
         if matches!(key, Key::Object(_)) && !self.options.verify_external {
-            return Ok(self
-                .load_content(key, hint, resolver, encoded)
-                .await?
-                .into_bytes());
+            return Ok(self.load_content(key, hint, resolver).await?.into_bytes());
         }
         let flight = {
             let mut flights = self.flights.lock().unwrap();
@@ -790,7 +778,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         if let Some(error) = flight.failure.lock().unwrap().as_ref() {
             return Err(error.duplicate());
         }
-        let raw = match self.load_content(key, hint, resolver, encoded).await {
+        let raw = match self.load_content(key, hint, resolver).await {
             Ok(raw) => raw,
             Err(error) => {
                 // Object keys depend on each caller's resolver, so only
@@ -809,7 +797,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         key: &Key,
         hint: u64,
         resolver: Option<&dyn ObjectResolver>,
-        prefetched: Option<Bytes>,
     ) -> Result<DecodedBody> {
         let permit = self
             .semaphore
@@ -817,26 +804,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .acquire_owned()
             .await
             .map_err(|_| Error::Unsupported("reader closed"))?;
-        let encoded = if let Some(encoded) = prefetched {
-            encoded
-        } else {
-            match key {
-                Key::Archive(at, size) => {
-                    let encoded = self
-                        .source
-                        .read_range(*at..at.checked_add(*size).ok_or(Error::Range)?)
-                        .await?;
-                    if encoded.len() as u64 != *size {
-                        return Err(Error::MalformedFrame("short archive frame".into()));
-                    }
-                    encoded
+        let encoded = match key {
+            Key::Archive(at, size) => {
+                let encoded = self
+                    .source
+                    .read_range(*at..at.checked_add(*size).ok_or(Error::Range)?)
+                    .await?;
+                if encoded.len() as u64 != *size {
+                    return Err(Error::MalformedFrame("short archive frame".into()));
                 }
-                Key::Object(hash) => {
-                    resolver
-                        .ok_or(Error::Unsupported("external read requires resolver"))?
-                        .get_encoded(*hash, hint, ENCODED_FRAME_MAX)
-                        .await?
-                }
+                encoded
+            }
+            Key::Object(hash) => {
+                resolver
+                    .ok_or(Error::Unsupported("external read requires resolver"))?
+                    .get_encoded(*hash, hint, ENCODED_FRAME_MAX)
+                    .await?
             }
         };
         let key_copy = key.clone();
@@ -877,6 +860,28 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             )
         })
         .await
+    }
+    // Handles already own authenticated metadata; do not look up their paths
+    // again when a logical selection crosses extent boundaries.
+    pub(crate) fn read_entry_range(
+        &self,
+        entry: &Entry,
+        ends: &[u64],
+        offset: u64,
+        length: u64,
+    ) -> impl std::future::Future<Output = Result<Bytes>> + Send + use<R> {
+        let plan = build_plan(
+            std::iter::once((entry.path.as_str(), offset, length)),
+            self.max_read_bytes(),
+            |_| Ok(Some((entry, ends))),
+        );
+        let archive = self.clone();
+        async move {
+            let mut outputs = archive
+                .execute_plan(plan?, archive.resolver(), None)
+                .await?;
+            Ok(outputs.pop().unwrap())
+        }
     }
     #[doc(hidden)]
     pub async fn read_range_with_resolver(
@@ -993,163 +998,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .iter()
             .map(|size| BytesMut::zeroed(*size))
             .collect();
-        let mut groups: Vec<_> = plan.groups.into_iter().collect();
-        // Hash ordering scatters otherwise adjacent frames across miss windows.
-        // Keep physical neighbors together without widening decode admission.
-        groups.sort_by_cached_key(|(key, _)| match key {
-            Key::Archive(offset, _) => (0, [0; 32], *offset, key.clone()),
-            Key::Object(address) => resolver
-                .and_then(|r| r.encoded_location(*address))
-                .map_or_else(
-                    || (2, [0; 32], 0, key.clone()),
-                    |(pack, offset)| (1, pack, offset, key.clone()),
-                ),
-        });
-        let mut groups = groups.into_iter();
-        loop {
-            let window: Vec<_> = groups
-                .by_ref()
-                .take(self.options.concurrent_chunks)
-                .collect();
-            if window.is_empty() {
-                break;
+        let mut jobs = stream::iter(plan.groups.into_iter().map(|(key, group)| async move {
+            let raw = self.content(&key, group.hint, resolver).await?;
+            for copy in &group.copies {
+                validate_copy(copy, raw.len())?;
             }
-            let mut encoded = self.prefetch_window(&window, resolver).await?;
-            let mut jobs = stream::iter(window.into_iter().map(|(key, group)| {
-                let bytes = encoded.remove(&key);
-                async move {
-                    let raw = self
-                        .content_prefetched(&key, group.hint, resolver, bytes)
-                        .await?;
-                    for copy in &group.copies {
-                        validate_copy(copy, raw.len())?;
-                    }
-                    Ok::<_, Error>((key, group, raw))
-                }
-            }))
-            .buffer_unordered(self.options.concurrent_chunks);
-            while let Some(job) = jobs.next().await {
-                let (key, group, raw) = job?;
-                record(report.as_deref_mut(), &key, self.options.verify_external);
-                for copy in group.copies {
-                    outputs[copy.output][copy.destination].copy_from_slice(&raw[copy.source]);
-                }
+            Ok::<_, Error>((key, group, raw))
+        }))
+        .buffer_unordered(self.options.concurrent_chunks);
+        while let Some(job) = jobs.next().await {
+            let (key, group, raw) = job?;
+            record(report.as_deref_mut(), &key, self.options.verify_external);
+            for copy in group.copies {
+                outputs[copy.output][copy.destination].copy_from_slice(&raw[copy.source]);
             }
         }
         Ok(outputs.into_iter().map(BytesMut::freeze).collect())
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-    )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep the ordered validation or protocol operation together."
-    )]
-    async fn prefetch_window(
-        &self,
-        window: &[(Key, Group)],
-        resolver: Option<&dyn ObjectResolver>,
-    ) -> Result<BTreeMap<Key, Bytes>> {
-        let mut output = BTreeMap::new();
-        let missing: Vec<_> = window
-            .iter()
-            .filter(|(key, _)| {
-                self.flights
-                    .lock()
-                    .unwrap()
-                    .get(key)
-                    .and_then(Weak::upgrade)
-                    .is_none()
-            })
-            .collect();
-        let mut cursor = 0;
-        while cursor < missing.len() {
-            let Key::Archive(start, size) = missing[cursor].0 else {
-                break;
-            };
-            let first = cursor;
-            let mut end = start + size;
-            cursor += 1;
-            while cursor < missing.len() {
-                if let Key::Archive(offset, length) = missing[cursor].0
-                    && offset == end
-                    && offset + length - start <= 8 << 20
-                {
-                    end += length;
-                    cursor += 1;
-                } else {
-                    break;
-                }
-            }
-            if cursor - first > 1 {
-                let _permit = self
-                    .semaphore
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::Unsupported("reader closed"))?;
-                let bytes = self.source.read_range(start..end).await?;
-                if bytes.len() as u64 != end - start {
-                    return Err(Error::MalformedFrame(
-                        "short coalesced archive range".into(),
-                    ));
-                }
-                for (key, _) in &missing[first..cursor] {
-                    let Key::Archive(offset, length) = key else {
-                        unreachable!()
-                    };
-                    output.insert(
-                        key.clone(),
-                        Bytes::copy_from_slice(
-                            &bytes[(offset - start) as usize..(offset - start + length) as usize],
-                        ),
-                    );
-                }
-            }
-        }
-        if let Some(resolver) = resolver.filter(|resolver| resolver.supports_batch()) {
-            let requests: Vec<_> = missing
-                .iter()
-                .filter_map(|(key, group)| {
-                    if let Key::Object(address) = key {
-                        Some(ObjectRequest {
-                            address: *address,
-                            hint: group.hint,
-                            max_bytes: ENCODED_FRAME_MAX,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let size = requests.iter().try_fold(0_u64, |sum, request| {
-                sum.checked_add(
-                    resolver
-                        .encoded_length(request.address)
-                        .unwrap_or(request.max_bytes),
-                )
-            });
-            if requests.len() > 1 && size.is_some_and(|size| size <= 64 << 20) {
-                let _permit = self
-                    .semaphore
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::Unsupported("reader closed"))?;
-                let bytes = resolver.get_encoded_many(&requests).await?;
-                if bytes.len() != requests.len() {
-                    return Err(Error::MalformedExternalContent(
-                        "batch resolver result count".into(),
-                    ));
-                }
-                for (request, bytes) in requests.iter().zip(bytes) {
-                    if bytes.len() as u64 > request.max_bytes {
-                        return Err(Error::Budget("encoded batch resolver output"));
-                    }
-                    output.insert(Key::Object(request.address), bytes);
-                }
-            }
-        }
-        Ok(output)
     }
 }
 #[expect(

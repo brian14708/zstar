@@ -134,6 +134,41 @@ async fn handles_seek_across_frames_and_survive_archive_drop() {
 }
 
 #[tokio::test]
+async fn standalone_cursors_read_retained_entries_across_extents() {
+    let archive = Archive::from_bytes(fixture().await).await.unwrap();
+    let mut entry = archive.entry("dir/file").await.unwrap().unwrap();
+    // Reads must use the retained entry even when its path is not indexed.
+    entry.path = "retained-entry".into();
+    let mut cursor = zstar::FileCursor::new(entry).unwrap();
+    let expected = payload();
+    for (offset, length) in [(0, 1), (500, 2048), (1000, 6000), (8190, 3), (8193, 0)] {
+        assert_eq!(
+            cursor
+                .read(&archive, offset as u64, length as u64)
+                .await
+                .unwrap(),
+            expected[offset..offset + length]
+        );
+    }
+    assert!(matches!(
+        cursor.read(&archive, 8193, 1).await,
+        Err(Error::Range)
+    ));
+}
+
+#[tokio::test]
+async fn archive_cursors_reject_other_archives() {
+    let bytes = fixture().await;
+    let archive = Archive::from_bytes(bytes.clone()).await.unwrap();
+    let other = Archive::from_bytes(bytes).await.unwrap();
+    let mut cursor = archive.open_cursor("dir/file").await.unwrap();
+    assert!(matches!(
+        cursor.read(&other, 0, 1).await,
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[tokio::test]
 async fn owned_stream_combinators_and_large_seek_indexes() {
     let bytes = payload().repeat(16);
     let mut builder = Builder::with_options(
@@ -466,6 +501,67 @@ impl AsyncRangeReader for StalledSource {
         }
         self.bytes.read_range(range).await
     }
+}
+
+#[tokio::test]
+async fn cancelled_cursor_reads_and_stream_seeks_release_pending_io() {
+    let source = Arc::new(StalledSource {
+        bytes: fixture().await,
+        stall: AtomicBool::new(false),
+        started: Notify::new(),
+        dropped: Arc::new(Notify::new()),
+    });
+    let archive = Archive::open_with_options(
+        source.clone(),
+        ReaderOptions {
+            concurrent_chunks: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut cursor = archive.open_cursor("dir/file").await.unwrap();
+    let mut file = archive.open_file("dir/file").await.unwrap();
+    source.stall.store(true, Ordering::SeqCst);
+    {
+        let read = cursor.read(&archive, 500, 2048);
+        tokio::pin!(read);
+        timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut read => panic!("stalled cursor completed: {result:?}"),
+                () = source.started.notified() => {}
+            }
+        })
+        .await
+        .unwrap();
+    }
+    timeout(Duration::from_secs(2), source.dropped.notified())
+        .await
+        .unwrap();
+    let mut output = [0; 100];
+    timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = file.read(&mut output) => panic!("stalled stream completed: {result:?}"),
+            () = source.started.notified() => {}
+        }
+    })
+    .await
+    .unwrap();
+    // Seeking drops pending I/O before reading from the new position.
+    file.seek(SeekFrom::Start(1000)).await.unwrap();
+    timeout(Duration::from_secs(2), source.dropped.notified())
+        .await
+        .unwrap();
+    source.stall.store(false, Ordering::SeqCst);
+    timeout(Duration::from_secs(2), file.read_exact(&mut output))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output, payload()[1000..1100]);
+    assert_eq!(
+        cursor.read(&archive, 500, 2048).await.unwrap(),
+        payload()[500..2548]
+    );
 }
 
 #[tokio::test]

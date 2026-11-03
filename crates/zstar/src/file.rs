@@ -10,13 +10,86 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 type Load = Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>;
 
+// Immutable entry metadata and extent interpretation shared by both handles.
+// Logical stream position and pending I/O remain with File.
+struct FileSelection {
+    entry: Entry,
+    ends: Vec<u64>,
+    size: u64,
+}
+impl FileSelection {
+    fn new(entry: Entry) -> Result<Self> {
+        let size = entry.size()?;
+        let mut ends = Vec::new();
+        ends.try_reserve_exact(entry.extents.len())
+            .map_err(|_| Error::Budget("file cursor index"))?;
+        let mut position = 0_u64;
+        for extent in &entry.extents {
+            position = position.checked_add(extent.size).ok_or(Error::Range)?;
+            ends.push(position);
+        }
+        Ok(Self { entry, ends, size })
+    }
+
+    fn extent_index(&self, offset: u64) -> usize {
+        self.ends.partition_point(|end| *end <= offset)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
+    )]
+    fn read<R: AsyncRangeReader + ?Sized + 'static>(
+        &self,
+        archive: &Archive<R>,
+        offset: u64,
+        length: u64,
+    ) -> Load {
+        // Prepare synchronously so the pending future owns only its selected
+        // extent or read plan, without cloning the handle's complete metadata.
+        let prepared = (|| -> Result<Load> {
+            crate::checked_range(offset, length, self.size)?;
+            if length > archive.max_read_bytes() {
+                return Err(Error::Budget("returned read size"));
+            }
+            let length =
+                usize::try_from(length).map_err(|_| Error::Budget("returned read size"))?;
+            if length == 0 {
+                return Ok(Box::pin(std::future::ready(Ok(Bytes::new()))));
+            }
+            let index = self.extent_index(offset);
+            let first = &self.entry.extents[index];
+            let start = if index == 0 { 0 } else { self.ends[index - 1] };
+            let within = offset - start;
+            if length as u64 > first.size - within {
+                // Plan from retained metadata, preserving bounded batch execution.
+                return Ok(Box::pin(archive.read_entry_range(
+                    &self.entry,
+                    &self.ends,
+                    offset,
+                    length as u64,
+                )));
+            }
+            let extent = first.clone();
+            let archive = archive.clone();
+            Ok(Box::pin(async move {
+                let raw = archive
+                    .content(&Key::of(&extent), extent.encoded_size, archive.resolver())
+                    .await?;
+                crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
+                let start = (extent.offset + within) as usize;
+                Ok(raw.slice(start..start + length))
+            }))
+        })();
+        prepared.unwrap_or_else(|error| Box::pin(std::future::ready(Err(error))))
+    }
+}
+
 /// Reusable random-access member cursor retaining owned metadata.
 /// The caller supplies the live archive for each operation.
 pub struct FileCursor {
     pub(crate) owner: Option<std::sync::Weak<crate::ManifestReader>>,
-    entry: Entry,
-    starts: Vec<u64>,
-    size: u64,
+    selection: FileSelection,
 }
 impl FileCursor {
     #[expect(
@@ -27,28 +100,12 @@ impl FileCursor {
         if entry.kind != EntryKind::File {
             return Err(Error::Unsupported("entry is not a file"));
         }
-        let size = entry.size()?;
-        let mut starts = Vec::new();
-        starts
-            .try_reserve_exact(entry.extents.len())
-            .map_err(|_| Error::Budget("file cursor index"))?;
-        let mut position = 0_u64;
-        for extent in &entry.extents {
-            starts.push(position);
-            position = position.checked_add(extent.size).ok_or(Error::Range)?;
-        }
         Ok(Self {
             owner: None,
-            entry,
-            starts,
-            size,
+            selection: FileSelection::new(entry)?,
         })
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-    )]
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
@@ -68,40 +125,7 @@ impl FileCursor {
         {
             return Err(Error::Unsupported("cursor belongs to another archive"));
         }
-        crate::checked_range(offset, length, self.size)?;
-        if length > archive.max_read_bytes() {
-            return Err(Error::Budget("returned read size"));
-        }
-        let length = usize::try_from(length).map_err(|_| Error::Budget("returned read size"))?;
-        if length == 0 {
-            return Ok(Bytes::new());
-        }
-        let index = self
-            .starts
-            .partition_point(|start| *start <= offset)
-            .saturating_sub(1);
-        let first = &self.entry.extents[index];
-        let within = offset - self.starts[index];
-        if length as u64 > first.size - within {
-            // A multi-frame request communicates its complete miss plan, so
-            // packed and adjacent archive frames can share bounded range GETs.
-            return archive
-                .read_range_with_resolver(
-                    &self.entry.path,
-                    offset,
-                    length as u64,
-                    archive.resolver(),
-                )
-                .await;
-        }
-        let key = Key::of(first);
-        let raw = archive
-            .content(&key, first.encoded_size, archive.resolver())
-            .await?;
-        crate::checked_range(first.offset, first.size, raw.len() as u64)?;
-        let start = (first.offset + within) as usize;
-        // Share the validated single chunk for bounded readinto operations.
-        Ok(raw.slice(start..start + length))
+        self.selection.read(archive, offset, length).await
     }
 }
 
@@ -115,26 +139,16 @@ impl FileCursor {
 /// pending source I/O. Completed reads do not retain decoded content.
 pub struct File<R: AsyncRangeReader + ?Sized> {
     archive: Archive<R>,
-    entry: Entry,
-    size: u64,
-    starts: Vec<u64>,
+    selection: FileSelection,
     position: u64,
     pending: Option<(u64, Load)>,
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     pub(crate) fn new(archive: Archive<R>, entry: Entry) -> Result<Self> {
-        let size = entry.size()?;
-        let mut starts = Vec::with_capacity(entry.extents.len());
-        let mut at = 0_u64;
-        for extent in &entry.extents {
-            starts.push(at);
-            at = at.checked_add(extent.size).ok_or(Error::Range)?;
-        }
+        let selection = FileSelection::new(entry)?;
         Ok(Self {
             archive,
-            entry,
-            size,
-            starts,
+            selection,
             position: 0,
             pending: None,
         })
@@ -142,22 +156,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     /// Returns the archive-relative path.
     #[must_use]
     pub fn path(&self) -> &str {
-        &self.entry.path
+        &self.selection.entry.path
     }
     /// Returns the logical payload length in bytes.
     #[must_use]
     pub const fn size(&self) -> u64 {
-        self.size
+        self.selection.size
     }
     /// Returns the entry kind.
     #[must_use]
     pub const fn kind(&self) -> EntryKind {
-        self.entry.kind
+        self.selection.entry.kind
     }
     /// Borrows the entry's immutable metadata and extents.
     #[must_use]
     pub const fn metadata(&self) -> &Entry {
-        &self.entry
+        &self.selection.entry
     }
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
@@ -171,32 +185,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.entry.kind != EntryKind::File {
+        if this.selection.entry.kind != EntryKind::File {
             return Poll::Ready(Err(io::Error::from(Error::Unsupported(
                 "entry is not a file",
             ))));
         }
-        if buffer.remaining() == 0 || this.position >= this.size {
+        if buffer.remaining() == 0 || this.position >= this.selection.size {
             return Poll::Ready(Ok(()));
         }
-        let index = this
-            .starts
-            .partition_point(|start| *start <= this.position)
-            .saturating_sub(1);
         if this.pending.is_none() {
             let start = this.position;
-            let extent = &this.entry.extents[index];
-            let end = this.starts[index] + extent.size;
+            let index = this.selection.extent_index(start);
+            let end = this.selection.ends[index];
             let length = (end - start)
                 .min(this.archive.max_read_bytes())
                 .min(buffer.remaining() as u64);
-            let archive = this.archive.clone();
-            let path = this.entry.path.clone();
-            let future = Box::pin(async move {
-                archive
-                    .read_range_with_resolver(&path, start, length, archive.resolver())
-                    .await
-            });
+            let future = this.selection.read(&this.archive, start, length);
             this.pending = Some((start, future));
         }
         let (start, future) = this.pending.as_mut().unwrap();
@@ -222,7 +226,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncSeek for File<R> {
         let this = self.get_mut();
         let position = match seek {
             SeekFrom::Start(position) => i128::from(position),
-            SeekFrom::End(offset) => i128::from(this.size) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(this.selection.size) + i128::from(offset),
             SeekFrom::Current(offset) => i128::from(this.position) + i128::from(offset),
         };
         this.position = u64::try_from(position).map_err(|_| {
