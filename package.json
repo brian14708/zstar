@@ -1,0 +1,5 @@
+{
+  "name": "zstar-workspace",
+  "private": true,
+  "packageManager": "pnpm@12.9.0"
+}

@@ -10,7 +10,7 @@ import pytest
 import zstar
 from fsspec.asyn import AsyncFileSystem
 from fsspec.implementations.local import LocalFileSystem
-from zstar._fsspec import ZstarFileSystem
+from zstar import ZstarFileSystem
 
 
 def test_write_text_seek_directories_and_round_trip(tmp_path):

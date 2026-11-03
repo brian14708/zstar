@@ -10,3 +10,8 @@ dist/
 /.venv
 /target
 /python/src/zstar/*.so
+node_modules/
+/docs/.astro/
+/docs/src/content/docs/reference/spec.md
+/docs/src/content/docs/sdks/
+/docs/.cache/

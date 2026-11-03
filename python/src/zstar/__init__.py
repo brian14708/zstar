@@ -12,6 +12,7 @@ except ModuleNotFoundError as exc:
 
 from ._archive import Archive as Archive
 from ._archive import AsyncArchive as AsyncArchive
+from ._fsspec import ZstarFileSystem as ZstarFileSystem
 from ._writer import ArchiveWriter as ArchiveWriter
 from ._writer import AsyncArchiveWriter as AsyncArchiveWriter
 
@@ -21,4 +22,5 @@ __all__ = [
     "AsyncArchive",
     "AsyncArchiveWriter",
     "ZstarError",
+    "ZstarFileSystem",
 ]

@@ -1,0 +1,90 @@
+---
+title: "Create your first archive with Rust"
+---
+
+import Example from "../../../../components/Example.astro";
+import source from "../../../../../../crates/zstar/examples/tutorial_file.rs?raw";
+
+Create an archive containing a small text file, save it as `example.zstar`,
+and read it back. Then read just the first five bytes and check the archive for
+errors.
+
+The example creates the text for you, so you do not need any input files.
+`example.txt` is the file inside the archive; `example.zstar` is the archive
+saved in your current directory. Running the example again replaces it.
+
+## Set up
+
+Create a Rust project:
+
+```sh
+cargo new zstar-tutorial
+cd zstar-tutorial
+```
+
+Replace the empty `[dependencies]` section in `Cargo.toml` with:
+
+```toml
+[dependencies]
+zstar = { version = "0", features = ["fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+```
+
+Replace `src/main.rs` with the complete example below and run `cargo run`.
+
+## Write the archive
+
+`File::create()` opens `example.zstar` for writing. `append_bytes()` adds a
+file named `example.txt` with the text `Hello from Zstar` and a newline.
+`finish()` completes the archive, including the index used to locate files.
+Drop the returned file handle to close it before reading.
+
+<Example source={source} lang="rust" region="create" />
+
+## Read a file and a byte range
+
+Reopen `example.zstar` with `AsyncLocalFileSource` and pass it to `Archive::open`.
+The source lets Zstar read the parts of the file it needs.
+
+`read()` returns all the bytes of `example.txt`. `read_range()` takes a Rust
+range: `0..5` selects bytes 0 through 4, giving `Hello`. The assertions check
+that both reads return the expected text.
+
+<Example source={source} lang="rust" region="read" />
+
+## Verify the archive
+
+`verify(VerificationScope::Archive)` checks the entire archive for errors,
+including content you have not read. Rust closes the reader when it goes out
+of scope.
+
+<Example source={source} lang="rust" region="verify" />
+
+You should see:
+
+```text
+Hello from Zstar
+Hello
+Archive verified
+```
+
+## Complete example
+
+<details>
+<summary>Show the complete runnable example</summary>
+
+<Example source={source} lang="rust" />
+
+</details>
+
+[View the source](https://github.com/brian14708/zstar/blob/main/crates/zstar/examples/tutorial_file.rs).
+If you have cloned the Zstar repository, run this from its root directory:
+
+```sh
+cargo run --locked -p zstar --features fs --example tutorial_file
+```
+
+## Next
+
+[Upload and read an S3 archive](/zstar/tutorials/rust/s3/), or see
+[advanced usage](/zstar/guides/rust/configuration/) for storage and resource limits.

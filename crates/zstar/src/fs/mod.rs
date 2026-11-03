@@ -19,10 +19,11 @@ use crate::{Entry, EntryKind};
 use crate::{Error, RangeReader, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -824,6 +825,11 @@ fn extract_into<R: RangeReader>(
     Ok(report)
 }
 #[cfg(not(unix))]
+/// Extract an archive and report metadata application failures.
+///
+/// # Errors
+///
+/// Always returns an error because extraction requires a Unix filesystem.
 pub fn extract_with_report<R: RangeReader>(
     _: &mut BlockingArchive<R>,
     _: &Path,
@@ -1302,7 +1308,7 @@ fn permissions(meta: &cap_std::fs::Metadata) -> u64 {
     u64::from(meta.permissions().mode() & 0o7777)
 }
 #[cfg(not(unix))]
-fn permissions(_: &cap_std::fs::Metadata) -> u64 {
+const fn permissions(_: &cap_std::fs::Metadata) -> u64 {
     0o644
 }
 
