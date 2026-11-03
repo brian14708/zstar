@@ -37,7 +37,7 @@ func (c *manifestTarCursor) nextFrame() error {
 		return err
 	}
 	if binary.LittleEndian.Uint32(encoded) != 0xFD2FB528 || encoded[4]&4 == 0 {
-		return rejected("malformed-frame", "data frame magic or missing checksum")
+		return rejected(CategoryMalformedFrame, "data frame magic or missing checksum")
 	}
 	fd := encoded[4]
 	single := fd&32 != 0
@@ -62,10 +62,10 @@ func (c *manifestTarCursor) nextFrame() error {
 		block := uint32(h[0]) | uint32(h[1])<<8 | uint32(h[2])<<16
 		kind, size := (block>>1)&3, uint64(block>>3)
 		if kind == 3 {
-			return rejected("malformed-frame", "reserved block type")
+			return rejected(CategoryMalformedFrame, "reserved block type")
 		}
 		if size > 128<<10 {
-			return rejected("malformed-frame", "block size limit")
+			return rejected(CategoryMalformedFrame, "block size limit")
 		}
 		if kind == 1 {
 			size = 1
@@ -89,10 +89,10 @@ func (c *manifestTarCursor) nextFrame() error {
 	encoded = append(encoded, checksum...)
 	raw, err := c.decoder.decode(encoded, 0, addressLimit(c.limits.MaxFrameDecodedBytes), addressLimit(c.limits.MaxFrameEncodedBytes))
 	if err != nil {
-		return categorized("malformed-frame", err)
+		return categorized(CategoryMalformedFrame, err)
 	}
 	if len(raw) == 0 {
-		return rejected("malformed-frame", "empty data frame")
+		return rejected(CategoryMalformedFrame, "empty data frame")
 	}
 	c.raw, c.at = raw, 0
 	c.frameSize = uint64(len(encoded))
@@ -125,7 +125,7 @@ func (c *manifestTarCursor) consume(size uint64, visit func([]byte, uint64, uint
 
 func (c *manifestTarCursor) take(size uint64) ([]byte, error) {
 	if size > uint64(^uint(0)>>1) {
-		return nil, rejected("resource-limit", "tar payload exceeds address space")
+		return nil, rejected(CategoryResourceLimit, "tar payload exceeds address space")
 	}
 	// A tar/PAX length is untrusted; grow only as physical payload arrives.
 	out := make([]byte, 0, int(min(size, 64<<10)))
@@ -278,7 +278,7 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 			report = ArchiveReport{}
 		}
 	}()
-	c := manifestTarCursor{limits: m.spool.options.Limits, decoder: frameDecoder{limits: m.spool.options.Limits}, input: manifestRangeStream{ctx: ctx, source: m.source, end: m.start, category: "malformed-frame", readAhead: m.readAhead}}
+	c := manifestTarCursor{limits: m.spool.options.Limits, decoder: frameDecoder{limits: m.spool.options.Limits}, input: manifestRangeStream{ctx: ctx, source: m.source, end: m.start, category: CategoryMalformedFrame, readAhead: m.readAhead}}
 	defer c.decoder.close()
 	cursor := m.Cursor()
 	ordered := true

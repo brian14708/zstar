@@ -3,6 +3,10 @@ package zstar
 import (
 	"context"
 	"io/fs"
+	"iter"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -20,7 +24,7 @@ type manifestRangeStream struct {
 func (s *manifestRangeStream) shortRange() error {
 	category := s.category
 	if category == "" {
-		category = "malformed-toc"
+		category = CategoryMalformedTOC
 	}
 	return rejected(category, "short sequential range")
 }
@@ -71,11 +75,46 @@ type ManifestCursor struct {
 	mu       sync.Mutex
 	manifest *Manifest
 	entry    int
+	end      int
+	prefix   string
+	started  bool
 	err      error
 }
 
 // Cursor creates an independent bounded cursor over sorted owned entries.
 func (m *Manifest) Cursor() *ManifestCursor { return &ManifestCursor{manifest: m} }
+
+// CursorPrefix visits paths beginning with the literal UTF-8 byte prefix.
+// Use "dir/" for descendants of a directory, or "" for all entries.
+// It seeks by binary search and does not scan unrelated entries.
+func (m *Manifest) CursorPrefix(prefix string) *ManifestCursor {
+	return &ManifestCursor{manifest: m, prefix: prefix}
+}
+
+// Entries yields owned metadata in path order, filtered by a literal prefix.
+// Empty prefix selects all entries. Iteration holds no lock across yield,
+// retains at most one metadata batch, and stops after the first error.
+func (m *Manifest) Entries(prefix string) iter.Seq2[Entry, error] {
+	return func(yield func(Entry, error) bool) {
+		cursor := m.CursorPrefix(prefix)
+		defer cursor.Close()
+		for {
+			entries, err := cursor.Next(128)
+			if err != nil {
+				yield(Entry{}, err)
+				return
+			}
+			if len(entries) == 0 {
+				return
+			}
+			for _, entry := range entries {
+				if !yield(entry, nil) {
+					return
+				}
+			}
+		}
+	}
+}
 
 // Next returns up to limit owned entries; limit must be in [1, 4096].
 // An empty result with no error signals exhaustion. Calls are serialized.
@@ -83,18 +122,25 @@ func (c *ManifestCursor) Next(limit int) ([]Entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if limit < 1 || limit > 4096 {
-		return nil, rejected("resource-limit", "cursor batch must be in [1, 4096]")
+		return nil, rejected(CategoryResourceLimit, "cursor batch must be in [1, 4096]")
 	}
 	m := c.manifest
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return nil, categorized("unsupported-operation", fs.ErrClosed)
+		return nil, categorized(CategoryUnsupportedOperation, fs.ErrClosed)
 	}
 	if c.err != nil {
 		return nil, c.err
 	}
-	end := min(c.entry+limit, len(m.entries))
+	if !c.started {
+		c.entry, _ = slices.BinarySearchFunc(m.entries, c.prefix, compareEntryPath)
+		c.end = c.entry + sort.Search(len(m.entries)-c.entry, func(i int) bool {
+			return !strings.HasPrefix(m.entries[c.entry+i].Path, c.prefix)
+		})
+		c.started = true
+	}
+	end := min(c.entry+limit, c.end)
 	out := make([]Entry, 0, end-c.entry)
 	for _, e := range m.entries[c.entry:end] {
 		out = append(out, cloneEntry(e))
@@ -107,5 +153,5 @@ func (c *ManifestCursor) Next(limit int) ([]Entry, error) {
 func (c *ManifestCursor) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.err = rejected("unsupported-operation", "closed manifest cursor")
+	c.err = rejected(CategoryUnsupportedOperation, "closed manifest cursor")
 }

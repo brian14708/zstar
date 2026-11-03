@@ -90,7 +90,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	var out bytes.Buffer
 	rootBytes := []byte{7}
 	attributes := Extensions{"x-bytes": []byte{7}}
-	w, err := NewEntryArchiveWriter(&out, 512, ManifestWriterOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1})
+	w, err := NewEntryArchiveWriter(&out, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestDirectManifestTupleIntegerBoundaries(t *testing.T) {
 func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 	ctx := context.Background()
 	var output bytes.Buffer
-	w, err := NewEntryArchiveWriter(&output, 512, ManifestWriterOptions{MemoryBytes: 1})
+	w, err := NewEntryArchiveWriter(&output, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 			raw.Write(header)
 		}
 		raw.Write(make([]byte, 1024))
-		codec, err := NewEntryArchiveWriter(&archive, 2048, ManifestWriterOptions{})
+		codec, err := NewEntryArchiveWriter(&archive, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{}})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -44,7 +44,7 @@ func fileInfoForEntry(e Entry) (entryInfo, error) {
 		return entryInfo{}, err
 	}
 	if size > math.MaxInt64 {
-		return entryInfo{}, rejected("resource-limit", "file info size exceeds int64")
+		return entryInfo{}, rejected(CategoryResourceLimit, "file info size exceeds int64")
 	}
 	return entryInfo{entry: e, size: int64(size)}, nil
 }
@@ -81,9 +81,6 @@ func (i entryInfo) Mode() fs.FileMode {
 }
 
 func pathError(op, name string, err error) error {
-	if previous, ok := errors.AsType[*fs.PathError](err); ok {
-		err = previous.Err
-	}
 	return &fs.PathError{Op: op, Path: name, Err: err}
 }
 
@@ -252,20 +249,11 @@ func (f *archiveFile) Seek(offset int64, whence int) (int64, error) {
 	if f.file == nil {
 		return 0, pathError("seek", f.name, fs.ErrInvalid)
 	}
-	var base int64
-	switch whence {
-	case io.SeekStart:
-	case io.SeekCurrent:
-		base = f.offset
-	case io.SeekEnd:
-		base = f.info.Size()
-	default:
-		return 0, pathError("seek", f.name, fs.ErrInvalid)
+	position, err := seekPosition(f.offset, f.info.Size(), offset, whence)
+	if err != nil {
+		return 0, pathError("seek", f.name, err)
 	}
-	if offset > math.MaxInt64-base || base+offset < 0 {
-		return 0, pathError("seek", f.name, fs.ErrInvalid)
-	}
-	f.offset = base + offset
+	f.offset = position
 	return f.offset, nil
 }
 
@@ -335,4 +323,22 @@ func (f *archiveFile) ReadDir(n int) ([]fs.DirEntry, error) {
 		return entries, io.EOF
 	}
 	return entries, nil
+}
+
+// Calculate before mutating a cursor so rejected seeks preserve its position.
+func seekPosition(current, size, offset int64, whence int) (int64, error) {
+	var base int64
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		base = current
+	case io.SeekEnd:
+		base = size
+	default:
+		return 0, fs.ErrInvalid
+	}
+	if offset > math.MaxInt64-base || offset < -base {
+		return 0, fs.ErrInvalid
+	}
+	return base + offset, nil
 }

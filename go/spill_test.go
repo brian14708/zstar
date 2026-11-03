@@ -211,9 +211,9 @@ func TestSpoolQuotaPublicReaderAndWriterFailureCleanup(t *testing.T) {
 	if _, err = OpenManifest(context.Background(), memoryRange(data), options); ErrorCategory(err) != "resource-limit" {
 		t.Fatal(err)
 	}
-	writer, err := NewEntryArchiveWriter(io.Discard, 2048, ManifestWriterOptions{
+	writer, err := NewEntryArchiveWriter(io.Discard, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{
 		SpoolBudget: budget, MemoryBytes: 1, CreateSpillStore: options.CreateSpillStore,
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}

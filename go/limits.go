@@ -16,7 +16,7 @@ type Limits struct {
 
 func checkLimit(value, maximum uint64, name string) error {
 	if maximum != 0 && value > maximum {
-		return rejected("resource-limit", name)
+		return rejected(CategoryResourceLimit, name)
 	}
 	return nil
 }

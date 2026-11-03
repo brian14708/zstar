@@ -15,7 +15,7 @@ func (m *Manifest) checkOpen(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return categorized("unsupported-operation", fs.ErrClosed)
+		return categorized(CategoryUnsupportedOperation, fs.ErrClosed)
 	}
 	return nil
 }
@@ -29,7 +29,7 @@ func (m *Manifest) validateEntries(ctx context.Context) error {
 		}
 		for at := strings.IndexByte(entry.Path, '/'); at >= 0; {
 			if !directories[entry.Path[:at]] {
-				return rejected("malformed-toc", "missing ancestor directory")
+				return rejected(CategoryMalformedTOC, "missing ancestor directory")
 			}
 			next := strings.IndexByte(entry.Path[at+1:], '/')
 			if next < 0 {
@@ -43,7 +43,7 @@ func (m *Manifest) validateEntries(ctx context.Context) error {
 		external = external || entry.External()
 	}
 	if external != (len(m.requiredFeatures) != 0) {
-		return rejected("malformed-toc", "manifest required feature")
+		return rejected(CategoryMalformedTOC, "manifest required feature")
 	}
 	return nil
 }

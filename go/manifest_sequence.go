@@ -24,10 +24,10 @@ type sequenceReader struct {
 // Append each header and payload directly into the current item buffer.
 func (r *sequenceReader) appendTo(out []byte, n uint64) ([]byte, error) {
 	if r.limit != 0 && (uint64(len(out)) > r.limit || n > r.limit-uint64(len(out))) {
-		return nil, rejected("resource-limit", "CBOR item size")
+		return nil, rejected(CategoryResourceLimit, "CBOR item size")
 	}
 	if n > r.spool.size-r.at {
-		return nil, rejected("malformed-toc", "truncated CBOR item")
+		return nil, rejected(CategoryMalformedTOC, "truncated CBOR item")
 	}
 	for n > 0 {
 		if len(r.buffer) == 0 {
@@ -59,7 +59,7 @@ func (r *sequenceReader) next() (any, error) {
 	item = func(depth int) error {
 		items++
 		if depth > 64 || items > 16000000 {
-			return rejected("resource-limit", "CBOR nesting or items")
+			return rejected(CategoryResourceLimit, "CBOR nesting or items")
 		}
 		var err error
 		raw, err = r.appendTo(raw, 1)
@@ -81,7 +81,7 @@ func (r *sequenceReader) next() (any, error) {
 				n = n<<8 | uint64(v)
 			}
 		} else if ai > 27 {
-			return rejected("malformed-toc", "indefinite CBOR")
+			return rejected(CategoryMalformedTOC, "indefinite CBOR")
 		}
 		switch major {
 		case 2, 3:
@@ -91,16 +91,16 @@ func (r *sequenceReader) next() (any, error) {
 			}
 		case 4, 5:
 			if r.limit != 0 && n > r.limit {
-				return rejected("resource-limit", "CBOR item size")
+				return rejected(CategoryResourceLimit, "CBOR item size")
 			}
 			if major == 5 {
 				if n > r.spool.size-r.at {
-					return rejected("malformed-toc", "CBOR map size")
+					return rejected(CategoryMalformedTOC, "CBOR map size")
 				}
 				n *= 2
 			}
 			if n > r.spool.size-r.at {
-				return rejected("malformed-toc", "CBOR container size")
+				return rejected(CategoryMalformedTOC, "CBOR container size")
 			}
 			for ; n > 0; n-- {
 				if err := item(depth + 1); err != nil {
@@ -109,7 +109,7 @@ func (r *sequenceReader) next() (any, error) {
 			}
 		case 0, 1, 7:
 		default:
-			return rejected("malformed-toc", "unsupported CBOR type")
+			return rejected(CategoryMalformedTOC, "unsupported CBOR type")
 		}
 		return nil
 	}
@@ -118,14 +118,14 @@ func (r *sequenceReader) next() (any, error) {
 	}
 	var value any
 	if err := manifestDecoder.Unmarshal(raw, &value); err != nil {
-		return nil, categorized("malformed-toc", err)
+		return nil, categorized(CategoryMalformedTOC, err)
 	}
 	if err := validValue(value); err != nil {
-		return nil, categorized("malformed-toc", err)
+		return nil, categorized(CategoryMalformedTOC, err)
 	}
 	canonical, err := manifestEncode(value)
 	if err != nil || !bytes.Equal(raw, canonical) {
-		return nil, rejected("malformed-toc", "noncanonical CBOR")
+		return nil, rejected(CategoryMalformedTOC, "noncanonical CBOR")
 	}
 	r.lastSize = len(raw)
 	return value, nil
@@ -143,11 +143,11 @@ func (s *manifestSpool) readSortRecord(at *uint64) (manifestSortRecord, error) {
 	}
 	fields, ok := value.([]any)
 	if !ok || len(fields) == 0 {
-		return manifestSortRecord{}, rejected("malformed-toc", "invalid entry sort record")
+		return manifestSortRecord{}, rejected(CategoryMalformedTOC, "invalid entry sort record")
 	}
 	path, ok := fields[0].(string)
 	if !ok {
-		return manifestSortRecord{}, rejected("malformed-toc", "invalid entry sort path")
+		return manifestSortRecord{}, rejected(CategoryMalformedTOC, "invalid entry sort path")
 	}
 	return manifestSortRecord{path: path, value: value}, nil
 }

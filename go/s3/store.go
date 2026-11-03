@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"math/bits"
 	"strings"
@@ -38,6 +39,13 @@ type BlobClient interface {
 var ErrNotFound = errors.New("zstar s3: object not found")
 
 func redacted(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return ErrNotFound
+	}
+	if errors.Is(err, fs.ErrClosed) {
+		return fs.ErrClosed
+	}
+
 	if errors.Is(err, context.Canceled) {
 		return context.Canceled
 	}
@@ -126,7 +134,7 @@ func (s *Source) ManifestRange(ctx context.Context) (offset, encodedSize uint64,
 
 // ReadRange returns an exact conditional range from the pinned object.
 // ctx bounds the request; backend diagnostics are redacted.
-func (s *Source) ReadRange(ctx context.Context, offset, length int64) ([]byte, error) {
+func (s *Source) ReadRange(ctx context.Context, offset, length int64) (data []byte, err error) {
 	if offset < 0 || length < 0 {
 		return nil, errors.New("zstar s3: negative range")
 	}
@@ -150,8 +158,12 @@ func (s *Source) ReadRange(ctx context.Context, offset, length int64) ([]byte, e
 	if result == nil || result.Body == nil {
 		return nil, errors.New("zstar s3: missing response body")
 	}
-	// Response contents are checked before return; closing a read body is cleanup.
-	defer func() { _ = result.Body.Close() }() //nolint:errcheck // The bounded response has been validated; closing its body is cleanup.
+	defer func() {
+		if closeErr := result.Body.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("zstar s3: close response: %w", redacted(closeErr)))
+			data = nil
+		}
+	}()
 	expected := fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, size)
 	if aws.ToString(result.ContentRange) != expected || result.ContentLength == nil || *result.ContentLength != length || (s.etag != nil && (result.ETag == nil || aws.ToString(result.ETag) != aws.ToString(s.etag))) || (s.version != nil && (result.VersionId == nil || aws.ToString(result.VersionId) != aws.ToString(s.version))) {
 		return nil, errObjectChanged
@@ -172,11 +184,14 @@ func readExact(reader io.Reader, count int) ([]byte, error) {
 	}
 	raw := make([]byte, count+1)
 	n, err := io.ReadFull(reader, raw)
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, redacted(err)
 	}
-	if n != count || err != io.ErrUnexpectedEOF {
-		return nil, errors.New("zstar s3: incomplete or oversized response")
+	if n < count {
+		return nil, fmt.Errorf("zstar s3: incomplete response: %w", io.ErrUnexpectedEOF)
+	}
+	if n > count {
+		return nil, errors.New("zstar s3: oversized response")
 	}
 	return raw[:count], nil
 }
@@ -184,6 +199,9 @@ func readExact(reader io.Reader, count int) ([]byte, error) {
 // BlobStoreOptions controls object key policy and bounded request concurrency.
 type BlobStoreOptions struct {
 	Prefix string
+	// CheckExists checks HEAD before compression and upload. Enable for workloads
+	// with repeated content; new objects incur one additional request.
+	CheckExists bool
 	// Key maps raw digest to storage key. It overrides Prefix when nonnil.
 	Key         func([32]byte) string
 	Concurrency int // zero selects eight
@@ -192,10 +210,21 @@ type BlobStoreOptions struct {
 // BlobStore reads and writes independent compressed content-addressed objects.
 // Its methods and caller-supplied key function must support concurrent calls.
 type BlobStore struct {
-	client BlobClient
-	bucket string
-	key    func([32]byte) string
-	slots  chan struct{}
+	client      BlobClient
+	bucket      string
+	key         func([32]byte) string
+	slots       chan struct{}
+	done        chan struct{}
+	checkExists bool
+	mu          sync.Mutex
+	encoder     *objectEncoder
+}
+
+// An idle workspace travels as one value; checked-out codecs are operation-owned.
+type objectEncoder struct {
+	codec  *zstd.Encoder
+	window int
+	output []byte
 }
 
 // NewBlobStore creates a reusable bounded external object resolver and uploader.
@@ -218,7 +247,7 @@ func NewBlobStore(client BlobClient, bucket string, options BlobStoreOptions) (*
 			return prefix + "/" + suffix
 		}
 	}
-	return &BlobStore{client: client, bucket: bucket, key: key, slots: make(chan struct{}, options.Concurrency)}, nil
+	return &BlobStore{client: client, bucket: bucket, key: key, slots: make(chan struct{}, options.Concurrency), done: make(chan struct{}), checkExists: options.CheckExists}, nil
 }
 
 // ObjectKey maps a decoded digest to its configured storage key.
@@ -231,15 +260,26 @@ func (b *BlobStore) acquire(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-b.done:
+		return fmt.Errorf("zstar s3: %w", fs.ErrClosed)
 	case b.slots <- struct{}{}:
-		return nil
+		select {
+		case <-b.done:
+			<-b.slots
+			return fmt.Errorf("zstar s3: %w", fs.ErrClosed)
+		case <-ctx.Done():
+			<-b.slots
+			return ctx.Err()
+		default:
+			return nil
+		}
 	}
 }
 
 // GetEncoded implements the entry-oriented resolver. The manifest's encoded
 // size is a hint; enforce actual object length independently. Decoding and
 // content-address verification belong to the archive reader.
-func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes uint64) ([]byte, error) {
+func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes uint64) (data []byte, err error) {
 	if maxBytes == 0 {
 		return nil, errors.New("zstar: encoded object budget must be positive")
 	}
@@ -257,11 +297,16 @@ func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes
 	if result == nil || result.Body == nil {
 		return nil, errors.New("zstar s3: missing response body")
 	}
-	defer func() { _ = result.Body.Close() }() //nolint:errcheck // The response has been validated; closing its body is cleanup.
-	if result.ContentLength == nil || *result.ContentLength <= 0 || uint64(*result.ContentLength) > maxBytes {
-		return nil, &zstar.FormatError{Category: "resource-limit", Cause: errors.New("zstar s3: encoded object limit")}
+	defer func() {
+		if closeErr := result.Body.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("zstar s3: close response: %w", redacted(closeErr)))
+			data = nil
+		}
+	}()
+	if result.ContentLength == nil || *result.ContentLength <= 0 || uint64(*result.ContentLength) > maxBytes || uint64(*result.ContentLength) >= uint64(math.MaxInt) {
+		return nil, &zstar.FormatError{Category: zstar.CategoryResourceLimit, Cause: errors.New("zstar s3: encoded object limit")}
 	}
-	data, err := readExact(result.Body, int(*result.ContentLength))
+	data, err = readExact(result.Body, int(*result.ContentLength))
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +319,7 @@ func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes
 // Put uploads one object, skipping the write when the content-addressed key
 // already exists (conditional If-None-Match), and returns its complete-object extent, ready for
 // Header.Extents. Callers can select a subrange by adjusting Size and Offset.
-func (b *BlobStore) Put(ctx context.Context, raw []byte) (zstar.Extent, error) {
+func (b *BlobStore) Put(ctx context.Context, raw []byte) (extent zstar.Extent, err error) {
 	if len(raw) == 0 {
 		return zstar.Extent{}, errors.New("zstar s3: external raw size limit")
 	}
@@ -283,21 +328,38 @@ func (b *BlobStore) Put(ctx context.Context, raw []byte) (zstar.Extent, error) {
 	}
 	defer func() { <-b.slots }()
 	digest := sha256.Sum256(raw)
+	key := b.key(digest)
+	if b.checkExists {
+		meta, err := b.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key)})
+		if err == nil {
+			if meta == nil || meta.ContentLength == nil || *meta.ContentLength <= 0 {
+				return zstar.Extent{}, errors.New("zstar s3: invalid existing object size")
+			}
+			return zstar.Extent{Source: zstar.ObjectSource(digest), Size: uint64(len(raw)), EncodedSize: uint64(*meta.ContentLength)}, nil
+		}
+		if err = redacted(err); !errors.Is(err, ErrNotFound) {
+			return zstar.Extent{}, err
+		}
+	}
 	// An independent object cannot refer farther back than its own decoded size.
 	// A power-of-two window bounds codec history without losing useful matches.
 	window := max(zstd.MinWindowSize, 1<<bits.Len(uint(len(raw)-1)))
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(window), zstd.WithEncoderCRC(true))
+	encoder, err := b.takeEncoder(window)
 	if err != nil {
 		return zstar.Extent{}, err
 	}
-	encoded := encoder.EncodeAll(raw, nil)
-	if err := encoder.Close(); err != nil {
-		return zstar.Extent{}, err
-	}
+	encoder.output = encoder.codec.EncodeAll(raw, encoder.output[:0])
+	defer func() {
+		err = errors.Join(err, b.releaseEncoder(encoder))
+		if err != nil {
+			extent = zstar.Extent{}
+		}
+	}()
+	encoded := encoder.output
 	if err = ctx.Err(); err != nil {
 		return zstar.Extent{}, err
 	}
-	_, err = b.client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(b.key(digest)), Body: bytes.NewReader(encoded), ContentLength: aws.Int64(int64(len(encoded))), ContentType: aws.String(zstdContentType), CacheControl: aws.String(immutableCacheControl), IfNoneMatch: aws.String("*")})
+	_, err = b.client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key), Body: bytes.NewReader(encoded), ContentLength: aws.Int64(int64(len(encoded))), ContentType: aws.String(zstdContentType), CacheControl: aws.String(immutableCacheControl), IfNoneMatch: aws.String("*")})
 	// A precondition failure means the content-addressed object already exists.
 	if api, ok := errors.AsType[smithy.APIError](err); err != nil && (!ok || api.ErrorCode() != "PreconditionFailed") {
 		return zstar.Extent{}, objectError(redacted(err))
@@ -305,9 +367,64 @@ func (b *BlobStore) Put(ctx context.Context, raw []byte) (zstar.Extent, error) {
 	return zstar.Extent{Source: zstar.ObjectSource(digest), Size: uint64(len(raw)), EncodedSize: uint64(len(encoded))}, nil
 }
 
+func (b *BlobStore) takeEncoder(window int) (*objectEncoder, error) {
+	b.mu.Lock()
+	encoder := b.encoder
+	b.encoder = nil
+	b.mu.Unlock()
+	if encoder != nil {
+		if encoder.window == window {
+			return encoder, nil
+		}
+		if err := encoder.codec.Close(); err != nil {
+			return nil, err
+		}
+	}
+	codec, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(window), zstd.WithEncoderCRC(true))
+	if err != nil {
+		return nil, err
+	}
+	return &objectEncoder{codec: codec, window: window}, nil
+}
+
+func (b *BlobStore) releaseEncoder(encoder *objectEncoder) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.done:
+	default:
+		if b.encoder == nil && encoder.window <= 1<<20 && cap(encoder.output) <= 2<<20 {
+			b.encoder = encoder
+			return nil
+		}
+	}
+	return encoder.codec.Close()
+}
+
+// Close releases the idle codec and refuses new calls with fs.ErrClosed.
+// Active calls finish and release their codecs. The SDK client stays open.
+// It retains one idle codec with at most 1 MiB history and 2 MiB output, plus
+// codec bookkeeping. Close is idempotent and concurrency safe.
+func (b *BlobStore) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.done:
+		return nil
+	default:
+		close(b.done)
+	}
+	encoder := b.encoder
+	b.encoder = nil
+	if encoder != nil {
+		return encoder.codec.Close()
+	}
+	return nil
+}
+
 func objectError(err error) error {
 	if errors.Is(err, ErrNotFound) {
-		return &zstar.FormatError{Category: "missing-external-content", Cause: err}
+		return &zstar.FormatError{Category: zstar.CategoryMissingExternalContent, Cause: err}
 	}
 	return err
 }

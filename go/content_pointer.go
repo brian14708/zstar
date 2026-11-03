@@ -11,18 +11,18 @@ import (
 
 func validateObjectExtents(extents []Extent) error {
 	if len(extents) == 0 {
-		return rejected("malformed-pointer", "extent count")
+		return rejected(CategoryMalformedPointer, "extent count")
 	}
 	var total uint64
 	for _, e := range extents {
 		if _, ok := e.Source.ContentAddress(); !ok {
-			return rejected("malformed-pointer", "object source required")
+			return rejected(CategoryMalformedPointer, "object source required")
 		}
 		if err := e.validate(0); err != nil {
-			return &FormatError{Category: "malformed-pointer", Cause: err}
+			return &FormatError{Category: CategoryMalformedPointer, Cause: err}
 		}
 		if e.Size > math.MaxUint64-total {
-			return rejected("malformed-pointer", "file size overflow")
+			return rejected(CategoryMalformedPointer, "file size overflow")
 		}
 		total += e.Size
 
@@ -46,7 +46,7 @@ func EncodeContentReference(extents []Extent) ([]byte, error) {
 // DecodeContentReference decodes and validates canonical external extent tuples.
 func DecodeContentReference(raw []byte) ([]Extent, error) {
 	if len(raw) == 0 {
-		return nil, rejected("malformed-pointer", "reference size limit")
+		return nil, rejected(CategoryMalformedPointer, "reference size limit")
 	}
 	mode, err := (cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF, IndefLength: cbor.IndefLengthForbidden, TagsMd: cbor.TagsForbidden, MaxArrayElements: 2147483647, MaxMapPairs: 1_000_000, MaxNestedLevels: 64}).DecMode()
 	if err != nil {
@@ -54,25 +54,25 @@ func DecodeContentReference(raw []byte) ([]Extent, error) {
 	}
 	var value any
 	if err = mode.Unmarshal(raw, &value); err != nil {
-		return nil, &FormatError{Category: "malformed-pointer", Cause: err}
+		return nil, &FormatError{Category: CategoryMalformedPointer, Cause: err}
 	}
 	canonical, err := manifestEncode(value)
 	if err != nil || !bytes.Equal(canonical, raw) {
-		return nil, rejected("malformed-pointer", "noncanonical CBOR")
+		return nil, rejected(CategoryMalformedPointer, "noncanonical CBOR")
 	}
 	m, ok := value.(map[any]any)
 	if !ok || len(m) != 2 || m["version"] != uint64(1) {
-		return nil, rejected("malformed-pointer", "reference fields or version")
+		return nil, rejected(CategoryMalformedPointer, "reference fields or version")
 	}
 	values, ok := m["extents"].([]any)
 	if !ok {
-		return nil, rejected("malformed-pointer", "extents")
+		return nil, rejected(CategoryMalformedPointer, "extents")
 	}
 	out := make([]Extent, 0, len(values))
 	for _, v := range values {
 		e, err := parseExtent(v, 0)
 		if err != nil {
-			return nil, &FormatError{Category: "malformed-pointer", Cause: err}
+			return nil, &FormatError{Category: CategoryMalformedPointer, Cause: err}
 		}
 		out = append(out, e)
 	}
@@ -105,30 +105,30 @@ func EncodeContentPointer(extents []Extent) ([]byte, error) {
 // DecodeContentPointer decodes and validates canonical external pointer text.
 func DecodeContentPointer(raw []byte) ([]Extent, error) {
 	if !bytes.HasPrefix(raw, []byte("version zstar-pointer-v1\n")) || len(raw) == 0 || raw[len(raw)-1] != '\n' {
-		return nil, rejected("malformed-pointer", "pointer header or length")
+		return nil, rejected(CategoryMalformedPointer, "pointer header or length")
 	}
 	lines := strings.Split(string(raw[len("version zstar-pointer-v1\n"):len(raw)-1]), "\n")
 	var out []Extent
 	for _, line := range lines {
 		fields := strings.Split(line, " ")
 		if len(fields) < 4 || len(fields) > 5 || fields[0] != "chunk" {
-			return nil, rejected("malformed-pointer", "chunk grammar")
+			return nil, rejected(CategoryMalformedPointer, "chunk grammar")
 		}
 		source, err := ParseObjectSource(fields[1])
 		if err != nil {
-			return nil, &FormatError{Category: "malformed-pointer", Cause: err}
+			return nil, &FormatError{Category: CategoryMalformedPointer, Cause: err}
 		}
 		e := Extent{Source: source}
 		values := []*uint64{&e.Size, &e.EncodedSize, &e.Offset}
 		for i, text := range fields[2:] {
 			n, err := strconv.ParseUint(text, 10, 64)
 			if err != nil || strconv.FormatUint(n, 10) != text {
-				return nil, rejected("malformed-pointer", "canonical integer")
+				return nil, rejected(CategoryMalformedPointer, "canonical integer")
 			}
 			*values[i] = n
 		}
 		if len(fields) == 5 && e.Offset == 0 {
-			return nil, rejected("malformed-pointer", "explicit default offset")
+			return nil, rejected(CategoryMalformedPointer, "explicit default offset")
 		}
 		out = append(out, e)
 	}

@@ -163,7 +163,7 @@ func TestManifestEntryOwnershipAndCursor(t *testing.T) {
 func TestManifestArchiveEncoderSharesAndSplitsFrames(t *testing.T) {
 	ctx := context.Background()
 	var out bytes.Buffer
-	writer, err := NewEntryArchiveWriter(&out, 2048, ManifestWriterOptions{MemoryBytes: 1})
+	writer, err := NewEntryArchiveWriter(&out, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}

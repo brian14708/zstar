@@ -149,7 +149,7 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 		return nil, err
 	}
 	if input == nil || writer == nil || size >= (^uint64(0)>>1) {
-		return nil, rejected("resource-limit", "external file size or reference bytes")
+		return nil, rejected(CategoryResourceLimit, "external file size or reference bytes")
 	}
 	chunker, err := NewChunker(io.LimitReader(input, int64(size)+1), options)
 	if err != nil {
@@ -167,7 +167,7 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 		}
 		total += uint64(len(raw))
 		if total > size {
-			return nil, rejected("resource-limit", "external file size or reference bytes")
+			return nil, rejected(CategoryResourceLimit, "external file size or reference bytes")
 		}
 		extent, err := writer.Put(ctx, raw)
 		if err != nil {
@@ -176,7 +176,7 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 		address, external := extent.Source.ContentAddress()
 		digest, digestErr := ParseContentAddress(address)
 		if !external || digestErr != nil || digest != sha256.Sum256(raw) || extent.Offset != 0 || extent.Size != uint64(len(raw)) {
-			return nil, rejected("malformed-external-content", "object writer changed chunk identity")
+			return nil, rejected(CategoryMalformedExternalContent, "object writer changed chunk identity")
 		}
 		if err := extent.validate(0); err != nil {
 			return nil, err

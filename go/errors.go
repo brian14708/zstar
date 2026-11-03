@@ -55,7 +55,7 @@ func categorized(category string, err error) error {
 	var array *cbor.MaxArrayElementsError
 	var pairs *cbor.MaxMapPairsError
 	if errors.As(err, &depth) || errors.As(err, &array) || errors.As(err, &pairs) {
-		category = "resource-limit"
+		category = CategoryResourceLimit
 	}
 	return &FormatError{category, err}
 }

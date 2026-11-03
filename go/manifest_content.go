@@ -2,27 +2,11 @@ package zstar
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"reflect"
 	"sync"
 )
-
-// ObjectRequest selects a complete frame; Hint is advisory.
-type ObjectRequest struct {
-	Digest         [32]byte
-	Hint, MaxBytes uint64
-}
-
-// BatchEncodedContentResolver optionally resolves a miss plan in one call.
-type BatchEncodedContentResolver interface {
-	EncodedContentResolver
-	GetEncodedMany(context.Context, []ObjectRequest) ([][]byte, error)
-}
-
-// EncodedContentIndex optionally exposes physical encoded lengths for planning.
-type EncodedContentIndex interface {
-	EncodedLength([32]byte) (uint64, bool)
-}
 
 type manifestChunkKey struct {
 	source      ExtentSource
@@ -44,6 +28,15 @@ type manifestContentChunk struct {
 	raw      []byte
 	verified bool
 }
+
+// selection validates the complete declared extent, even for a smaller read.
+func (c *manifestContentChunk) selection(extent Extent) ([]byte, error) {
+	if extent.Offset > uint64(len(c.raw)) || extent.Size > uint64(len(c.raw))-extent.Offset {
+		return nil, rejected(CategoryInvalidRange, "decoded extent bounds")
+	}
+	return c.raw[extent.Offset : extent.Offset+extent.Size], nil
+}
+
 type manifestContentFlight struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
@@ -79,7 +72,7 @@ func (s *manifestContentState) get(ctx context.Context, extent Extent, resolver 
 		value := reflect.ValueOf(resolver)
 		if value.IsValid() && value.Kind() == reflect.Pointer {
 			if value.IsNil() {
-				return nil, rejected("unsupported-operation", "external resolver required")
+				return nil, rejected(CategoryUnsupportedOperation, "external resolver required")
 			}
 			key.resolver = resolver
 		} else {
@@ -98,7 +91,7 @@ func (s *manifestContentState) get(ctx context.Context, extent Extent, resolver 
 		select {
 		case <-s.closed:
 			s.mu.Unlock()
-			return nil, categorized("unsupported-operation", fs.ErrClosed)
+			return nil, categorized(CategoryUnsupportedOperation, fs.ErrClosed)
 		default:
 		}
 		if candidate != nil && (!wantVerified || candidate.verified) {
@@ -122,7 +115,7 @@ func (s *manifestContentState) get(ctx context.Context, extent Extent, resolver 
 			return nil, ctx.Err()
 		case <-s.closed:
 			s.leave(key, flight)
-			return nil, categorized("unsupported-operation", fs.ErrClosed)
+			return nil, categorized(CategoryUnsupportedOperation, fs.ErrClosed)
 		case <-flight.done:
 			if flight.err != nil {
 				return nil, flight.err
@@ -180,13 +173,13 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 	if candidate == nil {
 		if object {
 			if resolver == nil {
-				return nil, rejected("unsupported-operation", "external resolver required")
+				return nil, rejected(CategoryUnsupportedOperation, "external resolver required")
 			}
 			encoded, err = resolver.GetEncoded(ctx, digest, extent.EncodedSize, uint64(addressLimit(s.limits.MaxFrameEncodedBytes)))
 		} else {
 			encoded, err = s.source.ReadRange(ctx, int64(extent.Source.offset), int64(extent.EncodedSize))
 			if err == nil && uint64(len(encoded)) != extent.EncodedSize {
-				err = rejected("malformed-frame", "short archive frame")
+				err = rejected(CategoryMalformedFrame, "short archive frame")
 			}
 		}
 		if err != nil {
@@ -199,14 +192,14 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 			return nil, err
 		}
 		if !object && (len(encoded) < 5 || encoded[4]&4 == 0) {
-			return nil, rejected("malformed-frame", "missing data checksum")
+			return nil, rejected(CategoryMalformedFrame, "missing data checksum")
 		}
 		raw, err := s.decoders.decode(encoded, 0)
 		if err != nil {
 			if object {
-				return nil, categorized("malformed-external-content", err)
+				return nil, categorized(CategoryMalformedExternalContent, err)
 			}
-			return nil, categorized("malformed-frame", err)
+			return nil, categorized(CategoryMalformedFrame, err)
 		}
 		candidate = &manifestContentChunk{raw: raw}
 	}
@@ -244,7 +237,7 @@ func (s *manifestContentState) checkOpen(ctx context.Context) error {
 	}
 	select {
 	case <-s.closed:
-		return categorized("unsupported-operation", fs.ErrClosed)
+		return categorized(CategoryUnsupportedOperation, fs.ErrClosed)
 	default:
 		return nil
 	}
@@ -254,17 +247,13 @@ func (s *manifestContentState) checkOpen(ctx context.Context) error {
 // called concurrently and must release the chunk when it returns; decoded
 // content is not retained after each selected source has been copied.
 func (s *manifestContentState) readMany(ctx context.Context, extents []Extent, resolver EncodedContentResolver, verify bool, consume func(int, *manifestContentChunk) error) error {
-	work, cancel := context.WithCancel(ctx)
-	defer cancel()
+	work, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	var wg sync.WaitGroup
-	var errorOnce sync.Once
-	var resultError error
 	queue := make(chan int)
 	workers := min(cap(s.slots), len(extents))
-	wg.Add(workers)
 	for range workers {
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for index := range queue {
 				extent := extents[index]
 				chunk, err := s.get(work, extent, resolver, verify)
@@ -272,11 +261,11 @@ func (s *manifestContentState) readMany(ctx context.Context, extents []Extent, r
 					err = consume(index, chunk)
 				}
 				if err != nil {
-					errorOnce.Do(func() { resultError = err; cancel() })
+					cancel(err)
 					return
 				}
 			}
-		}()
+		})
 	}
 send:
 	for i := range extents {
@@ -288,8 +277,8 @@ send:
 	}
 	close(queue)
 	wg.Wait()
-	if resultError != nil {
-		return resultError
+	if err := ctx.Err(); err != nil && !errors.Is(context.Cause(work), err) {
+		return errors.Join(context.Cause(work), err)
 	}
-	return ctx.Err()
+	return context.Cause(work)
 }
