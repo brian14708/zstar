@@ -51,8 +51,7 @@ func newManifestContentState(options manifestOptions, source RangeReader) *manif
 	}
 }
 
-// Active loads share immutable decoded bytes. External keys exclude
-// recompression-dependent hints. Explicit verification hashes complete objects.
+// Active loads share immutable decoded bytes, without retaining completed loads.
 func (s *manifestContentState) get(ctx context.Context, extent Extent, resolver EncodedContentResolver, verify bool) (*manifestContentChunk, error) {
 	key := chunkKey(extent)
 	_, object := extent.Source.ContentAddress()
@@ -64,9 +63,8 @@ func (s *manifestContentState) get(ctx context.Context, extent Extent, resolver 
 			}
 			key.resolver = resolver
 		} else {
-			// Function/value implementations may be noncomparable and cannot
-			// safely establish a namespace across operations. Batch planning
-			// still groups repeated extents before entering this loader.
+			// Value/function resolvers cannot establish a stable namespace
+			// across operations. Batch planning still groups repeated extents.
 			key.transient = new(uint8)
 		}
 	}
@@ -160,13 +158,7 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 		}
 	}
 	if candidate == nil {
-		prefetched, ok := ctx.Value(encodedPrefetchKey{}).(encodedPrefetch)
-		if !ok {
-			prefetched = nil
-		}
-		if frame := prefetched[chunkKey(extent)]; frame != nil {
-			encoded = frame
-		} else if object {
+		if object {
 			if resolver == nil {
 				return nil, rejected("unsupported-operation", "external resolver required")
 			}
@@ -240,4 +232,48 @@ func (s *manifestContentState) checkOpen(ctx context.Context) error {
 	default:
 		return nil
 	}
+}
+
+// readMany owns bounded content execution. consume is
+// called concurrently and must release the chunk when it returns; decoded
+// content is not retained after each selected source has been copied.
+func (s *manifestContentState) readMany(ctx context.Context, extents []Extent, resolver EncodedContentResolver, verify bool, consume func(int, *manifestContentChunk) error) error {
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	var errorOnce sync.Once
+	var resultError error
+	queue := make(chan int)
+	workers := min(cap(s.slots), len(extents))
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for index := range queue {
+				extent := extents[index]
+				chunk, err := s.get(work, extent, resolver, verify)
+				if err == nil {
+					err = consume(index, chunk)
+				}
+				if err != nil {
+					errorOnce.Do(func() { resultError = err; cancel() })
+					return
+				}
+			}
+		}()
+	}
+send:
+	for i := range extents {
+		select {
+		case queue <- i:
+		case <-work.Done():
+			break send
+		}
+	}
+	close(queue)
+	wg.Wait()
+	if resultError != nil {
+		return resultError
+	}
+	return ctx.Err()
 }

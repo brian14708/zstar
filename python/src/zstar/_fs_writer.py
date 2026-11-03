@@ -8,12 +8,11 @@ import tempfile
 import threading
 from collections.abc import Callable
 from tarfile import DIRTYPE, TarInfo
-from typing import BinaryIO
 
-from fsspec.spec import AbstractBufferedFile
 from typing_extensions import Buffer, Reader
 
 from . import _native
+from ._publication import _Publication
 from ._writer import ArchiveWriter
 from .types import WriterOptions
 
@@ -29,18 +28,13 @@ class _WriteSession:
 
     def __init__(
         self,
-        output: BinaryIO,
+        publication: _Publication,
         spool_memory: int,
         options: WriterOptions,
-        commit: Callable[[], None] | None = None,
-        discard: Callable[[], None] | None = None,
-        after_commit: Callable[[], None] | None = None,
         external: Callable[[str, bytes, int], int] | None = None,
         external_threshold: int = 16 << 20,
     ) -> None:
-        self.output, self.spool_memory = output, spool_memory
-        self.commit, self.discard = commit, discard
-        self.after_commit = after_commit
+        self.publication, self.spool_memory = publication, spool_memory
         self.external, self.external_threshold = external, external_threshold
         self.compression_level = options.get("compression_level", 3)
         self.lock = threading.RLock()
@@ -48,7 +42,7 @@ class _WriteSession:
         self.active: _StagedMember | None = None
         self.closed = False
         self.failed = False
-        self.writer = ArchiveWriter(output, **options)
+        self.writer = ArchiveWriter(publication.output, **options)
 
     def _check(self) -> None:
         if self.closed:
@@ -173,41 +167,7 @@ class _WriteSession:
             except BaseException as error:
                 errors.append(error)
                 abort = True
-            discarded = False
-            if abort and self.discard is not None:
-                try:
-                    self.discard()
-                    discarded = True
-                except BaseException as error:
-                    errors.append(error)
-                finally:
-                    if isinstance(self.output, AbstractBufferedFile):
-                        self.output.forced = True
-            try:
-                self.output.close()
-            except BaseException as error:
-                errors.append(error)
-                abort = True
-            if not abort and self.commit is not None:
-                try:
-                    self.commit()
-                except BaseException as error:
-                    errors.append(error)
-                    abort = True
-            if abort and self.discard is not None and not discarded:
-                try:
-                    self.discard()
-                except BaseException as error:
-                    errors.append(error)
-            if not abort and self.after_commit is not None:
-                try:
-                    self.after_commit()
-                except BaseException as error:
-                    errors.append(error)
-            if len(errors) == 1:
-                raise errors[0]
-            if errors:
-                raise BaseExceptionGroup("archive cleanup failed", errors)
+            self.publication.finish(abort=abort, errors=tuple(errors))
 
 
 class _StagedMember:

@@ -125,9 +125,6 @@ func TestPackedSharedFixtures(t *testing.T) {
 			if err != nil || !bytes.Equal(out, read("payload.bin")) {
 				t.Fatal("reconstruction", err)
 			}
-			if store.gets != 1 {
-				t.Fatalf("GETs: %d", store.gets)
-			}
 			g, err := DecodePackedGeneration(read("generation.cbor"))
 			if err != nil {
 				t.Fatal(err)

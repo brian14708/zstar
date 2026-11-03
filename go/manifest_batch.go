@@ -5,7 +5,6 @@ import (
 	"io/fs"
 	"slices"
 	"sort"
-	"sync"
 )
 
 // MaxBatchRequests is the local request-count limit for Reader.ReadMany.
@@ -144,51 +143,20 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 			}
 		}
 	}
-	ctx, err := m.prefetch(ctx, jobs, resolver)
-	if err != nil {
-		return nil, ReadReport{}, err
-	}
 	out := make([][]byte, len(requests))
 	for i, request := range requests {
 		out[i] = make([]byte, int(request.Length))
 	}
-	var resultError error
-	if len(jobs) > 0 {
-		work, cancel := context.WithCancel(ctx)
-		defer cancel()
-		var wg sync.WaitGroup
-		var errorOnce sync.Once
-		queue := make(chan int)
-		workers := min(cap(m.content.slots), len(jobs))
-		wg.Add(workers)
-		for range workers {
-			go func() {
-				defer wg.Done()
-				for index := range queue {
-					if err := m.readJob(work, &jobs[index], out, resolver, verifyExternal); err != nil {
-						errorOnce.Do(func() { resultError = err; cancel() })
-						return
-					}
-				}
-			}()
-		}
-	send:
-		for i := range jobs {
-			select {
-			case queue <- i:
-			case <-work.Done():
-				break send
-			}
-		}
-		close(queue)
-		wg.Wait()
+	extents := make([]Extent, len(jobs))
+	for i, job := range jobs {
+		extents[i] = job.extent
 	}
-	if resultError != nil {
-		return nil, ReadReport{}, resultError
-	}
-	if err := ctx.Err(); err != nil {
+	if err := m.content.readMany(ctx, extents, resolver, verifyExternal, func(index int, chunk *manifestContentChunk) error {
+		return copyReadJob(&jobs[index], out, chunk)
+	}); err != nil {
 		return nil, ReadReport{}, err
 	}
+
 	var report ReadReport
 	if wantReport {
 		report.MetadataAuthenticated = true
@@ -213,11 +181,7 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 	return out, report, nil
 }
 
-func (m *Manifest) readJob(ctx context.Context, job *manifestReadJob, out [][]byte, resolver EncodedContentResolver, verifyExternal bool) error {
-	chunk, err := m.content.get(ctx, job.extent, resolver, verifyExternal)
-	if err != nil {
-		return err
-	}
+func copyReadJob(job *manifestReadJob, out [][]byte, chunk *manifestContentChunk) error {
 	job.verified = chunk.verified
 	for _, part := range job.copies {
 		if part.extentOffset > uint64(len(chunk.raw)) || part.extentSize > uint64(len(chunk.raw))-part.extentOffset {
