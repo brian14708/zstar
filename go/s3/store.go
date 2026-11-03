@@ -240,8 +240,8 @@ func (b *BlobStore) acquire(ctx context.Context) error {
 // size is a hint; enforce actual object length independently. Decoding and
 // content-address verification belong to the archive reader.
 func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes uint64) ([]byte, error) {
-	if maxBytes == 0 || maxBytes > 17<<20 {
-		maxBytes = 17 << 20
+	if maxBytes == 0 {
+		return nil, errors.New("zstar: encoded object budget must be positive")
 	}
 	if err := b.acquire(ctx); err != nil {
 		return nil, objectError(err)
@@ -275,7 +275,7 @@ func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes
 // already exists (conditional If-None-Match), and returns its complete-object extent, ready for
 // Header.Extents. Callers can select a subrange by adjusting Size and Offset.
 func (b *BlobStore) Put(ctx context.Context, raw []byte) (zstar.Extent, error) {
-	if len(raw) == 0 || len(raw) > 16<<20 {
+	if len(raw) == 0 {
 		return zstar.Extent{}, errors.New("zstar s3: external raw size limit")
 	}
 	if err := b.acquire(ctx); err != nil {

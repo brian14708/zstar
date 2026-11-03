@@ -21,7 +21,7 @@ func (o ChunkingOptions) normalized() (ChunkingOptions, error) {
 			o.TargetBytes = 1 << 20
 		}
 		o.MinBytes, o.MaxBytes = o.TargetBytes, o.TargetBytes
-		if o.TargetBytes < 1 || o.TargetBytes > 16<<20 {
+		if o.TargetBytes < 1 {
 			return o, errors.New("zstar: invalid fixed chunk size")
 		}
 	} else {
@@ -34,8 +34,11 @@ func (o ChunkingOptions) normalized() (ChunkingOptions, error) {
 		if o.MaxBytes == 0 {
 			o.MaxBytes = 1 << 20
 		}
-		if o.MinBytes < 64 || o.MinBytes > o.TargetBytes || o.TargetBytes > o.MaxBytes || o.MaxBytes > 16<<20 || o.MinBytes%2 != 0 || o.MaxBytes%2 != 0 || o.TargetBytes&(o.TargetBytes-1) != 0 {
+		if o.MinBytes < 64 || o.MinBytes > o.TargetBytes || o.TargetBytes > o.MaxBytes || o.MinBytes%2 != 0 || o.MaxBytes%2 != 0 || o.TargetBytes&(o.TargetBytes-1) != 0 {
 			return o, errors.New("zstar: invalid FastCDC settings")
+		}
+		if bits.TrailingZeros(uint(o.TargetBytes))+1 >= len(fastCDCMasks) {
+			return o, errors.New("zstar: FastCDC profile does not support this target; use fixed chunking or a smaller target")
 		}
 	}
 	return o, nil
@@ -133,7 +136,7 @@ func (c *Chunker) Next(ctx context.Context) ([]byte, error) {
 	return chunk, nil
 }
 
-// ChunkObjectWriter allows standalone and packed storage to share chunking.
+// ChunkObjectWriter stores complete external chunks.
 type ChunkObjectWriter interface {
 	Put(context.Context, []byte) (Extent, error)
 }
@@ -145,8 +148,8 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 	if err != nil {
 		return nil, err
 	}
-	if input == nil || writer == nil || size > uint64(options.MaxBytes)*65536 {
-		return nil, rejected("resource-limit", "external file size or extent count")
+	if input == nil || writer == nil || size >= (^uint64(0)>>1) {
+		return nil, rejected("resource-limit", "external file size or reference bytes")
 	}
 	chunker, err := NewChunker(io.LimitReader(input, int64(size)+1), options)
 	if err != nil {
@@ -163,8 +166,8 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 			return nil, err
 		}
 		total += uint64(len(raw))
-		if total > size || len(extents) == 65536 {
-			return nil, rejected("resource-limit", "external file size or extent count")
+		if total > size {
+			return nil, rejected("resource-limit", "external file size or reference bytes")
 		}
 		extent, err := writer.Put(ctx, raw)
 		if err != nil {

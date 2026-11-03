@@ -483,7 +483,7 @@ impl S3BlobStore {
     /// Fetch one bounded encoded object. The encoded-size hint does not limit
     /// fetches; decoding and address verification belong to the reader.
     pub async fn get_encoded(&self, digest: [u8; 32], _hint: u64, max_bytes: u64) -> Result<Bytes> {
-        let limit = max_bytes.min(17 << 20);
+        let limit = max_bytes.min(isize::MAX as u64 - 1);
         let _permit = self
             .permits
             .acquire()
@@ -514,7 +514,7 @@ impl S3BlobStore {
         reason = "Errors follow the documented operation contract and crate error types."
     )]
     pub async fn put(&self, raw: Bytes) -> Result<Extent> {
-        if raw.is_empty() || raw.len() > crate::DATA_FRAME_MAX {
+        if raw.is_empty() {
             return Err(Error::Budget("external object size"));
         }
         let permit = self
@@ -535,7 +535,7 @@ impl S3BlobStore {
         // only a hint (another encoder may have written it); readers always
         // decode and verify the SHA-256, so a damaged object fails loudly.
         match self.store.head(&path).await {
-            Ok(meta) if meta.size > 0 && meta.size <= 17 << 20 => {
+            Ok(meta) if meta.size > 0 => {
                 drop(permit);
                 return Ok(Extent {
                     size: raw.len() as u64,
@@ -573,7 +573,7 @@ impl S3BlobStore {
             // encoding and return the stored size as the extent's hint.
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let meta = self.store.head(&path).await.map_err(storage_error)?;
-                if meta.size == 0 || meta.size > 17 << 20 {
+                if meta.size == 0 {
                     return Err(Error::Budget("encoded object size"));
                 }
                 meta.size

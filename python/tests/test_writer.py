@@ -192,6 +192,53 @@ def test_async_callbacks_run_off_loop_and_cancellation_joins_before_cleanup(tmp_
     asyncio.run(exercise())
 
 
+def test_native_writer_workers_retain_capacity_after_cancellation():
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        release = threading.Event()
+        full = asyncio.Event()
+        ninth_started = asyncio.Event()
+        finished = asyncio.Event()
+        started = set()
+        completed = set()
+
+        def record_start(index):
+            started.add(index)
+            if len(started) == 8:
+                full.set()
+            if index == 8:
+                ninth_started.set()
+
+        def record_finish(index):
+            completed.add(index)
+            if len(completed) == 9:
+                finished.set()
+
+        def operation(index):
+            loop.call_soon_threadsafe(record_start, index)
+            try:
+                assert release.wait(10), "test did not release worker"
+            finally:
+                loop.call_soon_threadsafe(record_finish, index)
+
+        tasks = [
+            asyncio.ensure_future(_native._writer_call(lambda i=i: operation(i))) for i in range(8)
+        ]
+        try:
+            await asyncio.wait_for(full.wait(), 10)
+            tasks[0].cancel()
+            await asyncio.sleep(0)
+            tasks.append(asyncio.ensure_future(_native._writer_call(lambda: operation(8))))
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(ninth_started.wait(), 0.1)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(finished.wait(), 10)
+
+    asyncio.run(exercise())
+
+
 def test_cancelled_async_open_discards_new_output(tmp_path, monkeypatch):
     path = tmp_path / "archive.zstar"
     original = ArchiveWriter.from_file
@@ -463,3 +510,50 @@ def test_writer_discards_unfinished_output_after_context_exception():
     assert writer.closed and not partial.closed
     with pytest.raises(zstar.ZstarError):
         zstar.Archive(partial.getvalue())
+
+
+def test_writer_large_external_entry(corpus_dir):
+    with zstar.Archive((corpus_dir / "limits/many-extents.zstar").read_bytes()) as reader:
+        entry = reader.entry("file")
+    assert len(entry[6]) == 65_537
+    output = io.BytesIO()
+    with ArchiveWriter(output) as writer:
+        writer.add_entry(entry)
+    with zstar.Archive(output.getvalue()) as reader:
+        assert len(reader.entry("file")[6]) == 65_537
+        assert reader.verify()["full_archive_verified"]
+
+
+def test_writer_preflights_impossible_inline_metadata():
+    class Unreadable:
+        def read(self, size=-1):
+            raise AssertionError("preflight must not consume the body")
+
+    output = io.BytesIO()
+    info = TarInfo("huge")
+    info.size = 1 << 50
+    with (
+        pytest.raises(zstar.ZstarError) as caught,
+        ArchiveWriter(output, limits={"max_entry_bytes": 8 << 20}) as writer,
+    ):
+        writer.addfile(info, Unreadable())
+    assert caught.value.category == "resource-limit"
+    assert output.getvalue() == b""
+
+
+def test_frame_sizes_are_caller_policy():
+    output = io.BytesIO()
+    with ArchiveWriter(output, frame_size=32 << 20) as writer:
+        writer.write_bytes("large", b"x" * (17 << 20))
+    encoded = output.getvalue()
+    with zstar.Archive(encoded) as reader:
+        assert reader.read_range("large", (17 << 20) - 1, 17 << 20) == b"x"
+        assert reader.verify()["full_archive_verified"]
+    with pytest.raises(zstar.ZstarError) as caught:
+        zstar.Archive(encoded, limits={"max_frame_decoded_bytes": 16 << 20})
+    assert caught.value.category == "resource-limit"
+    with pytest.raises(zstar.ZstarError) as caught:
+        ArchiveWriter(
+            io.BytesIO(), frame_size=32 << 20, limits={"max_frame_decoded_bytes": 16 << 20}
+        )
+    assert caught.value.category == "resource-limit"

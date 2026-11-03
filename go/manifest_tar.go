@@ -20,6 +20,7 @@ type ArchiveReport struct {
 }
 
 type manifestTarCursor struct {
+	limits                         Limits
 	decoder                        frameDecoder
 	input                          manifestRangeStream
 	raw                            []byte
@@ -69,8 +70,8 @@ func (c *manifestTarCursor) nextFrame() error {
 		if kind == 1 {
 			size = 1
 		}
-		if uint64(len(encoded))+3+size+4 > 17<<20 {
-			return rejected("malformed-frame", "encoded frame limit")
+		if err = checkLimit(uint64(len(encoded))+3+size+4, c.limits.MaxFrameEncodedBytes, "encoded frame size"); err != nil {
+			return err
 		}
 		encoded = append(encoded, h...)
 		encoded, err = c.input.appendTo(encoded, size)
@@ -86,7 +87,7 @@ func (c *manifestTarCursor) nextFrame() error {
 		return err
 	}
 	encoded = append(encoded, checksum...)
-	raw, err := c.decoder.decode(encoded, 0, maxFrameSize, 17<<20)
+	raw, err := c.decoder.decode(encoded, 0, addressLimit(c.limits.MaxFrameDecodedBytes), addressLimit(c.limits.MaxFrameEncodedBytes))
 	if err != nil {
 		return categorized("malformed-frame", err)
 	}
@@ -123,7 +124,11 @@ func (c *manifestTarCursor) consume(size uint64, visit func([]byte, uint64, uint
 }
 
 func (c *manifestTarCursor) take(size uint64) ([]byte, error) {
-	out := make([]byte, 0, int(size))
+	if size > uint64(^uint(0)>>1) {
+		return nil, rejected("resource-limit", "tar payload exceeds address space")
+	}
+	// A tar/PAX length is untrusted; grow only as physical payload arrives.
+	out := make([]byte, 0, int(min(size, 64<<10)))
 	err := c.consume(size, func(b []byte, _, _, _ uint64) error { out = append(out, b...); return nil })
 	return out, err
 }
@@ -265,7 +270,7 @@ func (m *Manifest) ValidateArchive(ctx context.Context) (ArchiveReport, error) {
 // metadata/content through m, but must not close it during validation. Entry
 // metadata is isolated from validation state and reused for each member chunk.
 func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) error) (report ArchiveReport, err error) {
-	if err = m.ValidateMetadata(ctx); err != nil {
+	if err = m.checkOpen(ctx); err != nil {
 		return report, err
 	}
 	defer func() {
@@ -273,7 +278,7 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 			report = ArchiveReport{}
 		}
 	}()
-	c := manifestTarCursor{input: manifestRangeStream{ctx: ctx, source: m.source, end: m.start, category: "malformed-frame", readAhead: m.readAhead}}
+	c := manifestTarCursor{limits: m.spool.options.Limits, decoder: frameDecoder{limits: m.spool.options.Limits}, input: manifestRangeStream{ctx: ctx, source: m.source, end: m.start, category: "malformed-frame", readAhead: m.readAhead}}
 	defer c.decoder.close()
 	cursor := m.Cursor()
 	ordered := true
@@ -353,8 +358,8 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 			visitorEntry = cloneEntry(*entry)
 		}
 		if entry.External() {
-			if header.size > 16<<20 {
-				return report, rejected("malformed-pointer", "pointer size limit")
+			if err = checkLimit(header.size, c.limits.MaxPointerBytes, "pointer size"); err != nil {
+				return report, err
 			}
 			pointer, e := c.take(header.size)
 			if e != nil {

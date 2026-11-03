@@ -23,11 +23,8 @@ import (
 )
 
 const (
-	manifestBlockMax   = 16 << 20
-	manifestEntryMax   = 8 << 20
-	manifestExtentsMax = 65536
 	// manifestHeaderMax bounds the root header map. The spec sets no header
-	// size, only the 8 MiB entry bound, so this is a deliberate local policy
+	// or entry size, so this is a deliberate local policy
 	// several metadata segments, so large root extensions still open.
 	manifestHeaderMax = 64 << 20
 	// Default budget for retained []Entry metadata.
@@ -52,11 +49,11 @@ func (e Extent) value() []any {
 }
 
 func (e Extent) validate(dataEnd uint64) error {
-	if e.Size == 0 || e.Size > maxFrameSize || e.EncodedSize == 0 || e.Offset > maxFrameSize || e.Size > maxFrameSize-e.Offset {
+	if e.Size == 0 || e.EncodedSize == 0 || e.Size > math.MaxUint64-e.Offset {
 		return rejected("malformed-toc", "extent bounds")
 	}
 	if s, archive := e.Source.ArchiveOffset(); archive {
-		if e.EncodedSize > 17<<20 || s > dataEnd || e.EncodedSize > dataEnd-s {
+		if s > dataEnd || e.EncodedSize > dataEnd-s {
 			return rejected("malformed-toc", "archive extent bounds")
 		}
 	} else {
@@ -180,7 +177,7 @@ func (e Entry) value() []any {
 }
 
 func (e Entry) validateFields(dataEnd uint64) error {
-	if !validPath(e.Path) || e.Mode > 4095 || len(e.Extents) > manifestExtentsMax {
+	if !validPath(e.Path) || e.Mode > 4095 {
 		return rejected("malformed-toc", "entry metadata")
 	}
 	if e.Type != TypeFile && e.Type != TypeSymlink && e.Type != TypeDirectory {
@@ -210,19 +207,7 @@ func (e Entry) validateFields(dataEnd uint64) error {
 	return nil
 }
 
-func (e Entry) validate(dataEnd uint64) error {
-	if err := e.validateFields(dataEnd); err != nil {
-		return err
-	}
-	raw, err := encodeEntry(e)
-	if err != nil {
-		return err
-	}
-	if len(raw) > manifestEntryMax {
-		return rejected("malformed-toc", "entry maximum")
-	}
-	return nil
-}
+func (e Entry) validate(dataEnd uint64) error { return e.validateFields(dataEnd) }
 
 func parseEntry(value any, dataEnd uint64) (Entry, error) {
 	var e Entry
@@ -256,7 +241,7 @@ func parseEntry(value any, dataEnd uint64) (Entry, error) {
 		return e, rejected("malformed-toc", "mtime")
 	}
 	values, ok := v[6].([]any)
-	if !ok || len(values) > manifestExtentsMax {
+	if !ok {
 		return e, rejected("malformed-toc", "extent list")
 	}
 	e.Extents = make([]Extent, 0, len(values))
@@ -336,6 +321,7 @@ func manifestEncode(value any) ([]byte, error) {
 // ManifestReaderOptions controls manifest reading and content resource budgets.
 // Zero values select documented defaults. Writer configuration uses ManifestWriterOptions.
 type ManifestReaderOptions struct {
+	Limits                                        Limits
 	MemoryBytes, MaxEncodedBytes, MaxDecodedBytes uint64
 	MaxReadBytes                                  uint64
 	// MaxRetainedEntryBytes bounds the estimated heap retained by parsed
@@ -365,31 +351,14 @@ type ManifestSpillStore interface {
 	io.Closer
 }
 
-// SpoolOptions controls packed-object temporary storage. Zero values select
-// 8 MiB in memory and a 4 GiB size limit and shared quota.
-type SpoolOptions struct {
-	MemoryBytes      uint64
-	MaxEncodedBytes  uint64
-	DisableDisk      bool
-	SpoolBudget      *SpoolBudget
-	CreateSpillStore func() (ManifestSpillStore, error)
-}
-
-func (o SpoolOptions) defaults() manifestOptions {
-	return (ManifestReaderOptions{
-		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
-		DisableDisk: o.DisableDisk, SpoolBudget: o.SpoolBudget,
-		CreateSpillStore: o.CreateSpillStore,
-	}).defaults()
-}
-
 // ManifestWriterOptions controls manifest encoding and temporary storage.
 // Zero values select defaults. Reader-only limits are intentionally unavailable.
 type ManifestWriterOptions struct {
+	Limits                                        Limits
 	MemoryBytes, MaxEncodedBytes, MaxDecodedBytes uint64
 	CompressionLevel                              int
 	RootExtensions                                Extensions
-	// BlockTarget is a target in [512, 1 MiB], default 64 KiB.
+	// BlockTarget is a target of at least 512 bytes, default 64 KiB.
 	BlockTarget      int
 	DisableDisk      bool
 	SpoolBudget      *SpoolBudget
@@ -405,7 +374,7 @@ type manifestOptions struct {
 
 func (o ManifestWriterOptions) defaults() manifestOptions {
 	result := (ManifestReaderOptions{
-		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
+		Limits: o.Limits, MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
 		MaxDecodedBytes: o.MaxDecodedBytes, DisableDisk: o.DisableDisk,
 		SpoolBudget: o.SpoolBudget, CreateSpillStore: o.CreateSpillStore,
 	}).defaults()
@@ -419,7 +388,7 @@ func (o ManifestWriterOptions) defaults() manifestOptions {
 
 func (o manifestOptions) writerOptions() ManifestWriterOptions {
 	return ManifestWriterOptions{
-		MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
+		Limits: o.Limits, MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
 		MaxDecodedBytes: o.MaxDecodedBytes, CompressionLevel: o.CompressionLevel,
 		RootExtensions: o.RootExtensions, BlockTarget: o.BlockTarget,
 		DisableDisk: o.DisableDisk, SpoolBudget: o.SpoolBudget,
@@ -674,8 +643,8 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		return nil, errors.New("zstar: nil source")
 	}
 	options := config.defaults()
-	if options.ReadAheadBytes > 17<<20 {
-		return nil, rejected("resource-limit", "read-ahead exceeds 17 MiB")
+	if options.Limits.MaxFrameEncodedBytes != 0 && options.ReadAheadBytes > options.Limits.MaxFrameEncodedBytes {
+		return nil, rejected("resource-limit", "read-ahead exceeds configured frame budget")
 	}
 	if options.ConcurrentChunks < 1 || options.ConcurrentChunks > 256 {
 		return nil, errors.New("zstar: concurrent chunks must be in [1, 256]")
@@ -737,7 +706,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			err = errors.Join(err, m.spool.close())
 		}
 	}()
-	decoder := frameDecoder{}
+	decoder := frameDecoder{limits: options.Limits}
 	defer decoder.close()
 	hash := sha256.New()
 	var decoded uint64
@@ -758,8 +727,11 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			return nil, rejected("malformed-toc", "metadata wrapper")
 		}
 		size := uint64(binary.LittleEndian.Uint32(header[4:]))
-		if size == 0 || size > 17<<20 || size > end-at-8 {
+		if size == 0 || size > end-at-8 {
 			return nil, rejected("malformed-toc", "metadata frame size")
+		}
+		if e := checkLimit(size, options.Limits.MaxFrameEncodedBytes, "encoded metadata frame size"); e != nil {
+			return nil, e
 		}
 		encoded, e := input.take(size)
 		if e != nil {
@@ -768,7 +740,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		if uint64(len(encoded)) != size {
 			return nil, rejected("malformed-toc", "short metadata")
 		}
-		raw, e := decoder.decode(encoded, 0, manifestBlockMax, 17<<20)
+		raw, e := decoder.decode(encoded, 0, min(addressLimit(options.Limits.MaxFrameDecodedBytes), int(options.MaxDecodedBytes-decoded)), addressLimit(options.Limits.MaxFrameEncodedBytes))
 		if e != nil {
 			return nil, categorized("malformed-toc", e)
 		}
@@ -827,7 +799,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		}
 		m.requiredFeatures = append(m.requiredFeatures, s)
 	}
-	sequence.limit = manifestEntryMax
+	sequence.limit = options.Limits.MaxEntryBytes
 	var retained uint64
 	for {
 		value, e := sequence.next()
@@ -842,6 +814,9 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		}
 		entry, e := parseEntry(value, m.start)
 		if e != nil {
+			return nil, e
+		}
+		if e = options.Limits.entry(entry, sequence.lastSize); e != nil {
 			return nil, e
 		}
 		if len(m.entries) > 0 && m.entries[len(m.entries)-1].Path >= entry.Path {

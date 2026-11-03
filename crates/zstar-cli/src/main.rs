@@ -1,4 +1,3 @@
-mod packed;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_runtime::env_config::{file::EnvConfigFiles, property::PropertiesKey};
 use aws_types::os_shim_internal::{Env as AwsEnv, Fs as AwsFs};
@@ -120,39 +119,6 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Explicit thin capture with immutable packed objects and generation publication.
-    PackObjects {
-        input: PathBuf,
-        output: PathBuf,
-        catalog: PathBuf,
-        #[arg(long)]
-        store: PathBuf,
-        #[arg(long,value_parser=["fixed","fastcdc"],default_value="fixed")]
-        chunking: String,
-    },
-    /// Reconstruct a portable archive using an explicitly selected catalog.
-    MaterializeObjects {
-        archive: PathBuf,
-        catalog: PathBuf,
-        output: PathBuf,
-        #[arg(long)]
-        store: PathBuf,
-    },
-    /// Reconstruct a portable archive from a store-relative immutable descriptor key.
-    MaterializeGeneration {
-        generation: String,
-        output: PathBuf,
-        #[arg(long)]
-        store: PathBuf,
-    },
-    /// Export verified complete frames into standalone objects/<digest>.zst files.
-    ExportObjects {
-        catalog: PathBuf,
-        #[arg(long)]
-        store: PathBuf,
-        #[arg(long)]
-        destination: PathBuf,
-    },
     Pack {
         input: PathBuf,
         output: PathBuf,
@@ -335,29 +301,6 @@ async fn main() -> restore::AnyResult<()> {
         .compact()
         .try_init();
     match Args::parse().command {
-        Command::PackObjects {
-            input,
-            output,
-            catalog,
-            store,
-            chunking,
-        } => packed::capture(input, output, catalog, store, chunking == "fastcdc").await?,
-        Command::MaterializeObjects {
-            archive,
-            catalog,
-            output,
-            store,
-        } => packed::materialize(archive, catalog, output, store).await?,
-        Command::MaterializeGeneration {
-            generation,
-            output,
-            store,
-        } => packed::generation(generation, output, store).await?,
-        Command::ExportObjects {
-            catalog,
-            store,
-            destination,
-        } => packed::export(catalog, store, destination).await?,
         Command::Pack {
             input,
             output,
@@ -450,7 +393,6 @@ async fn main() -> restore::AnyResult<()> {
             let footer =
                 zstar::parse_footer(&source.read_range(size - zstar::FOOTER_SIZE as u64..size)?)?;
             let parsed = BlockingArchive::open(source, metadata.options())?;
-            parsed.manifest().validate_metadata()?;
             println!(
                 "metadata_offset={} metadata_encoded_size={} metadata_decoded_size={} entries={}",
                 footer.toc_offset,

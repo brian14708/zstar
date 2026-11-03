@@ -14,7 +14,7 @@ const (
 func artifactContentType(key string) string {
 	extension := strings.TrimPrefix(path.Ext(key), ".")
 	switch strings.ToLower(extension) {
-	case "zstar", "zst", "zstp":
+	case "zstar", "zst":
 		return zstdContentType
 	case "cbor":
 		return "application/cbor"

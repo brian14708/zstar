@@ -34,12 +34,24 @@ async fn main() -> zstar::Result<()> {
 
 `Builder::finish` finalizes the manifest and footer. File paths are relative,
 use `/` separators, and require explicit entries for ancestor directories.
-Entries may be added in any order; the writer sorts the manifest.
+Entries may be added in any order; this writer sorts the manifest. The format
+also permits writer APIs that require sorted input. Optional
+`ManifestOptions.limits` budgets bound frames, windows, metadata items,
+and extent counts. Zero disables each additional limit. Known-size inputs that
+cannot fit configured extent or metadata budgets are rejected before payload I/O.
 
-Opening validates metadata. Selective reads validate the frames they use;
+Opening validates metadata. Metadata processing scales with the complete
+manifest, and the retained index must fit the configured memory budget. Spilling
+decoded metadata does not make the index disk-backed. Selective reads validate
+the frames they use;
 `verify(VerificationScope::Archive)` additionally checks the physical tar stream
 and payload mapping. External-closure verification also resolves external
 content. These checks establish internal consistency, not authenticity.
+
+Use `open_cursor()` for reusable positional member reads. A `FileCursor` borrows
+the archive on each read and supports concurrent reads without changing a stream
+position. After inspecting an entry, `cursor_from_entry()` avoids looking it up
+again; supply the unmodified entry from the same archive.
 
 ## Features and storage
 
@@ -49,7 +61,7 @@ content. These checks establish internal consistency, not authenticity.
 | `disk` | Temporary-file spill storage | Yes |
 | `fs` | Local range sources, filesystem capture, and restoration | No |
 | `http` | HTTP range sources and presigned requests | No |
-| `s3` | S3 storage and packed objects; also enables `http` | No |
+| `s3` | S3 storage; also enables `http` | No |
 
 Enable adapters through Cargo features, for example
 `zstar = { version = "0.0.1", features = ["fs"] }`.
@@ -63,9 +75,8 @@ policies before constructing the builder.
 writer, and metadata budgets. Keep caller-owned sources immutable while a
 reader is in use.
 
-Manifest primitives and packed-storage spool types are exported from the crate
-root. Capture sorting and manifest module layout are internal implementation
-details. Custom `PackStore` implementations can use the public `Spool` type.
+Manifest primitives and spool types are exported from the crate root. Capture
+sorting and manifest module layout are internal implementation details.
 
 From the repository root, run the examples with:
 

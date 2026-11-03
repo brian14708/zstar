@@ -1,108 +1,28 @@
-use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes};
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
-use tokio::sync::{Notify, watch};
-use zstar::AsyncRangeReader;
-use zstar::{ObjectResolver, ReaderOptions};
+use pyo3::prelude::*;
+use std::{collections::BTreeMap, sync::Arc};
 
-use super::reader::{Reader, open_reader, reader_options};
+use super::reader::{Lease, Session, reader_options};
 use super::request::FailureSlot;
 
 /// Async indexed archive over bytes, local sources, HTTP, or S3.
 /// Open authenticates metadata; use `verify` to check physical content.
 #[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncArchive {
-    state: Mutex<Owner>,
-}
-struct Owner {
-    open: Option<Arc<State>>,
-    closing: Weak<State>,
-}
-struct State {
-    reader: Reader,
-    resolver: Option<Arc<dyn ObjectResolver>>,
-    closed: watch::Sender<bool>,
-    active: AtomicUsize,
-    drained: Notify,
-    failures: Option<Arc<FailureSlot>>,
-}
-struct Lease(Arc<State>);
-impl Drop for Lease {
-    fn drop(&mut self) {
-        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.drained.notify_waiters();
-        }
-    }
-}
-impl Lease {
-    async fn run<T>(&self, work: impl Future<Output = PyResult<T>>) -> PyResult<T> {
-        let mut closed = self.0.closed.subscribe();
-        tokio::select! {
-            biased;
-            () = async {
-                if !*closed.borrow_and_update() {
-                    let _ = closed.changed().await;
-                }
-            } => Err(super::core_error(zstar::Error::Unsupported("reader closed"))),
-            result = work => result.map_err(|error| match &self.0.failures {
-                Some(failures) => failures.annotate(error),
-                None => error,
-            }),
-        }
-    }
+    session: Session,
 }
 impl AsyncArchive {
-    async fn open_source(
-        source: Arc<dyn AsyncRangeReader>,
-        options: ReaderOptions,
-        failures: Option<Arc<FailureSlot>>,
-    ) -> PyResult<Self> {
-        let resolver = options.resolver.clone();
-        let reader = open_reader(source, options)
-            .await
-            .map_err(|error| match &failures {
-                Some(failures) => failures.annotate(error),
-                None => error,
-            })?;
-        Ok(Self::owned(reader, resolver, failures))
-    }
-    fn owned(
-        reader: Reader,
-        resolver: Option<Arc<dyn ObjectResolver>>,
-        failures: Option<Arc<FailureSlot>>,
-    ) -> Self {
-        Self {
-            state: Mutex::new(Owner {
-                open: Some(Arc::new(State {
-                    reader,
-                    resolver,
-                    closed: watch::channel(false).0,
-                    active: AtomicUsize::new(0),
-                    drained: Notify::new(),
-                    failures,
-                })),
-                closing: Weak::new(),
-            }),
-        }
+    fn open(
+        py: Python<'_>,
+        work: impl std::future::Future<Output = PyResult<Session>> + Send + 'static,
+    ) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(Self {
+                session: work.await?,
+            })
+        })
     }
     fn lease(&self) -> PyResult<Lease> {
-        // Admit under the mutex, release it, and only then build a Python error.
-        let admitted = {
-            let owner = super::lock_state(&self.state);
-            owner.open.as_ref().map(|state| {
-                state.active.fetch_add(1, Ordering::Relaxed);
-                state.clone()
-            })
-        };
-        admitted
-            .map(Lease)
-            .ok_or_else(|| super::core_error(zstar::Error::Unsupported("reader closed")))
+        self.session.lease()
     }
 }
 #[pymethods]
@@ -111,7 +31,7 @@ impl AsyncArchive {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(super::reader::MemberCursor::open(&lease.0.reader, &path))
+                .run(super::reader::MemberCursor::open(&lease.reader, &path))
                 .await
         })
     }
@@ -119,26 +39,29 @@ impl AsyncArchive {
         &self,
         py: Python<'py>,
         cursor: &super::reader::MemberCursor,
-        offset: u64,
-        length: u64,
+        size: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let cursor = cursor.inner.clone();
+        let cursor = cursor.clone();
+        let length = super::reader::member_read_length(size)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let bytes = lease
-                .run(async {
-                    cursor
-                        .lock()
-                        .await
-                        .read(&lease.0.reader, offset, length)
-                        .await
-                        .map_err(super::core_error)
-                })
-                .await?;
-            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+            lease.run(cursor.read(&lease.reader, length)).await
         })
     }
     fn _read_member_into<'py>(
+        &self,
+        py: Python<'py>,
+        cursor: &super::reader::MemberCursor,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let lease = self.lease()?;
+        let cursor = cursor.clone();
+        let buffer = super::reader::WritableBuffer::new(buffer)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            lease.run(cursor.read_into(&lease.reader, &buffer)).await
+        })
+    }
+    fn _read_member_into_at<'py>(
         &self,
         py: Python<'py>,
         cursor: &super::reader::MemberCursor,
@@ -146,52 +69,25 @@ impl AsyncArchive {
         buffer: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let cursor = cursor.inner.clone();
-        let buffer = PyBuffer::<u8>::get(buffer)?;
-        let length = buffer.item_count() as u64;
+        let cursor = cursor.clone();
+        let buffer = super::reader::WritableBuffer::new(buffer)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let bytes = lease
-                .run(async {
-                    cursor
-                        .lock()
-                        .await
-                        .read(&lease.0.reader, offset, length)
-                        .await
-                        .map_err(super::core_error)
-                })
-                .await?;
-            Python::attach(|py| {
-                buffer.copy_from_slice(py, &bytes)?;
-                Ok(bytes.len())
-            })
+            lease
+                .run(cursor.read_into_at(&lease.reader, offset, &buffer))
+                .await
         })
     }
-    /// Verify every physical frame and tar member, optionally including external objects.
     #[pyo3(
         signature = (
             *,
             external = false,
         )
     )]
+    /// Verify physical frames and tar members, optionally including external objects.
     fn verify<'py>(&self, py: Python<'py>, external: bool) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let scope = if external {
-            zstar::VerificationScope::ExternalClosure
-        } else {
-            zstar::VerificationScope::Archive
-        };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            lease
-                .run(async {
-                    let report = lease
-                        .0
-                        .reader
-                        .verify(scope)
-                        .await
-                        .map_err(super::core_error)?;
-                    Python::attach(|py| super::verification_dict(py, report))
-                })
-                .await
+            lease.run(lease.verify(external)).await
         })
     }
     /// Awaitable: owned entry metadata, or None if the path is absent.
@@ -199,24 +95,17 @@ impl AsyncArchive {
     fn entry<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let entry = lease
-                .run(async { lease.0.reader.entry(&path).await.map_err(super::core_error) })
-                .await?;
-            Python::attach(|py| {
-                entry
-                    .map(|entry| super::manifest_api::to_py(py, &entry.to_value()))
-                    .transpose()
-            })
+            lease.run(lease.entry(&path)).await
         })
     }
     #[getter]
     fn root_extensions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let lease = self.lease()?;
-        super::manifest_api::extensions_to_py(py, lease.0.reader.root_extensions())
+        super::manifest::extensions_to_py(py, lease.reader.root_extensions())
     }
     #[getter]
     fn entry_count(&self) -> PyResult<u64> {
-        Ok(self.lease()?.0.reader.entry_count())
+        Ok(self.lease()?.reader.entry_count())
     }
     /// Lazily yield owned entry tuples in path order with async iteration.
     #[pyo3(
@@ -228,8 +117,9 @@ impl AsyncArchive {
         slf.lease()?;
         Ok(AsyncEntries {
             archive: slf.into(),
-            prefix,
-            cursor: Arc::new(tokio::sync::Mutex::new((None, false))),
+            cursor: Arc::new(tokio::sync::Mutex::new(super::reader::EntryIterator::new(
+                prefix,
+            ))),
         })
     }
     /// Open an immutable encoded byte snapshot.
@@ -238,57 +128,19 @@ impl AsyncArchive {
         signature = (
             data,
             *,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Independent wire fields or Python keyword options form this API."
     )]
     fn from_bytes<'py>(
         py: Python<'py>,
         data: &Bound<'py, PyAny>,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let options = reader_options(
+        let options = reader_options(py, options)?;
+        Self::open(
             py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
-        let source: Arc<dyn AsyncRangeReader> =
-            Arc::new(bytes::Bytes::from(super::buffer_vec(py, data)?));
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, None).await
-        })
+            Session::from_bytes(crate::support::buffer_vec(py, data)?, options),
+        )
     }
     /// Open an immutable local archive using bounded positional file reads.
     #[staticmethod]
@@ -296,60 +148,16 @@ impl AsyncArchive {
         signature = (
             path,
             *,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
     )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Independent wire fields or Python keyword options form this API."
-    )]
-    fn from_file(
-        py: Python<'_>,
+    fn from_file<'py>(
+        py: Python<'py>,
         path: std::path::PathBuf,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        let options = reader_options(
-            py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let source: Arc<dyn AsyncRangeReader> = Arc::new(
-                zstar::fs::AsyncLocalFileSource::open(path)
-                    .await
-                    .map_err(super::local_source_error)?,
-            );
-            Self::open_source(source, options, None).await
-        })
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = reader_options(py, options)?;
+        Self::open(py, Session::from_file(path, options))
     }
     /// Borrow a seekable Python file object; sizing and reads run off-loop.
     #[staticmethod]
@@ -357,76 +165,16 @@ impl AsyncArchive {
         signature = (
             fileobj,
             *,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
     )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Independent wire fields or Python keyword options form this API."
-    )]
-    fn from_fileobj(
-        py: Python<'_>,
+    fn from_fileobj<'py>(
+        py: Python<'py>,
         fileobj: Py<PyAny>,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        let options = reader_options(
-            py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (object, size) = tokio::task::spawn_blocking(move || {
-                Python::attach(|py| {
-                    let source = py
-                        .import("zstar._source")?
-                        .getattr("_FileSource")?
-                        .call1((fileobj,))?;
-                    let size: u64 = source.getattr("size")?.extract()?;
-                    Ok::<_, PyErr>((source.unbind(), size))
-                })
-            })
-            .await
-            .map_err(|_| {
-                super::core_error(zstar::Error::Io(std::io::Error::other(
-                    "file object worker failed",
-                )))
-            })??;
-            let source: Arc<dyn AsyncRangeReader> = Arc::new(super::PythonSource {
-                object: Arc::new(object),
-                size,
-                permits: Arc::new(tokio::sync::Semaphore::new(8)),
-            });
-            Self::open_source(source, options, None).await
-        })
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = reader_options(py, options)?;
+        Self::open(py, Session::from_fileobj(fileobj, options))
     }
     /// Open an immutable synchronous `read_range(offset, length)` source.
     /// Callbacks run on bounded workers.
@@ -436,61 +184,17 @@ impl AsyncArchive {
             source,
             size,
             *,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
     )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Independent wire fields or Python keyword options form this API."
-    )]
-    fn from_source(
-        py: Python<'_>,
+    fn from_source<'py>(
+        py: Python<'py>,
         source: Py<PyAny>,
         size: u64,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        let options = reader_options(
-            py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
-        let source: Arc<dyn AsyncRangeReader> = Arc::new(super::PythonSource {
-            object: Arc::new(source),
-            size,
-            permits: Arc::new(tokio::sync::Semaphore::new(8)),
-        });
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, None).await
-        })
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = reader_options(py, options)?;
+        Self::open(py, Session::from_python(source, size, options))
     }
 
     #[staticmethod]
@@ -500,66 +204,20 @@ impl AsyncArchive {
             *,
             headers = None,
             provider = None,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
     )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Independent wire fields or Python keyword options form this API."
-    )]
-    fn from_url(
-        py: Python<'_>,
+    fn from_url<'py>(
+        py: Python<'py>,
         url: Option<String>,
         headers: Option<BTreeMap<String, String>>,
         provider: Option<Py<PyAny>>,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        let options = reader_options(
-            py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = reader_options(py, options)?;
         let failures = Arc::new(FailureSlot::default());
-        let source: Arc<dyn AsyncRangeReader> = Arc::new(super::request::source(
-            py,
-            "GET",
-            url,
-            headers,
-            provider,
-            failures.clone(),
-        )?);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::open_source(source, options, Some(failures)).await
-        })
+        let source = super::request::source(py, "GET", url, headers, provider, failures.clone())?;
+        Self::open(py, Session::open(Arc::new(source), options, Some(failures)))
     }
     #[staticmethod]
     #[pyo3(
@@ -574,25 +232,15 @@ impl AsyncArchive {
             access_key_id = None,
             secret_access_key = None,
             session_token = None,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
+            **options,
         )
     )]
     #[expect(
         clippy::too_many_arguments,
         reason = "Independent wire fields or Python keyword options form this API."
     )]
-    fn from_s3(
-        py: Python<'_>,
+    fn from_s3<'py>(
+        py: Python<'py>,
         bucket: String,
         key: String,
         endpoint: Option<String>,
@@ -602,32 +250,9 @@ impl AsyncArchive {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Bound<'_, PyAny>> {
-        let options = reader_options(
-            py,
-            concurrent_chunks,
-            verify_external,
-            memory_bytes,
-            max_encoded_bytes,
-            max_decoded_bytes,
-            max_read_bytes,
-            max_retained_entry_bytes,
-            max_entries,
-            max_spool_bytes,
-            create_spill_store,
-            resolver,
-        )?;
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = reader_options(py, options)?;
         let builder = super::s3::builder(
             bucket,
             endpoint,
@@ -637,12 +262,7 @@ impl AsyncArchive {
             secret_access_key,
             session_token,
         )?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut options = options;
-            let source = super::s3::source(builder, key, object_prefix, &mut options)
-                .map_err(super::core_error)?;
-            Self::open_source(source, options, None).await
-        })
+        Self::open(py, Session::from_s3(builder, key, object_prefix, options))
     }
     /// Batch logical ranges with chunk sharing and cancellation propagation.
     #[pyo3(
@@ -658,52 +278,12 @@ impl AsyncArchive {
         requests: &Bound<'_, PyAny>,
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let requests = super::batch_requests(requests)?;
+        let requests = super::reader::batch_requests(requests)?;
         let lease = self.lease()?;
-        let resolver = resolver.map(|r| super::pack::binding(py, r));
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let ranges: Vec<_> = requests
-                .iter()
-                .map(|(path, offset, length)| zstar::ReadRequest {
-                    path,
-                    offset: *offset,
-                    length: *length,
-                })
-                .collect();
-            lease
-                .run(async {
-                    let object_resolver = resolver
-                        .as_ref()
-                        .map(|r| r.as_ref() as &dyn ObjectResolver)
-                        .or(lease.0.resolver.as_deref());
-                    let outputs = lease
-                        .0
-                        .reader
-                        .read_many_with_resolver(&ranges, object_resolver)
-                        .await
-                        .map_err(super::core_error)?;
-                    Python::attach(|py| {
-                        Ok(outputs
-                            .iter()
-                            .map(|bytes| PyBytes::new(py, bytes).unbind())
-                            .collect::<Vec<_>>())
-                    })
-                })
-                .await
-        })
-    }
-    fn validate_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let lease = self.lease()?;
+        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(async {
-                    lease
-                        .0
-                        .reader
-                        .validate_metadata()
-                        .await
-                        .map_err(super::core_error)
-                })
+                .run(lease.read_many(&requests, resolver.as_deref()))
                 .await
         })
     }
@@ -725,103 +305,31 @@ impl AsyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let resolver = resolver.map(|r| super::pack::binding(py, r));
+        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(async {
-                    let length = super::read_length(&lease.0.reader, &path, offset, length)
-                        .await
-                        .map_err(super::core_error)?;
-                    let object_resolver = resolver
-                        .as_ref()
-                        .map(|r| r.as_ref() as &dyn ObjectResolver)
-                        .or(lease.0.resolver.as_deref());
-                    let (raw, report) = lease
-                        .0
-                        .reader
-                        .read_range_with_report_and_resolver(&path, offset, length, object_resolver)
-                        .await
-                        .map_err(super::core_error)?;
-                    Python::attach(|py| {
-                        Ok((
-                            PyBytes::new(py, &raw).unbind(),
-                            super::report_dict(py, report)?,
-                        ))
-                    })
-                })
+                .run(lease.read_with_report(&path, offset, length, resolver.as_deref()))
                 .await
-        })
-    }
-    fn paths<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let lease = self.lease()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let entries = lease
-                .run(async {
-                    lease
-                        .0
-                        .reader
-                        .collect_entries()
-                        .await
-                        .map_err(super::core_error)
-                })
-                .await?;
-            Ok(entries.into_iter().map(|e| e.path).collect::<Vec<_>>())
-        })
-    }
-    fn _entry<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        let lease = self.lease()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let entry = lease
-                .run(async { lease.0.reader.entry(&path).await.map_err(super::core_error) })
-                .await?
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(path.clone()))?;
-            Python::attach(|py| super::entry_info(py, &entry))
         })
     }
     fn read_link<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            lease
-                .run(async {
-                    lease
-                        .0
-                        .reader
-                        .read_link(&path)
-                        .await
-                        .map_err(super::core_error)
-                })
-                .await
+            lease.run(lease.read_link(&path)).await
         })
     }
     #[getter]
+    fn max_read_bytes(&self) -> PyResult<u64> {
+        Ok(self.session.lease()?.reader.max_read_bytes())
+    }
+    #[getter]
     fn closed(&self) -> bool {
-        super::lock_state(&self.state).open.is_none()
+        self.session.closed()
     }
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = {
-            let mut owner = super::lock_state(&self.state);
-            if let Some(state) = owner.open.take() {
-                owner.closing = Arc::downgrade(&state);
-                Some(state)
-            } else {
-                owner.closing.upgrade()
-            }
-        };
-        if let Some(state) = &state {
-            state.closed.send_replace(true);
-        }
+        let closing = self.session.close();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Some(state) = state {
-                loop {
-                    let drained = state.drained.notified();
-                    tokio::pin!(drained);
-                    drained.as_mut().enable();
-                    if state.active.load(Ordering::Acquire) == 0 {
-                        break;
-                    }
-                    drained.await;
-                }
-            }
+            closing.drain().await;
             Ok(())
         })
     }
@@ -857,61 +365,10 @@ impl AsyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let resolver = resolver.map(|r| super::pack::binding(py, r));
+        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(async {
-                    let length = super::read_length(&lease.0.reader, &path, offset, length)
-                        .await
-                        .map_err(super::core_error)?;
-                    let bytes = lease
-                        .0
-                        .reader
-                        .read_range_with_resolver(
-                            &path,
-                            offset,
-                            length,
-                            resolver
-                                .as_ref()
-                                .map(|r| r.as_ref() as &dyn ObjectResolver)
-                                .or(lease.0.resolver.as_deref()),
-                        )
-                        .await
-                        .map_err(super::core_error)?;
-                    Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
-                })
-                .await
-        })
-    }
-    fn _readinto<'py>(
-        &self,
-        py: Python<'py>,
-        path: String,
-        offset: u64,
-        buffer: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let lease = self.lease()?;
-        let buffer = PyBuffer::<u8>::get(buffer)?;
-        let length = buffer.item_count() as u64;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            lease
-                .run(async {
-                    let data = lease
-                        .0
-                        .reader
-                        .read_range_with_resolver(
-                            &path,
-                            offset,
-                            length,
-                            lease.0.resolver.as_deref(),
-                        )
-                        .await
-                        .map_err(super::core_error)?;
-                    Python::attach(|py| {
-                        buffer.copy_from_slice(py, &data)?;
-                        Ok(data.len())
-                    })
-                })
+                .run(lease.read(&path, offset, length, resolver.as_deref()))
                 .await
         })
     }
@@ -921,8 +378,7 @@ impl AsyncArchive {
 #[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncEntries {
     archive: Py<AsyncArchive>,
-    prefix: Option<String>,
-    cursor: Arc<tokio::sync::Mutex<(Option<zstar::EntryCursor>, bool)>>,
+    cursor: Arc<tokio::sync::Mutex<super::reader::EntryIterator>>,
 }
 #[pymethods]
 impl AsyncEntries {
@@ -932,9 +388,8 @@ impl AsyncEntries {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.archive.get().lease()?;
         let cursor = self.cursor.clone();
-        let prefix = self.prefix.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Self::next_batch(lease, cursor, prefix, 1)
+            Self::next_batch(lease, cursor, 1)
                 .await?
                 .pop()
                 .ok_or_else(|| pyo3::exceptions::PyStopAsyncIteration::new_err(()))
@@ -943,51 +398,19 @@ impl AsyncEntries {
     fn _next_batch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.archive.get().lease()?;
         let cursor = self.cursor.clone();
-        let prefix = self.prefix.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, Self::next_batch(lease, cursor, prefix, 64))
+        pyo3_async_runtimes::tokio::future_into_py(py, Self::next_batch(lease, cursor, 64))
     }
 }
 impl AsyncEntries {
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "The guard intentionally covers this short state update."
-    )]
     async fn next_batch(
         lease: Lease,
-        cursor: Arc<tokio::sync::Mutex<(Option<zstar::EntryCursor>, bool)>>,
-        prefix: Option<String>,
+        cursor: Arc<tokio::sync::Mutex<super::reader::EntryIterator>>,
         limit: usize,
     ) -> PyResult<Vec<Py<PyAny>>> {
         lease
             .run(async {
-                let mut state = cursor.lock().await;
-                if state.1 {
-                    return Ok(Vec::new());
-                }
-                // Commit the checkpoint after metadata and conversion succeed.
-                let position = match state.0.clone() {
-                    Some(position) => position,
-                    None => match &prefix {
-                        Some(prefix) => lease.0.reader.cursor_prefix(prefix).await,
-                        None => lease.0.reader.cursor().await,
-                    }
-                    .map_err(super::core_error)?,
-                };
-                let (position, entries) = lease
-                    .0
-                    .reader
-                    .next_entries(position, limit)
-                    .await
-                    .map_err(super::core_error)?;
-                let output = Python::attach(|py| {
-                    entries
-                        .iter()
-                        .map(|entry| super::manifest_api::to_py(py, &entry.to_value()))
-                        .collect::<PyResult<Vec<_>>>()
-                })?;
-                state.0 = Some(position);
-                state.1 = output.is_empty();
-                Ok(output)
+                let mut cursor = cursor.lock().await;
+                cursor.next_batch(&lease.reader, limit).await
             })
             .await
     }

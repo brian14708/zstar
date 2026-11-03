@@ -25,9 +25,10 @@ mod capture;
 mod cbor;
 pub mod chunking;
 mod decoded_body;
+mod limits;
+pub use limits::Limits;
 pub mod manifest;
 mod manifest_io;
-pub mod pack;
 pub use manifest::{Entry, EntryKind, Extent, Source};
 pub type Extensions = std::collections::BTreeMap<String, ciborium::Value>;
 #[cfg(feature = "async")]
@@ -59,16 +60,11 @@ pub use manifest_io::{
 pub use tar::{TarHeader, parse_header_prefix as parse_member_header};
 
 pub const FOOTER_SIZE: usize = 80;
-pub const DATA_FRAME_MAX: usize = 16 * 1024 * 1024;
 pub const FOOTER_MAGIC: u32 = 0x184D_2A5F;
 pub const TOC_MAGIC: u32 = 0x184D_2A5E;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("malformed packed-object catalog: {0}")]
-    MalformedCatalog(String),
-    #[error("packed object snapshot changed")]
-    ChangedPack,
     #[error("local resource budget exceeded: {0}")]
     Budget(&'static str),
     #[error("archive is not a Zstar file")]
@@ -113,8 +109,6 @@ impl Error {
     #[cfg(feature = "async")]
     pub(crate) fn duplicate(&self) -> Self {
         match self {
-            Self::MalformedCatalog(m) => Self::MalformedCatalog(m.clone()),
-            Self::ChangedPack => Self::ChangedPack,
             Self::Budget(m) => Self::Budget(m),
             Self::NotZstar => Self::NotZstar,
             Self::MalformedFooter(m) => Self::MalformedFooter(m),
@@ -139,8 +133,6 @@ impl Error {
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
-            Self::MalformedCatalog(_) => "malformed-catalog",
-            Self::ChangedPack => "changed-pack",
             Self::Budget(_) => "resource-limit",
             Self::NotZstar => "not-zstar",
             Self::MalformedFooter(_) => "malformed-footer",
@@ -303,7 +295,7 @@ pub fn encode_footer(footer: &Footer) -> [u8; FOOTER_SIZE] {
     reason = "Errors follow the documented operation contract and crate error types."
 )]
 pub fn encode_frame(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() > DATA_FRAME_MAX {
+    if data.is_empty() {
         return Err(Error::MalformedFrame("invalid decoded frame size".into()));
     }
     let mut encoder = zstd::bulk::Compressor::new(level)?;
@@ -328,21 +320,30 @@ pub(crate) fn decode_frame_into(
     decoded: &mut Vec<u8>,
     context: &mut zstd::zstd_safe::DCtx<'static>,
 ) -> Result<()> {
-    if expected_size == 0 || expected_size > DATA_FRAME_MAX || encoded.len() > 17 * 1024 * 1024 {
+    if expected_size == 0 {
         return Err(Error::MalformedFrame("frame size limit".into()));
     }
     let start = decoded.len();
-    decode_bounded_into(encoded, expected_size, decoded, context)?;
+    decode_bounded_into(encoded, expected_size, decoded, context, Limits::default())?;
     if decoded.len() - start != expected_size {
         return Err(Error::MalformedFrame("decoded size mismatch".into()));
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_bounded(encoded: &[u8], limit: usize) -> Result<Vec<u8>> {
+    decode_bounded_with_limits(encoded, limit, Limits::default())
+}
+pub(crate) fn decode_bounded_with_limits(
+    encoded: &[u8],
+    limit: usize,
+    limits: Limits,
+) -> Result<Vec<u8>> {
+    limits.frame(encoded)?;
     let mut decoded = Vec::new();
     let mut context = zstd::zstd_safe::DCtx::create();
-    decode_bounded_into(encoded, limit, &mut decoded, &mut context)?;
+    decode_bounded_into(encoded, limit, &mut decoded, &mut context, limits)?;
     decoded.shrink_to_fit();
     Ok(decoded)
 }
@@ -352,6 +353,7 @@ fn decode_bounded_into(
     limit: usize,
     decoded: &mut Vec<u8>,
     context: &mut zstd::zstd_safe::DCtx<'static>,
+    limits: Limits,
 ) -> Result<()> {
     use std::io::Read;
     if !encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
@@ -369,15 +371,22 @@ fn decode_bounded_into(
     let declared = zstd::zstd_safe::get_frame_content_size(encoded)
         .map_err(|_| Error::MalformedFrame("invalid content size".into()))?;
     if declared.is_some_and(|size| size > limit as u64) {
-        return Err(Error::MalformedFrame("decoded output limit".into()));
+        return Err(Error::Budget("decoded frame size"));
     }
     context
         .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
         .map_err(|e| Error::MalformedFrame(zstd::zstd_safe::get_error_name(e).into()))?;
     let mut frame_decoder =
         zstd::stream::read::Decoder::with_context(encoded, context).single_frame();
+    let window_log = if limits.max_window_bytes == 0 {
+        31
+    } else {
+        // Zstandard accepts powers of two; inspect the exact declared window
+        // separately so a non-power-of-two budget is not rounded up.
+        64 - (limits.max_window_bytes.max(1024) - 1).leading_zeros()
+    };
     frame_decoder
-        .window_log_max(24)
+        .window_log_max(window_log.min(31))
         .map_err(|e| Error::MalformedFrame(e.to_string()))?;
     let start = decoded.len();
     if let Some(size) = declared {
@@ -406,7 +415,7 @@ fn decode_bounded_into(
             .map_err(|e| Error::MalformedFrame(e.to_string()))?;
     }
     if decoded.len() - start > limit {
-        return Err(Error::MalformedFrame("decoded output limit".into()));
+        return Err(Error::Budget("decoded frame size"));
     }
     Ok(())
 }
@@ -462,13 +471,13 @@ mod tests {
             let raw = vec![7; size];
             let encoded = encode_frame(&raw, 3).unwrap();
             assert_ne!(encoded[4] & 4, 0);
-            let decoded = decode_bounded(&encoded, DATA_FRAME_MAX).unwrap();
+            let decoded = decode_bounded(&encoded, 16 << 20).unwrap();
             assert_eq!(decoded, raw);
             assert_eq!(decoded.capacity(), size);
             assert!(decode_bounded(&encoded, size - 1).is_err());
             let mut corrupt = encoded;
             *corrupt.last_mut().unwrap() ^= 1;
-            assert!(decode_bounded(&corrupt, DATA_FRAME_MAX).is_err());
+            assert!(decode_bounded(&corrupt, 16 << 20).is_err());
         }
         let raw = vec![7; 65_536];
         let encoded = zstd::stream::encode_all(raw.as_slice(), 3).unwrap();
@@ -476,7 +485,7 @@ mod tests {
             zstd::zstd_safe::get_frame_content_size(&encoded).unwrap(),
             None
         );
-        let decoded = decode_bounded(&encoded, DATA_FRAME_MAX).unwrap();
+        let decoded = decode_bounded(&encoded, 16 << 20).unwrap();
         assert_eq!(decoded, raw);
         assert_eq!(decoded.capacity(), raw.len());
         assert!(decode_bounded(&encoded, raw.len() - 1).is_err());

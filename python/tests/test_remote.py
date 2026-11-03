@@ -603,13 +603,14 @@ def test_async_metadata_calls_are_awaitable_and_share_the_loop_with_the_provider
             from zstar import _native
 
             for awaitable in (
-                archive._reader.entry("hello"),
-                archive._reader._entry("hello"),
-                archive._reader.paths(),
-                archive._reader.validate_metadata(),
+                archive.entry("hello"),
+                archive.getinfo("hello"),
             ):
                 assert inspect.isawaitable(awaitable)
                 await awaitable
+
+            async def names():
+                return [name async for name in archive.names()]
 
             async def read_member():
                 async with archive.open("hello") as member:
@@ -620,7 +621,7 @@ def test_async_metadata_calls_are_awaitable_and_share_the_loop_with_the_provider
                 asyncio.gather(
                     archive.getinfo("hello"),
                     archive.read("hello"),
-                    archive._reader.paths(),
+                    names(),
                     read_member(),
                 ),
                 5,

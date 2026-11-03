@@ -1,11 +1,8 @@
 //! Archive I/O for the entry-oriented manifest. No persistent frame table.
 use crate::decoded_body::DecodedBody;
-use crate::manifest::{
-    ENCODED_FRAME_MAX, EXTENTS_MAX, Entry, EntryKind, Extent, Source, decode_pointer,
-    encode_pointer,
-};
+use crate::manifest::{Entry, EntryKind, Extent, Source, decode_pointer, encode_pointer};
 use crate::manifest_io::{ManifestEncoder, ManifestOptions, ManifestReader, SpillStore, Spool};
-use crate::{Error, RangeReader, Result};
+use crate::{Error, Limits, RangeReader, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
@@ -35,6 +32,7 @@ fn load_content<R: RangeReader>(
     extent: &Extent,
     resolver: &mut Option<&mut dyn EncodedObjectResolver>,
     verify_external: bool,
+    limits: Limits,
 ) -> Result<DecodedBody> {
     let encoded = match extent.source {
         Source::Archive(at) => {
@@ -48,11 +46,11 @@ fn load_content<R: RangeReader>(
         Source::Object(hash) => resolver
             .as_mut()
             .ok_or(Error::Unsupported("external read requires resolver"))?
-            .get_encoded(hash, extent.encoded_size, ENCODED_FRAME_MAX)?,
+            .get_encoded(hash, extent.encoded_size, limits.encoded_limit())?,
     };
     let raw = DecodedBody::compact(match extent.source {
-        Source::Archive(_) => decode_content(&encoded, true)?,
-        Source::Object(_) => decode_object(&encoded)?,
+        Source::Archive(_) => decode_content_with_limits(&encoded, true, limits)?,
+        Source::Object(_) => decode_object(&encoded, limits)?,
     });
     if let Source::Object(hash) = extent.source
         && verify_external
@@ -70,6 +68,7 @@ pub struct ContentReader<'a, R: RangeReader> {
     source: &'a mut R,
     resolver: Option<&'a mut dyn EncodedObjectResolver>,
     verify_external: bool,
+    limits: Limits,
     extents: std::vec::IntoIter<Extent>,
     cached: Option<(Source, u64, DecodedBody)>,
     offset: usize,
@@ -103,6 +102,7 @@ impl<R: RangeReader> ContentReader<'_, R> {
                         &extent,
                         &mut self.resolver,
                         self.verify_external,
+                        self.limits,
                     )?;
                     self.cached = Some((extent.source, extent.encoded_size, raw));
                 }
@@ -173,9 +173,16 @@ impl<W: Write> BlockingBuilder<W> {
         level: i32,
         options: ManifestOptions,
     ) -> Result<Self> {
-        if !(512..=crate::DATA_FRAME_MAX).contains(&frame_target) {
-            return Err(Error::Unsupported("frame target outside format bounds"));
+        if frame_target < 512 {
+            return Err(Error::Unsupported(
+                "frame target must be at least 512 bytes",
+            ));
         }
+        Limits::check(
+            frame_target as u64,
+            options.limits.max_frame_decoded_bytes,
+            "writer frame size",
+        )?;
         let mut compressor = zstd::bulk::Compressor::new(level)?;
         compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
         Ok(Self {
@@ -218,9 +225,7 @@ impl<W: Write> BlockingBuilder<W> {
         self.encoded.clear();
         self.compressor
             .compress_to_buffer(&self.pending, &mut self.encoded)?;
-        if self.encoded.len() as u64 > ENCODED_FRAME_MAX {
-            return Err(invalid("encoded frame maximum"));
-        }
+        self.options.limits.frame(&self.encoded)?;
         self.output.write_all(&self.encoded)?;
         let mut record = [0; 32];
         for (slot, n) in record.as_chunks_mut::<8>().0.iter_mut().zip([
@@ -293,9 +298,7 @@ impl<W: Write> BlockingBuilder<W> {
         Ok(self)
     }
     fn write_completed(&mut self, raw_size: usize, encoded: &[u8]) -> Result<()> {
-        if encoded.len() as u64 > ENCODED_FRAME_MAX {
-            return Err(invalid("encoded frame maximum"));
-        }
+        self.options.limits.frame(encoded)?;
         self.output.write_all(encoded)?;
         let mut record = [0; 32];
         for (slot, n) in record.as_chunks_mut::<8>().0.iter_mut().zip([
@@ -354,6 +357,11 @@ impl<W: Write> BlockingBuilder<W> {
         }
         let result = if entry.is_external() {
             let text = encode_pointer(&entry.extents)?;
+            Limits::check(
+                text.len() as u64,
+                self.options.limits.max_pointer_bytes,
+                "pointer size",
+            )?;
             self.add(entry, text.len() as u64, Some(&mut text.as_slice()))
         } else {
             self.add(entry, 0, None)
@@ -372,6 +380,7 @@ impl<W: Write> BlockingBuilder<W> {
     fn add(&mut self, entry: Entry, size: u64, mut payload: Option<&mut dyn Read>) -> Result<()> {
         // Archive positions are resolved after compression; validate caller metadata separately.
         entry.validate(u64::MAX)?;
+        self.options.limits.entry(&entry)?;
         if entry.kind != EntryKind::File && size != 0 {
             return Err(invalid("nonfile payload"));
         }
@@ -380,16 +389,15 @@ impl<W: Write> BlockingBuilder<W> {
         } else {
             entry.path.clone()
         };
-        let flag = match entry.kind {
-            EntryKind::File => b'0',
-            EntryKind::Directory => b'5',
-            EntryKind::Symlink => b'2',
-        };
         let header = crate::tar_encode::member_header_full(
             &tar_path,
             size,
             entry.mode,
-            flag,
+            match entry.kind {
+                EntryKind::File => b'0',
+                EntryKind::Directory => b'5',
+                EntryKind::Symlink => b'2',
+            },
             entry.linkname.as_deref().unwrap_or(""),
             entry.uid,
             entry.gid,
@@ -403,6 +411,18 @@ impl<W: Write> BlockingBuilder<W> {
         let total = padded
             .checked_add(header.len() as u64)
             .ok_or_else(|| invalid("member length overflow"))?;
+        if entry.kind == EntryKind::File && !entry.is_external() && size != 0 {
+            // Preflight minimum extent metadata before reading the payload.
+            let pending = if total > (self.frame_target - self.pending.len()) as u64 {
+                0
+            } else {
+                self.pending.len()
+            };
+            let offset = (pending + header.len()) % self.frame_target;
+            self.options
+                .limits
+                .inline(size, self.frame_target, offset, entry.encoded_len()?)?;
+        }
         if total > (self.frame_target - self.pending.len()) as u64 {
             self.flush_frame()?;
         }
@@ -490,6 +510,7 @@ impl<W: Write> BlockingBuilder<W> {
             self.write_completed(raw_size, &encoded)?;
             self.recycle_buffers(raw, encoded);
         }
+        let limits = self.options.limits;
         let mut metadata =
             ManifestEncoder::new(self.output, self.encoded_position, self.level, self.options);
         let mut at = 0;
@@ -507,6 +528,8 @@ impl<W: Write> BlockingBuilder<W> {
                 let end = start
                     .checked_add(size)
                     .ok_or_else(|| invalid("file length overflow"))?;
+                let mut extent_bytes = 0;
+                let base_bytes = entry.encoded_len()? - 1;
                 // Capture records and frame records share physical order. Keep
                 // the current frame across files, avoiding per-file binary disk
                 // searches and repeated reads for shared small-file frames.
@@ -525,16 +548,27 @@ impl<W: Write> BlockingBuilder<W> {
                     let a = start.max(raw);
                     let b = end.min(frame_end);
                     if b > a {
-                        entry.extents.push(Extent {
+                        let extent = Extent {
                             size: b - a,
                             source: Source::Archive(encoded),
                             encoded_size,
                             offset: a - raw,
-                        });
+                        };
+                        extent_bytes += extent.encoded_len();
+                        entry.extents.push(extent);
                     }
-                    if entry.extents.len() > EXTENTS_MAX {
-                        return Err(invalid("entry extent maximum"));
-                    }
+                    Limits::check(
+                        entry.extents.len() as u64,
+                        limits.max_extents,
+                        "entry extent count",
+                    )?;
+                    Limits::check(
+                        (base_bytes
+                            + crate::cbor::head_len(entry.extents.len() as u64)
+                            + extent_bytes) as u64,
+                        limits.max_entry_bytes,
+                        "entry metadata size",
+                    )?;
                     if frame_end >= end {
                         break;
                     }
@@ -617,6 +651,7 @@ impl<R: RangeReader> BlockingArchive<R> {
             source: &mut self.source,
             resolver,
             verify_external,
+            limits: self.options.limits,
             extents: entry.extents.into_iter(),
             cached: None,
             offset: 0,
@@ -675,8 +710,13 @@ impl<R: RangeReader> BlockingArchive<R> {
                         && (matches!(source, Source::Object(_)) || *encoded == extent.encoded_size)
                 });
                 if !same {
-                    let raw =
-                        load_content(&mut self.source, extent, &mut resolver, verify_external)?;
+                    let raw = load_content(
+                        &mut self.source,
+                        extent,
+                        &mut resolver,
+                        verify_external,
+                        self.options.limits,
+                    )?;
                     cached = Some((extent.source.clone(), extent.encoded_size, raw));
                 }
                 let raw = &cached.as_ref().unwrap().2;
@@ -706,8 +746,9 @@ impl<R: RangeReader> BlockingArchive<R> {
         let mut at = 0_u64;
         let mut decoded = 0_u64;
         while at < self.data_end {
-            let frame = fetch_frame(&mut self.source, at, self.data_end)?;
-            let raw = decode_content(&frame, true)?;
+            let frame =
+                fetch_frame_with_limits(&mut self.source, at, self.data_end, self.options.limits)?;
+            let raw = decode_content_with_limits(&frame, true, self.options.limits)?;
             if raw.is_empty() {
                 return Err(Error::MalformedFrame("empty data frame".into()));
             }
@@ -756,7 +797,6 @@ impl<R: RangeReader> BlockingArchive<R> {
         &mut self,
         mut visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
     ) -> Result<PhysicalReport> {
-        self.manifest.validate_metadata()?;
         struct Member {
             entry: Entry,
             remaining: u64,
@@ -775,8 +815,13 @@ impl<R: RangeReader> BlockingArchive<R> {
         let mut encoded_at = 0_u64;
         let mut decoded_at = 0_u64;
         while encoded_at < self.data_end {
-            let encoded = fetch_frame(&mut self.source, encoded_at, self.data_end)?;
-            let raw = decode_content(&encoded, true)?;
+            let encoded = fetch_frame_with_limits(
+                &mut self.source,
+                encoded_at,
+                self.data_end,
+                self.options.limits,
+            )?;
+            let raw = decode_content_with_limits(&encoded, true, self.options.limits)?;
             report.frames += 1;
             if raw.is_empty() {
                 return Err(Error::MalformedFrame("empty data frame".into()));
@@ -854,8 +899,8 @@ impl<R: RangeReader> BlockingArchive<R> {
                     if !entry.is_external() && size != entry.size()? {
                         return Err(Error::TarTocMismatch("inline payload size"));
                     }
-                    if entry.is_external() && size > 16 << 20 {
-                        return Err(Error::MalformedPointer("pointer size maximum".into()));
+                    if entry.is_external() {
+                        Limits::check(size, self.options.limits.max_pointer_bytes, "pointer size")?;
                     }
                     let padded = size.checked_add(511).ok_or(Error::Range)? / 512 * 512;
                     headers.clear();
@@ -982,22 +1027,33 @@ fn normalized_extents(extents: &[Extent]) -> impl Iterator<Item = Extent> + '_ {
 }
 
 pub fn decode_content(encoded: &[u8], require_checksum: bool) -> Result<Vec<u8>> {
-    if encoded.len() < 5 || encoded.len() as u64 > ENCODED_FRAME_MAX {
+    decode_content_with_limits(encoded, require_checksum, Limits::default())
+}
+pub(crate) fn decode_content_with_limits(
+    encoded: &[u8],
+    require_checksum: bool,
+    limits: Limits,
+) -> Result<Vec<u8>> {
+    if encoded.len() < 5 {
         return Err(Error::MalformedFrame("encoded frame bounds".into()));
     }
     if require_checksum && encoded[4] & 4 == 0 {
         return Err(Error::MalformedFrame("missing data checksum".into()));
     }
-    crate::decode_bounded(encoded, crate::DATA_FRAME_MAX)
+    crate::decode_bounded_with_limits(encoded, limits.decoded_limit(), limits)
 }
 
-pub(crate) fn decode_object(encoded: &[u8]) -> Result<Vec<u8>> {
-    decode_content(encoded, false).map_err(|error| match error {
+pub(crate) fn decode_object(encoded: &[u8], limits: Limits) -> Result<Vec<u8>> {
+    decode_content_with_limits(encoded, false, limits).map_err(|error| match error {
         Error::MalformedFrame(message) => Error::MalformedExternalContent(message),
         other => other,
     })
 }
 
+/// Determine one frame's boundary without assuming a content-size field exists.
+pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Result<Vec<u8>> {
+    fetch_frame_with_limits(source, start, end, Limits::default())
+}
 #[expect(
     clippy::cast_possible_truncation,
     reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
@@ -1006,10 +1062,16 @@ pub(crate) fn decode_object(encoded: &[u8]) -> Result<Vec<u8>> {
     clippy::items_after_statements,
     reason = "Keep local helpers next to the operation that uses them."
 )]
-/// Determine one frame's boundary without assuming a content-size field exists.
-pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Result<Vec<u8>> {
+fn fetch_frame_with_limits<R: RangeReader>(
+    source: &mut R,
+    start: u64,
+    end: u64,
+    limits: Limits,
+) -> Result<Vec<u8>> {
     // Fetch a bounded read-ahead window once; block headers are scanned in memory.
-    let header_end = start.saturating_add(256 << 10).min(end);
+    let header_end = start
+        .saturating_add((256 << 10).min(limits.encoded_limit()))
+        .min(end);
     let header = source.read_range(start..header_end)?;
     if header.len() < 6 || !header.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         return Err(Error::MalformedFrame("frame header".into()));
@@ -1031,7 +1093,7 @@ pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Resu
         2 => 4,
         _ => 8,
     };
-    let limit = start.saturating_add(ENCODED_FRAME_MAX).min(end);
+    let limit = start.saturating_add(limits.encoded_limit()).min(end);
     // Read ahead in large chunks and scan block headers in memory, so request
     // count is bounded by frame size / READ_AHEAD rather than block count.
     const READ_AHEAD: u64 = 256 << 10;
@@ -1044,6 +1106,9 @@ pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Resu
         .ok_or_else(|| invalid("frame header overflow"))?;
     loop {
         if at.checked_add(3).is_none_or(|n| n > limit) {
+            if limit < end {
+                return Err(Error::Budget("encoded frame size"));
+            }
             return Err(Error::MalformedFrame("block header bounds".into()));
         }
         if at + 3 > buffered_end {
@@ -1079,9 +1144,14 @@ pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Resu
             .checked_add(4)
             .ok_or_else(|| invalid("frame checksum overflow"))?;
     }
-    if at > end || at - start > ENCODED_FRAME_MAX {
-        return Err(Error::MalformedFrame("frame encoded limit".into()));
+    if at > end {
+        return Err(Error::MalformedFrame("truncated frame".into()));
     }
+    Limits::check(
+        at - start,
+        limits.max_frame_encoded_bytes,
+        "encoded frame size",
+    )?;
     if at > buffered_end {
         let more = source.read_range(buffered_end..at)?;
         if more.len() as u64 != at - buffered_end {

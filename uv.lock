@@ -930,15 +930,8 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 
-[package.optional-dependencies]
-http = [
-    { name = "fsspec", extra = ["http"] },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "fsspec", specifier = ">=2026.9.0" },
-    { name = "fsspec", extras = ["http"], marker = "extra == 'http'", specifier = ">=2026.9.0" },
     { name = "typing-extensions", specifier = ">=4.16" },
 ]
-provides-extras = ["http"]

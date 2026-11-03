@@ -117,20 +117,17 @@ def test_bulk_write_modes_and_protocol_paths(tmp_path):
         assert archive.read("dir/local") == b"local"
 
 
-@pytest.mark.parametrize("failure", ["commit", "metadata"])
-def test_backend_finalization_failure_cleans_only_uncommitted_output(tmp_path, failure):
+def test_backend_commit_failure_discards_uncommitted_output(tmp_path):
     events = []
 
     class Backend(LocalFileSystem):
         def _open(self, *args, **kwargs):
             output = super()._open(*args, **kwargs)
-            commit, discard = output.commit, output.discard
+            discard = output.discard
 
             def commit_output():
                 events.append("commit")
-                if failure == "commit":
-                    raise OSError("commit failed")
-                commit()
+                raise OSError("commit failed")
 
             def discard_output():
                 events.append("discard")
@@ -139,25 +136,15 @@ def test_backend_finalization_failure_cleans_only_uncommitted_output(tmp_path, f
             output.commit, output.discard = commit_output, discard_output
             return output
 
-        def setxattr(self, path, **kwargs):
-            events.append("metadata")
-            raise OSError("metadata failed")
-
     path = tmp_path / "archive"
     path.write_bytes(b"original")
     with (
-        pytest.raises(OSError, match=f"{failure} failed"),
-        ZstarFileSystem(
-            fo=path, fs=Backend(skip_instance_cache=True), mode="w", metadata={"x": "y"}
-        ) as fs,
+        pytest.raises(OSError, match="commit failed"),
+        ZstarFileSystem(fo=path, fs=Backend(skip_instance_cache=True), mode="w") as fs,
     ):
         fs.pipe_file("data", b"hello")
-    assert events == (["commit", "discard"] if failure == "commit" else ["commit", "metadata"])
-    if failure == "commit":
-        assert path.read_bytes() == b"original"
-    else:
-        with zstar.Archive.from_file(path) as archive:
-            assert archive.read("data") == b"hello"
+    assert events == ["commit", "discard"]
+    assert path.read_bytes() == b"original"
 
 
 def test_abort_preserves_existing_archive_and_discards_staging(tmp_path):
@@ -229,7 +216,7 @@ def test_staging_close_failure_still_discards_archive(tmp_path, monkeypatch):
                 raise OSError("spool close failed")
 
     monkeypatch.setattr(
-        "zstar._fs_writer.tempfile.SpooledTemporaryFile", lambda **kwargs: BrokenClose()
+        "zstar._publication.tempfile.SpooledTemporaryFile", lambda **kwargs: BrokenClose()
     )
     path = tmp_path / "archive"
     path.write_bytes(b"original")
@@ -434,35 +421,6 @@ def test_concurrent_external_archives_share_objects(tmp_path):
     assert len(list((tmp_path / "objects").glob("*.zst"))) == 1
 
 
-def test_backend_metadata_uses_setxattr(tmp_path):
-    class Backend(LocalFileSystem):
-        def __init__(self):
-            super().__init__()
-            self.attributes = {}
-
-        def setxattr(self, path, **kwargs):
-            with zstar.Archive.from_file(path) as archive:
-                assert archive.read("data") == b"hello"
-            self.attributes[path] = kwargs
-
-    backend = Backend()
-    path = str(tmp_path / "archive")
-    with ZstarFileSystem(fo=path, fs=backend, mode="w", metadata={"application": "zstar"}) as fs:
-        fs.pipe_file("data", b"hello")
-    assert backend.attributes[path] == {"application": "zstar"}
-
-
-def test_metadata_requires_backend_support(tmp_path):
-    path = tmp_path / "archive"
-    path.write_bytes(b"original")
-    with (
-        pytest.raises(NotImplementedError, match="setxattr"),
-        ZstarFileSystem(fo=path, mode="w", metadata={"x": "y"}),
-    ):
-        pass
-    assert path.read_bytes() == b"original"
-
-
 def test_async_write_put_and_member_staging(tmp_path):
     source = tmp_path / "source"
     source.write_bytes(b"local")
@@ -542,3 +500,53 @@ def test_writer_callbacks_run_off_async_loop():
     assert sink.closed
     with zstar.Archive(sink.archive) as reader:
         assert reader.read("x") == b"hello"
+
+
+def test_shared_writer_serializes_parallel_known_size_members(tmp_path):
+    path = tmp_path / "archive"
+    with ZstarFileSystem(fo=path, mode="w") as fs:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(fs.pipe_file, f"dir{index % 3}/file{index}", bytes([index]) * 2000)
+                for index in range(12)
+            ]
+            for future in futures:
+                future.result(timeout=10)
+        assert len(fs.find("")) == 12
+    with zstar.Archive.from_file(path) as archive:
+        for index in range(12):
+            assert archive.read(f"dir{index % 3}/file{index}") == bytes([index]) * 2000
+        assert archive.verify()["full_archive_verified"]
+
+
+def test_member_emission_and_spool_cleanup_errors_are_preserved(tmp_path, monkeypatch):
+    read_error = OSError("spool read failed")
+    close_error = OSError("spool close failed")
+
+    class BrokenSpool(io.BytesIO):
+        def read(self, size=-1):
+            raise read_error
+
+        def close(self):
+            if not self.closed:
+                super().close()
+                raise close_error
+
+    monkeypatch.setattr(
+        "zstar._publication.tempfile.SpooledTemporaryFile", lambda **kwargs: BrokenSpool()
+    )
+    path = tmp_path / "archive"
+    path.write_bytes(b"original")
+    fs = ZstarFileSystem(fo=path, mode="w")
+    member = fs.open("broken", "wb")
+    member.write(b"payload")
+    with pytest.raises(ExceptionGroup) as caught:
+        member.close()
+    primary, cleanup = caught.value.exceptions
+    assert isinstance(primary, zstar.ZstarError)
+    assert primary.__cause__ is read_error
+    assert cleanup is close_error
+    assert member.closed
+    with pytest.raises(ValueError, match="writer failed"):
+        fs.close()
+    assert path.read_bytes() == b"original"

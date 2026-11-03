@@ -389,7 +389,7 @@ func PutPresigned(ctx context.Context, provider PresignedPutProvider, client *ht
 		if req.Header.Get("Content-Type") == "" {
 			contentType := "application/octet-stream"
 			switch strings.ToLower(path.Ext(req.URL.Path)) {
-			case ".zstar", ".zst", ".zstp":
+			case ".zstar", ".zst":
 				contentType = "application/zstd"
 			case ".cbor":
 				contentType = "application/cbor"

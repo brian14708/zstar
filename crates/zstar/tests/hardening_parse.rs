@@ -45,11 +45,11 @@ fn oversized_item_is_rejected_without_allocating() {
     reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
 )]
 #[test]
-fn entry_above_cap_is_rejected_while_decoding() {
+fn oversized_invalid_path_is_rejected_while_decoding() {
     let mut doc = header();
-    // Array head then a text string longer than ENTRY_MAX that really exists.
+    // Array head then an invalid path longer than 8 MiB that really exists.
     doc.extend([0x86, 0x7a]);
-    let big = zstar::manifest::ENTRY_MAX + 1;
+    let big = (8 << 20) + 1;
     doc.extend((big as u32).to_be_bytes());
     doc.extend(vec![b'a'; big]);
     assert!(decode_document(&doc, 0).is_err());

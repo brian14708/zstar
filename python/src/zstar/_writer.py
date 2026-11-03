@@ -15,7 +15,7 @@ from typing_extensions import Reader
 
 from . import _native
 from ._info import _to_entry
-from .types import BinaryWriter, CborValue, EntryTuple, SpillStore, WriterOptions
+from .types import BinaryWriter, CborValue, EntryTuple, Limits, SpillStore, WriterOptions
 
 
 def _open_no_follow(path: str | os.PathLike[str], flags: int, mode: int = 0o666) -> int:
@@ -40,6 +40,7 @@ class ArchiveWriter:
         self,
         fileobj: BinaryWriter,
         *,
+        limits: Limits | None = None,
         frame_size: int = 1 << 20,
         compression_level: int = 3,
         memory_bytes: int = 8 << 20,
@@ -51,6 +52,7 @@ class ArchiveWriter:
     ) -> None:
         self._writer = _native.EntryArchiveWriter(
             fileobj,
+            limits=limits,
             frame_size=frame_size,
             compression_level=compression_level,
             memory_bytes=memory_bytes,
@@ -139,14 +141,6 @@ class ArchiveWriter:
         info.size = len(data)
         info.mode = mode
         self.addfile(info, BytesIO(data))
-
-    def _add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
-        """Add an explicitly externalized body, preserving its v1 chunk references."""
-        if self.closed:
-            raise ValueError("writer closed")
-        if not tarinfo.isfile() or tarinfo.size != body.size:
-            raise ValueError("external body requires a regular file with matching size")
-        self._writer.add(body._entry(_to_entry(tarinfo)), None, 0)
 
     def add(
         self,
@@ -260,8 +254,9 @@ class AsyncArchiveWriter:
     """Async writer with the same operations as ArchiveWriter.
 
     File access, compression, and synchronous body/sink/spill callbacks run on
-    Rust workers. Operations serialize per writer. Cancellation waits for the
-    active worker before propagating; exceptional context exit discards output.
+    Rust workers, with at most eight admitted jobs across writers. Operations
+    serialize per writer. Cancellation waits for the active worker before
+    propagating; exceptional context exit discards output.
     Borrowed sinks remain open. Use an async with block to guarantee cleanup.
     """
 
@@ -306,10 +301,6 @@ class AsyncArchiveWriter:
         """Write bytes on a native worker, serializing with other operations."""
         async with self._lock:
             await _writer_call(partial(self._writer.write_bytes, name, data, mode=mode))
-
-    async def _add_external(self, tarinfo: _TarInfo, body: _native.ExternalFile) -> None:
-        async with self._lock:
-            await _writer_call(partial(self._writer._add_external, tarinfo, body))
 
     async def add(
         self,

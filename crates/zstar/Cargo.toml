@@ -15,7 +15,7 @@ default = ["async", "disk"]
 disk = ["dep:tempfile"]
 fs = ["async", "dep:cap-fs-ext", "dep:cap-std"]
 http = ["async", "dep:reqwest"]
-s3 = ["http", "dep:object_store", "dep:quick-xml"]
+s3 = ["http", "dep:object_store"]
 async = [
     "dep:tokio",
     "dep:async-trait",
@@ -27,7 +27,6 @@ async = [
 cap-fs-ext = { workspace = true, optional = true }
 cap-std = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, features = ["aws"] }
-quick-xml = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }

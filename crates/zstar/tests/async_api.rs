@@ -139,7 +139,7 @@ async fn standalone_cursors_read_retained_entries_across_extents() {
     let mut entry = archive.entry("dir/file").await.unwrap().unwrap();
     // Reads must use the retained entry even when its path is not indexed.
     entry.path = "retained-entry".into();
-    let mut cursor = zstar::FileCursor::new(entry).unwrap();
+    let cursor = zstar::FileCursor::new(entry).unwrap();
     let expected = payload();
     for (offset, length) in [(0, 1), (500, 2048), (1000, 6000), (8190, 3), (8193, 0)] {
         assert_eq!(
@@ -161,11 +161,22 @@ async fn archive_cursors_reject_other_archives() {
     let bytes = fixture().await;
     let archive = Archive::from_bytes(bytes.clone()).await.unwrap();
     let other = Archive::from_bytes(bytes).await.unwrap();
-    let mut cursor = archive.open_cursor("dir/file").await.unwrap();
-    assert!(matches!(
-        cursor.read(&other, 0, 1).await,
-        Err(Error::Unsupported(_))
-    ));
+    let entry = archive.entry("dir/file").await.unwrap().unwrap();
+    for cursor in [
+        archive.open_cursor("dir/file").await.unwrap(),
+        archive.cursor_from_entry(entry).await.unwrap(),
+    ] {
+        assert!(matches!(
+            cursor.read(&other, 0, 1).await,
+            Err(Error::Unsupported(_))
+        ));
+        let (first, second) = tokio::join!(
+            cursor.read(&archive, 0, 1000),
+            cursor.read(&archive, 500, 2048),
+        );
+        assert_eq!(first.unwrap(), payload()[..1000]);
+        assert_eq!(second.unwrap(), payload()[500..2548]);
+    }
 }
 
 #[tokio::test]
@@ -520,7 +531,7 @@ async fn cancelled_cursor_reads_and_stream_seeks_release_pending_io() {
     )
     .await
     .unwrap();
-    let mut cursor = archive.open_cursor("dir/file").await.unwrap();
+    let cursor = archive.open_cursor("dir/file").await.unwrap();
     let mut file = archive.open_file("dir/file").await.unwrap();
     source.stall.store(true, Ordering::SeqCst);
     {

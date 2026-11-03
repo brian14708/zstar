@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// ValidateMetadata confirms the authenticated manifest remains open
-// and checks cancellation. It performs no content I/O.
-func (m *Manifest) ValidateMetadata(ctx context.Context) error {
+// checkOpen checks operation cancellation and manifest lifetime.
+// Metadata authentication and validation complete during OpenManifest.
+func (m *Manifest) checkOpen(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

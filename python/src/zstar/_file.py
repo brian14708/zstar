@@ -16,40 +16,6 @@ if TYPE_CHECKING:
     from ._archive import Archive, AsyncArchive
 
 
-def _position(current: int, end: int, offset: int, whence: int) -> int:
-    offset, whence = operator.index(offset), operator.index(whence)
-    if whence == io.SEEK_SET:
-        position = offset
-    elif whence == io.SEEK_CUR:
-        position = current + offset
-    elif whence == io.SEEK_END:
-        position = end + offset
-    else:
-        raise ValueError("invalid whence")
-    if position < 0:
-        raise ValueError("negative seek position")
-    if position > (1 << 64) - 1:
-        raise OverflowError("seek position exceeds the archive range")
-    return position
-
-
-def _step(max_read_bytes: int) -> int:
-    return max(1, max_read_bytes)
-
-
-def _count(position: int, end: int, size: int | None) -> int:
-    available = max(0, end - position)
-    size = -1 if size is None else operator.index(size)
-    return available if size < 0 else min(size, available)
-
-
-def _check_count(count: int, limit: int) -> None:
-    if count > limit:
-        error = _native.ZstarError("returned read size exceeds budget")
-        error.category = "resource-limit"
-        raise error
-
-
 class ArchiveFile(io.RawIOBase):
     """A read-only, seekable member stream borrowing its parent archive.
 
@@ -58,14 +24,14 @@ class ArchiveFile(io.RawIOBase):
     cursor updates, and close.
     """
 
-    def __init__(self, archive: "Archive", name: str, size: int) -> None:
+    def __init__(self, archive: "Archive", name: str, cursor: _native.MemberCursor) -> None:
         self._lock = threading.Lock()
         super().__init__()
         self._archive: Archive | None = archive
         self.name = name
         self.mode = "rb"
-        self._size, self._position = size, 0
-        self._cursor: _native.MemberCursor | None = archive._reader._open_member(name)
+        self._cursor: _native.MemberCursor | None = cursor
+        self.size = cursor.size
 
     def _owner(self) -> "Archive":
         archive = self._archive
@@ -90,26 +56,25 @@ class ArchiveFile(io.RawIOBase):
     def tell(self) -> int:
         with self._lock:
             self._owner()
-            return self._position
+            assert self._cursor is not None
+            return self._cursor.tell()
 
     @override
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         with self._lock:
             self._owner()
-            self._position = _position(self._position, self._size, offset, whence)
-            return self._position
+            assert self._cursor is not None
+            return self._cursor.seek(operator.index(offset), operator.index(whence))
 
     @override
     def read(self, size: int | None = -1) -> bytes:
         with self._lock:
             archive = self._owner()
-            count = _count(self._position, self._size, size)
-            if count == 0:
-                return b""
-            _check_count(count, archive._max_read_bytes)
             assert self._cursor is not None
-            data = archive._reader._read_member(self._cursor, self._position, count)
-            self._position += len(data)
+            data = archive._reader._read_member(
+                self._cursor, None if size is None else operator.index(size)
+            )
+            self._cursor.advance(len(data))
             return data
 
     def iter_chunks(self, chunk_size: int = 64 << 10) -> Iterator[bytes]:
@@ -117,7 +82,7 @@ class ArchiveFile(io.RawIOBase):
         chunk_size = operator.index(chunk_size)
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        chunk_size = min(chunk_size, _step(self._owner()._max_read_bytes))
+        chunk_size = min(chunk_size, max(1, self._owner()._max_read_bytes))
         while chunk := self.read(chunk_size):
             yield chunk
 
@@ -127,26 +92,12 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def readinto(self, buffer: "Buffer") -> int:
-        with memoryview(buffer).cast("B") as view:
-            if view.readonly:
-                raise TypeError("readinto requires a writable buffer")
-            with self._lock:
-                archive = self._owner()
-                count = _count(self._position, self._size, len(view))
-                step = _step(archive._max_read_bytes)
-                done = 0
-                while done < count:
-                    assert self._cursor is not None
-                    got = archive._reader._read_member_into(
-                        self._cursor,
-                        self._position + done,
-                        view[done : done + min(count - done, step)],
-                    )
-                    if got == 0:
-                        break
-                    done += got
-                self._position += done
-                return done
+        with self._lock:
+            archive = self._owner()
+            assert self._cursor is not None
+            count = archive._reader._read_member_into(self._cursor, buffer)
+            self._cursor.advance(count)
+            return count
 
     @override
     def close(self) -> None:
@@ -168,13 +119,11 @@ class AsyncArchiveFile:
     call with ``asyncio.run_coroutine_threadsafe(stream.read(n), loop)``.
     """
 
-    def __init__(
-        self, archive: "AsyncArchive", name: str, size: int, cursor: _native.MemberCursor
-    ) -> None:
+    def __init__(self, archive: "AsyncArchive", name: str, cursor: _native.MemberCursor) -> None:
         self._archive: AsyncArchive | None = archive
         self.name, self.mode = name, "rb"
-        self._size, self._position = size, 0
         self._cursor: _native.MemberCursor | None = cursor
+        self.size = cursor.size
         self._lock = asyncio.Lock()
 
     @property
@@ -198,13 +147,11 @@ class AsyncArchiveFile:
     async def read(self, size: int | None = -1) -> bytes:
         async with self._lock:
             archive = self._owner()
-            count = _count(self._position, self._size, size)
-            if count == 0:
-                return b""
-            _check_count(count, archive._max_read_bytes)
             assert self._cursor is not None
-            data = await archive._reader._read_member(self._cursor, self._position, count)
-            self._position += len(data)
+            data = await archive._reader._read_member(
+                self._cursor, None if size is None else operator.index(size)
+            )
+            self._cursor.advance(len(data))
             return data
 
     async def iter_chunks(self, chunk_size: int = 64 << 10) -> AsyncIterator[bytes]:
@@ -212,44 +159,34 @@ class AsyncArchiveFile:
         chunk_size = operator.index(chunk_size)
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        chunk_size = min(chunk_size, _step(self._owner()._max_read_bytes))
+        chunk_size = min(chunk_size, max(1, self._owner()._max_read_bytes))
         while chunk := await self.read(chunk_size):
             yield chunk
 
     async def readinto(self, buffer: "Buffer") -> int:
-        with memoryview(buffer).cast("B") as view:
-            if view.readonly:
-                raise TypeError("readinto requires a writable buffer")
-            async with self._lock:
-                archive = self._owner()
-                count = _count(self._position, self._size, len(view))
-                if count == 0:
-                    return 0
-                step = _step(archive._max_read_bytes)
-                done = 0
-                while done < count:
-                    assert self._cursor is not None
-                    got = await archive._reader._read_member_into(
-                        self._cursor,
-                        self._position + done,
-                        view[done : done + min(count - done, step)],
-                    )
-                    if got == 0:
-                        break
-                    done += got
-                self._position += done
-                return done
+        async with self._lock:
+            archive = self._owner()
+            assert self._cursor is not None
+            count = await archive._reader._read_member_into(self._cursor, buffer)
+            self._cursor.advance(count)
+            return count
+
+    async def _readinto_at(self, offset: int, buffer: "Buffer") -> int:
+        archive = self._owner()
+        assert self._cursor is not None
+        return await archive._reader._read_member_into_at(self._cursor, offset, buffer)
 
     async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         async with self._lock:
             self._owner()
-            self._position = _position(self._position, self._size, offset, whence)
-            return self._position
+            assert self._cursor is not None
+            return self._cursor.seek(operator.index(offset), operator.index(whence))
 
     async def tell(self) -> int:
         async with self._lock:
             self._owner()
-            return self._position
+            assert self._cursor is not None
+            return self._cursor.tell()
 
     async def close(self) -> None:
         async with self._lock:

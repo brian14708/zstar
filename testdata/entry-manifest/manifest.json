@@ -203,7 +203,7 @@
         {
           "name": "object-window-over-limit",
           "operation": "external-range",
-          "expected_error": "malformed-external-content",
+          "expected_error": "resource-limit",
           "objects": {
             "sha256:4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92": "frames/object-window-over-limit.zst"
           },
@@ -211,6 +211,11 @@
             "path": "hello.txt",
             "offset": 0,
             "length": 6
+          },
+          "limits": {
+            "limits": {
+              "max_window_bytes": 16777216
+            }
           }
         },
         {
@@ -521,7 +526,7 @@
     "invalid/extent-size-overflow.zstar": {
       "sha256": "ba9a6a5285aebc249836bab432a83fff669d6a3a1baa7bdd0f9770e020fddc6b",
       "cases": [
-        {"name": "extent-size-overflow-metadata", "operation": "metadata", "expected_error": "malformed-toc"}
+        {"name": "extent-size-overflow-metadata", "operation": "metadata", "expected_error": "resource-limit", "limits": {"limits": {"max_frame_decoded_bytes": 16777216}}}
       ]
     },
     "invalid/extent-encoded-zero.zstar": {
@@ -551,7 +556,7 @@
     "invalid/extent-selection-overflow.zstar": {
       "sha256": "dc6d3173cbd6d23820ccb272ec56ff9537e86d574af88939994ab0b7147b6944",
       "cases": [
-        {"name": "extent-selection-overflow-metadata", "operation": "metadata", "expected_error": "malformed-toc"}
+        {"name": "extent-selection-overflow-metadata", "operation": "metadata", "expected_error": "resource-limit", "limits": {"limits": {"max_frame_decoded_bytes": 16777216}}}
       ]
     },
     "invalid/extent-source-overflow.zstar": {
@@ -987,15 +992,58 @@
     "frames/metadata-window-over-limit.zstar": {
       "sha256": "655a03e6ca10caf74dc2cb6807731948b73fd58d82796fbafd45b3f8acf8fb75",
       "cases": [
-        {"name": "metadata-window-over-limit", "operation": "metadata", "expected_error": "malformed-toc"}
+        {
+          "name": "metadata-window-over-limit",
+          "operation": "metadata",
+          "expected_error": "resource-limit",
+          "limits": {
+            "limits": {
+              "max_window_bytes": 16777216
+            }
+          }
+        },
+        {
+          "name": "metadata-window-over-limit.zstar-unrestricted",
+          "operation": "metadata"
+        }
       ]
     },
     "frames/data-window-over-limit.zstar": {
       "sha256": "d8ed05bee09a27ae4add9b903a0add8dc12a3c7108793244e725174c9d729123",
       "cases": [
-        {"name": "data-window-over-limit-metadata", "operation": "metadata"},
-        {"name": "data-window-over-limit-full", "operation": "full-archive", "expected_error": "malformed-frame"},
-        {"name": "data-window-over-limit-read", "operation": "inline-range", "expected_error": "malformed-frame", "request": {"path": "file", "offset": 0, "length": 5}}
+        {
+          "name": "data-window-over-limit-metadata",
+          "operation": "metadata"
+        },
+        {
+          "name": "data-window-over-limit-full",
+          "operation": "full-archive",
+          "expected_error": "resource-limit",
+          "limits": {
+            "limits": {
+              "max_window_bytes": 16777216
+            }
+          }
+        },
+        {
+          "name": "data-window-over-limit-read",
+          "operation": "inline-range",
+          "expected_error": "resource-limit",
+          "request": {
+            "path": "file",
+            "offset": 0,
+            "length": 5
+          },
+          "limits": {
+            "limits": {
+              "max_window_bytes": 16777216
+            }
+          }
+        },
+        {
+          "name": "data-window-over-limit.zstar-unrestricted",
+          "operation": "full-archive"
+        }
       ]
     },
     "frames/metadata-nonzero-dictionary-id.zstar": {
@@ -1784,6 +1832,115 @@
       "cases": [
         {"name": "empty-symlink-target-metadata", "operation": "metadata", "expected_error": "malformed-toc"},
         {"name": "empty-symlink-target-full-archive", "operation": "full-archive", "expected_error": "malformed-toc"}
+      ]
+    },
+    "limits/many-extents.zstar": {
+      "sha256": "f367a5483c84f1478bba5245d980bf381a3fc7ba1b368f6f189e84b040f466c9",
+      "cases": [
+        {
+          "name": "many-extents-metadata",
+          "operation": "metadata"
+        },
+        {
+          "name": "many-extents-physical",
+          "operation": "full-archive",
+          "members": {},
+          "expected_verification": {
+            "full_archive_verified": true,
+            "data_checksums_checked": true,
+            "external_closure_validated": false
+          }
+        },
+        {
+          "name": "many-extents-last-byte",
+          "operation": "external-range",
+          "request": {
+            "path": "file",
+            "offset": 65536,
+            "length": 1
+          },
+          "range_result": "contents/one-x.bin",
+          "objects": {
+            "sha256:2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881": "objects/2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881.zst"
+          },
+          "verify_external": true
+        },
+        {
+          "name": "many-extents-caller-budget",
+          "operation": "metadata",
+          "limits": {
+            "limits": {
+              "max_extents": 65536
+            }
+          },
+          "expected_error": "resource-limit"
+        }
+      ]
+    },
+    "limits/entry-byte-limit.zstar": {
+      "sha256": "4b7bf192eebda4fd8ca69147abb46f7d3adf6ae82f25882365cce2a7a1bb3b9c",
+      "cases": [
+        {
+          "name": "entry-byte-limit-metadata",
+          "operation": "metadata",
+          "expected_error": "resource-limit",
+          "limits": {
+            "limits": {
+              "max_entry_bytes": 8388608
+            }
+          }
+        },
+        {
+          "name": "large-entry-without-caller-budget",
+          "operation": "metadata",
+          "limits": {
+            "memory_bytes": 33554432
+          }
+        }
+      ]
+    },
+    "limits/large-frame.zstar": {
+      "sha256": "f6cf6e82f22a654eefaaf9ffed8a9a305d215d08702b10c5329f26c9fe556e08",
+      "cases": [
+        {
+          "name": "large-frame-metadata",
+          "operation": "metadata"
+        },
+        {
+          "name": "large-frame-physical",
+          "operation": "full-archive",
+          "members": {}
+        },
+        {
+          "name": "large-frame-last-byte",
+          "operation": "inline-range",
+          "request": {
+            "path": "file",
+            "offset": 17825791,
+            "length": 1
+          },
+          "range_result": "contents/one-x.bin"
+        },
+        {
+          "name": "large-frame-max_frame_decoded_bytes",
+          "operation": "metadata",
+          "limits": {
+            "limits": {
+              "max_frame_decoded_bytes": 16777216
+            }
+          },
+          "expected_error": "resource-limit"
+        },
+        {
+          "name": "large-frame-max_frame_encoded_bytes",
+          "operation": "metadata",
+          "limits": {
+            "limits": {
+              "max_frame_encoded_bytes": 637
+            }
+          },
+          "expected_error": "resource-limit"
+        }
       ]
     }
   }

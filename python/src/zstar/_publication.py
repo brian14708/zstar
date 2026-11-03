@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+import tempfile
+from collections.abc import Callable
+from functools import partial
+from tarfile import TarInfo
 from typing import BinaryIO, Protocol, cast
 
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
-from typing_extensions import Buffer
+from typing_extensions import Buffer, Reader
+
+from . import _native
+from ._info import _from_entry
+from .types import WriterOptions
 
 
 class _AsyncOutput(Protocol):
     async def write(self, data: bytes, /) -> int: ...
     async def close(self) -> None: ...
-
-
-class _SetMetadata(Protocol):
-    def __call__(self, path: str, /, **metadata: str) -> object: ...
-
-
-class _AsyncSetMetadata(Protocol):
-    async def __call__(self, path: str, /, **metadata: str) -> object: ...
 
 
 class _AsyncSink:
@@ -44,8 +43,7 @@ class _Publication:
     """Own output closure and publication, including failure cleanup.
 
     Async streams publish on close and cannot be rolled back. Transactional
-    fsspec outputs are closed before commit and discarded on failure. Metadata
-    runs only after publication and its failure never discards published bytes.
+    fsspec outputs are closed before commit and discarded on failure.
     """
 
     def __init__(
@@ -53,12 +51,10 @@ class _Publication:
         output: BinaryIO,
         *,
         transactional: bool = False,
-        after_commit: Callable[[], None] | None = None,
     ) -> None:
         self.output = output
         self._commit = getattr(output, "commit", None) if transactional else None
         self._discard = getattr(output, "discard", None) if transactional else None
-        self._after_commit = after_commit
         self._finished = False
 
     @classmethod
@@ -67,12 +63,8 @@ class _Publication:
         backend: AbstractFileSystem,
         path: str,
         loop: asyncio.AbstractEventLoop,
-        metadata: Mapping[str, str] | None = None,
     ) -> _Publication:
         asynchronous = bool(getattr(backend, "asynchronous", False))
-        setxattr = getattr(backend, "_setxattr" if asynchronous else "setxattr", None)
-        if metadata and not callable(setxattr):
-            raise NotImplementedError("metadata requires a backend with setxattr(), such as s3fs")
         if asynchronous:
             stream = cast(
                 _AsyncOutput,
@@ -82,19 +74,7 @@ class _Publication:
         else:
             output = cast(BinaryIO, backend.open(path, "wb", autocommit=False))
 
-        def update_metadata() -> None:
-            if asynchronous:
-                asyncio.run_coroutine_threadsafe(
-                    cast(_AsyncSetMetadata, setxattr)(path, **dict(metadata or {})), loop
-                ).result()
-            else:
-                cast(_SetMetadata, setxattr)(path, **dict(metadata or {}))
-
-        return cls(
-            output,
-            transactional=not asynchronous,
-            after_commit=update_metadata if metadata else None,
-        )
+        return cls(output, transactional=not asynchronous)
 
     def finish(self, *, abort: bool = False, errors: tuple[BaseException, ...] = ()) -> None:
         if self._finished:
@@ -129,12 +109,49 @@ class _Publication:
                 self._discard()
             except BaseException as error:
                 failures.append(error)
-        if not abort and self._after_commit is not None:
-            try:
-                self._after_commit()
-            except BaseException as error:
-                failures.append(error)
         if len(failures) == 1:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup("output publication failed", failures)
+
+
+class _WriteSession:
+    """Native member state with Python-owned backend publication."""
+
+    def __init__(
+        self,
+        publication: _Publication,
+        spool_memory: int,
+        options: WriterOptions,
+        external: Callable[[str, bytes, int], int] | None = None,
+        external_threshold: int = 16 << 20,
+    ) -> None:
+        self.publication = publication
+        self._session = _native.StagedWriter(
+            _native.EntryArchiveWriter(publication.output, **options),
+            partial(tempfile.SpooledTemporaryFile, max_size=spool_memory, mode="w+b"),
+            external,
+            external_threshold,
+            options.get("compression_level", 3),
+        )
+
+    def mkdir(self, path: str, parents: bool = True, exist_ok: bool = False) -> None:
+        self._session.mkdir(path, parents, exist_ok)
+
+    def open(self, path: str) -> _native.StagedMember:
+        return self._session.open(path)
+
+    def add_file(self, path: str, body: Reader[bytes], size: int) -> None:
+        self._session.add_file(path, body, size)
+
+    def snapshot(self) -> dict[str, TarInfo]:
+        entries = {}
+        for entry, size in self._session.snapshot():
+            info = _from_entry(entry)
+            info.size = size
+            entries[info.name] = info
+        return entries
+
+    def close(self, abort: bool = False) -> None:
+        abort, errors = self._session.finish(abort)
+        self.publication.finish(abort=abort, errors=tuple(errors))

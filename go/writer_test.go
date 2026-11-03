@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -312,5 +313,129 @@ func TestWriterArgumentErrorsAreNotSticky(t *testing.T) {
 	link := "bad\xff"
 	if err := (Entry{Path: "l", Type: TypeSymlink, Linkname: &link}).validateFields(0); err == nil {
 		t.Fatal("non-UTF-8 linkname accepted")
+	}
+}
+
+func TestWriterAcceptsMoreThan65536InlineExtents(t *testing.T) {
+	const size = 512 * 65537
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, WriterOptions{FrameSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Add(context.Background(), Header{Path: "large", Size: size}, bytes.NewReader(bytes.Repeat([]byte{7}, size))); err != nil {
+		t.Fatal(err)
+	}
+	testClose(t, writer)
+	reader, err := Open(context.Background(), memoryRange(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, reader)
+	entry, err := reader.Entry("large")
+	if err != nil || len(entry.Extents) != 65537 {
+		t.Fatalf("extent count: %v %v", entry, err)
+	}
+	last, err := reader.Read(context.Background(), "large", size-1, 1)
+	if err != nil || !bytes.Equal(last, []byte{7}) {
+		t.Fatalf("last byte: %v %v", last, err)
+	}
+	if _, err = reader.Verify(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriterLargeExternalEntryAndReference(t *testing.T) {
+	data, err := os.ReadFile("../testdata/entry-manifest/limits/many-extents.zstar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(context.Background(), memoryRange(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, reader)
+	entry, err := reader.Entry("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := EncodeContentReference(entry.Extents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeContentReference(reference)
+	if err != nil || len(decoded) != 65537 {
+		t.Fatalf("reference: %d %v", len(decoded), err)
+	}
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Add(context.Background(), Header{Path: "file", Mode: entry.Mode, Extents: decoded}, nil); err != nil {
+		t.Fatal(err)
+	}
+	testClose(t, writer)
+	result, err := Open(context.Background(), memoryRange(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, result)
+	if _, err = result.Verify(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type unreadableBody struct{}
+
+func (unreadableBody) Read([]byte) (int, error) { panic("preflight consumed the body") }
+
+func TestWriterPreflightsImpossibleInlineMetadata(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, WriterOptions{Manifest: ManifestWriterOptions{Limits: Limits{MaxEntryBytes: 8 << 20}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Add(context.Background(), Header{Path: "huge", Size: 1 << 50}, unreadableBody{}); ErrorCategory(err) != CategoryResourceLimit {
+		t.Fatal(err)
+	}
+	if output.Len() != 0 {
+		t.Fatal("preflight wrote output")
+	}
+	if err = writer.Add(context.Background(), Header{Path: "small", Size: 1}, strings.NewReader("x")); err != nil {
+		t.Fatal(err)
+	}
+	testClose(t, writer)
+}
+
+func TestFrameSizesAreCallerPolicy(t *testing.T) {
+	const size = 17 << 20
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, WriterOptions{FrameSize: 32 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Add(context.Background(), Header{Path: "large", Size: size}, bytes.NewReader(bytes.Repeat([]byte{9}, size))); err != nil {
+		t.Fatal(err)
+	}
+	testClose(t, writer)
+	reader, err := Open(context.Background(), memoryRange(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, reader)
+	last, err := reader.Read(context.Background(), "large", size-1, 1)
+	if err != nil || !bytes.Equal(last, []byte{9}) {
+		t.Fatalf("last byte: %v %v", last, err)
+	}
+	if _, err = reader.Verify(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	limits := Limits{MaxFrameDecodedBytes: 16 << 20}
+	if _, err = OpenWithOptions(context.Background(), memoryRange(output.Bytes()), ReaderOptions{Manifest: ManifestReaderOptions{Limits: limits}}); ErrorCategory(err) != CategoryResourceLimit {
+		t.Fatal(err)
+	}
+	if _, err = NewWriter(&output, WriterOptions{FrameSize: 32 << 20, Manifest: ManifestWriterOptions{Limits: limits}}); ErrorCategory(err) != CategoryResourceLimit {
+		t.Fatal(err)
 	}
 }

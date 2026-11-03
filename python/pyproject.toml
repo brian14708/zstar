@@ -39,9 +39,6 @@ Documentation = "https://github.com/brian14708/zstar/tree/main/python"
 [project.entry-points."fsspec.specs"]
 zstar = "zstar._fsspec:ZstarFileSystem"
 
-[project.optional-dependencies]
-http = ["fsspec[http]>=2026.9.0"]
-
 [tool.maturin]
 locked = true
 profile = "release"

@@ -41,9 +41,6 @@ func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 	if store.Len() == 0 || !store.closed {
 		t.Fatal("metadata did not spill or its store was not closed after indexing")
 	}
-	if err := manifest.ValidateMetadata(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	entry, err := manifest.Entry("file-0299")
 	if err != nil || entry == nil || entry.Path != "file-0299" {
 		t.Fatalf("lookup: %v %v", entry, err)
@@ -161,9 +158,6 @@ func TestManifestEntryOwnershipAndCursor(t *testing.T) {
 	if count != 100 {
 		t.Fatalf("cursor count %d", count)
 	}
-	if err = m.ValidateMetadata(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestManifestArchiveEncoderSharesAndSplitsFrames(t *testing.T) {
@@ -189,9 +183,6 @@ func TestManifestArchiveEncoderSharesAndSplitsFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer testClose(t, result)
-	if err := result.ValidateMetadata(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	a, err := result.Entry("a")
 	if err != nil {
 		t.Fatal(err)

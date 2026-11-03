@@ -9,7 +9,10 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-type frameDecoder struct{ decoder *zstd.Decoder }
+type frameDecoder struct {
+	decoder *zstd.Decoder
+	limits  Limits
+}
 
 func (d *frameDecoder) close() {
 	if d.decoder != nil {
@@ -21,6 +24,7 @@ func (d *frameDecoder) close() {
 // One idle workspace per reader; concurrent workers are already bounded by
 // ConcurrentChunks. Excess workspaces are closed rather than retained globally.
 type frameDecoderPool struct {
+	limits Limits
 	mu     sync.Mutex
 	idle   *frameDecoder
 	closed bool
@@ -36,7 +40,7 @@ func (p *frameDecoderPool) decode(encoded []byte, expected int) ([]byte, error) 
 	p.idle = nil
 	p.mu.Unlock()
 	if d == nil {
-		d = &frameDecoder{}
+		d = &frameDecoder{limits: p.limits}
 	}
 	defer func() {
 		p.mu.Lock()
@@ -47,7 +51,7 @@ func (p *frameDecoderPool) decode(encoded []byte, expected int) ([]byte, error) 
 			p.idle = d
 		}
 	}()
-	return d.decode(encoded, expected, maxFrameSize, 17<<20)
+	return d.decode(encoded, expected, addressLimit(p.limits.MaxFrameDecodedBytes), addressLimit(p.limits.MaxFrameEncodedBytes))
 }
 
 func (p *frameDecoderPool) close() {
@@ -68,14 +72,21 @@ func decodeBoundedFrame(encoded []byte, expected, decodedLimit, encodedLimit int
 
 func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLimit int) ([]byte, error) {
 	if expected < 0 || expected > decodedLimit || len(encoded) > encodedLimit {
-		return nil, errors.New("zstar: frame size limits")
+		return nil, rejected("resource-limit", "frame size limits")
 	}
 	var header zstd.Header
 	if err := header.Decode(encoded); err != nil {
 		return nil, err
 	}
-	if header.Skippable || header.DictionaryID != 0 || header.WindowSize > maxFrameSize || header.SingleSegment && header.FrameContentSize > maxFrameSize {
+	if header.Skippable || header.DictionaryID != 0 {
 		return nil, errors.New("zstar: unsupported frame or window limit")
+	}
+	window := header.WindowSize
+	if header.SingleSegment {
+		window = header.FrameContentSize
+	}
+	if err := checkLimit(window, d.limits.MaxWindowBytes, "Zstandard window"); err != nil {
+		return nil, err
 	}
 	// Walk block lengths so concatenated frames and trailing bytes cannot pass
 	// merely because their combined decoded length matches the declared size.
@@ -112,14 +123,14 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 	// by the decoder. Reuse it to reserve once for unknown-size callers.
 	if expected == 0 && header.HasFCS {
 		if header.FrameContentSize > uint64(decodedLimit) {
-			return nil, errors.New("zstar: decoded output limit")
+			return nil, rejected("resource-limit", "decoded output limit")
 		}
 		if header.FrameContentSize != 0 {
 			expected = int(header.FrameContentSize)
 		}
 	}
 	if d.decoder == nil {
-		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxFrameSize), zstd.WithDecoderMaxMemory(maxFrameSize))
+		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(max(uint64(1024), min(uint64(1)<<31, uint64(addressLimit(d.limits.MaxWindowBytes))))), zstd.WithDecoderMaxMemory(max(uint64(decodedLimit), uint64(1)<<31)))
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +148,7 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 			return nil, readErr
 		}
 		if len(raw) > decodedLimit {
-			return nil, errors.New("zstar: decoded output limit")
+			return nil, rejected("resource-limit", "decoded output limit")
 		}
 		return raw, nil
 	}
@@ -149,7 +160,7 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 		count, readErr := decoder.Read(raw[n:])
 		n += count
 		if n > expected {
-			return nil, errors.New("zstar: decoded output limit")
+			return nil, errors.New("zstar: declared content size mismatch")
 		}
 		if errors.Is(readErr, io.EOF) {
 			if n != expected {

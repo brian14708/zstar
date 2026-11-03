@@ -4,12 +4,8 @@ use crate::{Error, Result};
 use ciborium::Value;
 use std::collections::BTreeMap;
 
-pub const METADATA_BLOCK_MAX: usize = 16 << 20;
-pub const ENTRY_MAX: usize = 8 << 20;
-pub const EXTENTS_MAX: usize = 65_536;
 /// Target decoded bytes per independently compressed manifest segment.
 pub const BLOCK_TARGET: usize = 64 << 10;
-pub const ENCODED_FRAME_MAX: u64 = 17 << 20;
 
 fn malformed(reason: &str) -> Error {
     Error::MalformedToc(reason.into())
@@ -113,26 +109,35 @@ pub fn parse_object_address(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 impl Extent {
+    pub(crate) fn encoded_len(&self) -> usize {
+        use crate::cbor::head_len;
+        1 + head_len(self.size)
+            + head_len(self.encoded_size)
+            + match self.source {
+                Source::Archive(at) => head_len(at),
+                Source::Object(_) => 73,
+            }
+            + if self.offset == 0 {
+                0
+            } else {
+                head_len(self.offset)
+            }
+    }
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
     pub fn validate(&self, data_end: u64) -> Result<()> {
-        if self.size == 0 || self.size > crate::DATA_FRAME_MAX as u64 || self.encoded_size == 0 {
+        if self.size == 0 || self.encoded_size == 0 {
             return Err(malformed("extent size"));
         }
-        if self
-            .offset
-            .checked_add(self.size)
-            .is_none_or(|end| end > crate::DATA_FRAME_MAX as u64)
-        {
+        if self.offset.checked_add(self.size).is_none() {
             return Err(malformed("extent selection"));
         }
         if let Source::Archive(start) = self.source
-            && (self.encoded_size > ENCODED_FRAME_MAX
-                || start
-                    .checked_add(self.encoded_size)
-                    .is_none_or(|end| end > data_end))
+            && (start
+                .checked_add(self.encoded_size)
+                .is_none_or(|end| end > data_end))
         {
             return Err(malformed("archive extent bounds"));
         }
@@ -265,7 +270,7 @@ impl Entry {
         reason = "Errors follow the documented operation contract and crate error types."
     )]
     pub fn validate(&self, data_end: u64) -> Result<()> {
-        if !valid_path(&self.path) || self.mode > 4095 || self.extents.len() > EXTENTS_MAX {
+        if !valid_path(&self.path) || self.mode > 4095 {
             return Err(malformed("entry metadata"));
         }
         if (self.kind == EntryKind::Symlink) != self.linkname.is_some() {
@@ -291,9 +296,7 @@ impl Entry {
                 return Err(malformed("unknown attribute"));
             }
         }
-        if self.encoded_len()? > ENTRY_MAX {
-            return Err(malformed("entry size maximum"));
-        }
+        self.encoded_len()?;
         Ok(())
     }
     #[expect(
@@ -319,14 +322,9 @@ impl Entry {
         });
         len += head_len(self.extents.len() as u64);
         for extent in &self.extents {
-            len += 1 + head_len(extent.size) + head_len(extent.encoded_size);
-            len += match extent.source {
-                Source::Archive(at) => head_len(at),
-                Source::Object(_) => 2 + 71,
-            };
-            if extent.offset != 0 {
-                len += head_len(extent.offset);
-            }
+            len = len
+                .checked_add(extent.encoded_len())
+                .ok_or_else(|| malformed("entry size maximum"))?;
         }
         if !self.attributes.is_empty() || self.linkname.is_some() {
             len += head_len((self.attributes.len() + usize::from(self.linkname.is_some())) as u64);
@@ -447,9 +445,6 @@ impl Entry {
             _ => return Err(malformed("mtime_ns")),
         };
         let values = array(&v[6])?;
-        if values.len() > EXTENTS_MAX {
-            return Err(malformed("extent count"));
-        }
         let mut attributes = BTreeMap::new();
         let mut linkname = None;
         if v.len() == 8 {
@@ -539,13 +534,20 @@ pub(crate) fn decode_sequence(
     len: u64,
     data_end: u64,
 ) -> Result<(ManifestRoot, Vec<Entry>)> {
-    decode_sequence_budgeted(reader, len, data_end, RETAINED_ENTRIES_MAX, 0)
+    decode_sequence_budgeted(
+        reader,
+        len,
+        data_end,
+        RETAINED_ENTRIES_MAX,
+        0,
+        crate::Limits::default(),
+    )
 }
 
 /// Header item cap: the format does not bound root extensions, and a header
 /// item may span several metadata segments (see `manifest_io` tests), so this is
-/// a deliberate local budget of four segments, far above `ENTRY_MAX`.
-pub(crate) const HEADER_MAX: u64 = 4 * METADATA_BLOCK_MAX as u64;
+/// a deliberate local parser budget.
+pub(crate) const HEADER_MAX: u64 = 64 << 20;
 /// Default ceiling on estimated heap retained by the decoded entry vector.
 pub(crate) const RETAINED_ENTRIES_MAX: u64 = 4 << 30;
 
@@ -572,9 +574,16 @@ pub(crate) fn decode_sequence_budgeted(
     data_end: u64,
     max_retained: u64,
     max_entries: u64,
+    limits: crate::Limits,
 ) -> Result<(ManifestRoot, Vec<Entry>)> {
-    let mut sequence = crate::cbor::SequenceDecoder::<_>::new(reader, len)
-        .with_item_limits(HEADER_MAX, ENTRY_MAX as u64);
+    let mut sequence = crate::cbor::SequenceDecoder::<_>::new(reader, len).with_item_limits(
+        HEADER_MAX,
+        if limits.max_entry_bytes == 0 {
+            u64::MAX
+        } else {
+            limits.max_entry_bytes
+        },
+    );
     let value = sequence
         .next()?
         .ok_or_else(|| malformed("missing manifest header"))?;
@@ -613,6 +622,7 @@ pub(crate) fn decode_sequence_budgeted(
             return Err(Error::Budget("manifest entry count"));
         }
         let entry = Entry::from_value(&value, data_end)?;
+        limits.entry(&entry)?;
         if entries
             .last()
             .is_some_and(|prev: &Entry| prev.path.as_bytes() >= entry.path.as_bytes())
@@ -714,7 +724,6 @@ fn valid_feature(name: &str) -> bool {
 /// Serialize the portable external reference. No whole-file identity is stored.
 pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     if extents.is_empty()
-        || extents.len() > EXTENTS_MAX
         || extents
             .iter()
             .any(|e| !matches!(e.source, Source::Object(_)))
@@ -776,9 +785,6 @@ pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
         }
         out.push('\n');
     }
-    if out.len() > 16 << 20 {
-        return Err(Error::MalformedPointer("pointer size maximum".into()));
-    }
     Ok(out.into_bytes())
 }
 
@@ -788,9 +794,6 @@ pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
 )]
 pub fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
     let parse = || -> Result<Vec<Extent>> {
-        if bytes.len() > 16 << 20 {
-            return Err(malformed("pointer size maximum"));
-        }
         let text = std::str::from_utf8(bytes).map_err(|_| malformed("pointer UTF-8"))?;
         let text = text
             .strip_suffix('\n')
@@ -829,9 +832,6 @@ pub fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
             }
             e.validate(0)?;
             extents.push(e);
-            if extents.len() > EXTENTS_MAX {
-                return Err(malformed("pointer extent count"));
-            }
         }
         if encode_pointer(&extents)? != bytes {
             return Err(malformed("pointer canonical grammar"));

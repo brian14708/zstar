@@ -1,8 +1,7 @@
 //! One deterministic manifest sequence with bounded compression segments and disk spooling.
-use crate::manifest::{
-    BLOCK_TARGET, ENCODED_FRAME_MAX, Entry, METADATA_BLOCK_MAX, ManifestRoot, entry_allocation,
-    valid_path,
-};
+#[cfg(test)]
+const LEGACY_FRAME_SIZE: usize = 16 << 20;
+use crate::manifest::{BLOCK_TARGET, Entry, ManifestRoot, entry_allocation, valid_path};
 use crate::{Error, Footer, RangeReader, Result, TOC_MAGIC};
 use ciborium::Value;
 use sha2::{Digest, Sha256};
@@ -25,6 +24,7 @@ fn invalid(reason: &str) -> Error {
 
 #[derive(Clone, Debug)]
 pub struct ManifestOptions {
+    pub limits: crate::Limits,
     pub memory_bytes: u64,
     pub max_encoded_bytes: u64,
     pub max_decoded_bytes: u64,
@@ -46,6 +46,7 @@ pub struct ManifestOptions {
 impl Default for ManifestOptions {
     fn default() -> Self {
         Self {
+            limits: crate::Limits::default(),
             memory_bytes: MEMORY_DEFAULT,
             max_encoded_bytes: TOTAL_DEFAULT,
             max_decoded_bytes: TOTAL_DEFAULT,
@@ -96,10 +97,10 @@ impl<W: Write> ManifestEncoder<W> {
             options,
         }
     }
-    fn validate_target(&self) -> Result<()> {
-        if !(512..=1 << 20).contains(&self.options.block_target) {
+    const fn validate_target(&self) -> Result<()> {
+        if self.options.block_target < 512 {
             return Err(Error::Unsupported(
-                "metadata segment target must be in [512, 1 MiB]",
+                "metadata segment target must be at least 512 bytes",
             ));
         }
         Ok(())
@@ -115,6 +116,7 @@ impl<W: Write> ManifestEncoder<W> {
     pub fn add_entry(&mut self, entry: Entry) -> Result<()> {
         self.validate_target()?;
         entry.validate(self.start)?;
+        self.options.limits.entry(&entry)?;
         self.entry_buffer.clear();
         entry.append_encoded(&mut self.entry_buffer)?;
         self.records.append_encoded_record(&self.entry_buffer)?;
@@ -133,6 +135,11 @@ impl<W: Write> ManifestEncoder<W> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        crate::Limits::check(
+            self.pending.len() as u64,
+            self.options.limits.max_frame_decoded_bytes,
+            "decoded metadata frame size",
+        )?;
         self.decoded = self
             .decoded
             .checked_add(self.pending.len() as u64)
@@ -144,8 +151,9 @@ impl<W: Write> ManifestEncoder<W> {
             self.compressor = Some(zstd::bulk::Compressor::new(self.level)?);
         }
         let encoded = self.compressor.as_mut().unwrap().compress(&self.pending)?;
-        if encoded.len() as u64 > ENCODED_FRAME_MAX {
-            return Err(invalid("encoded metadata segment maximum"));
+        self.options.limits.frame(&encoded)?;
+        if encoded.len() > u32::MAX as usize {
+            return Err(invalid("metadata wrapper length"));
         }
         let size = encoded.len() as u64 + 8;
         let end = self
@@ -375,9 +383,14 @@ impl ManifestIngest {
             return Err(invalid("metadata wrapper"));
         }
         let len = u64::from(u32::from_le_bytes(header[4..].try_into().unwrap()));
-        if len == 0 || len > ENCODED_FRAME_MAX || len > self.end - self.at - 8 {
+        if len == 0 || len > self.end - self.at - 8 {
             return Err(invalid("encoded metadata bounds"));
         }
+        crate::Limits::check(
+            len,
+            self.spool.options.limits.max_frame_encoded_bytes,
+            "encoded metadata frame size",
+        )?;
         Ok(len)
     }
     pub(crate) fn push(&mut self, header: &[u8], encoded: &[u8]) -> Result<()> {
@@ -385,8 +398,23 @@ impl ManifestIngest {
         if encoded.len() as u64 != len {
             return Err(invalid("short metadata frame"));
         }
-        let raw = crate::decode_bounded(encoded, METADATA_BLOCK_MAX)
-            .map_err(|e| invalid(&e.to_string()))?;
+        let limits = self.spool.options.limits;
+        let limit = limits.decoded_limit().min(
+            usize::try_from(
+                self.spool
+                    .options
+                    .max_decoded_bytes
+                    .saturating_sub(self.decoded),
+            )
+            .unwrap_or(usize::MAX),
+        );
+        let raw =
+            crate::decode_bounded_with_limits(encoded, limit, limits).map_err(
+                |error| match error {
+                    crate::Error::Budget(_) => error,
+                    other => invalid(&other.to_string()),
+                },
+            )?;
         if raw.is_empty() {
             return Err(invalid("empty metadata segment"));
         }
@@ -428,6 +456,7 @@ impl ManifestIngest {
             self.footer.toc_offset,
             retained,
             self.spool.options.max_entries,
+            self.spool.options.limits,
         )?;
         let extent_count = entries.iter().try_fold(0_usize, |count, entry| {
             count
@@ -618,11 +647,6 @@ impl ManifestReader {
     pub fn collect_entries(&self) -> Result<Vec<Entry>> {
         Ok(self.entries.clone())
     }
-    /// Authentication, schema and namespace validation happen before open returns.
-    #[doc(hidden)]
-    pub const fn validate_metadata(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 impl<'a> IntoIterator for &'a ManifestReader {
@@ -716,7 +740,7 @@ mod tests {
                     let len =
                         u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
                     let raw =
-                        crate::decode_bounded(&bytes[at + 8..at + 8 + len], METADATA_BLOCK_MAX)
+                        crate::decode_bounded(&bytes[at + 8..at + 8 + len], LEGACY_FRAME_SIZE)
                             .unwrap();
                     assert!(raw.len() <= block_target);
                     decoded.extend(raw);
@@ -1093,7 +1117,6 @@ mod tests {
         );
         assert!(reader.entry("file-0300").unwrap().is_none());
         assert_eq!(reader.collect_entries().unwrap().len(), 300);
-        reader.validate_metadata().unwrap();
         let mut bad = footer;
         bad.toc_sha256[0] ^= 1;
         assert!(matches!(
@@ -1130,7 +1153,7 @@ mod tests {
                 .unwrap();
         }
         let (metadata, footer) = writer.finish(vec![], BTreeMap::default()).unwrap();
-        assert!(footer.toc_decoded_len > METADATA_BLOCK_MAX as u64);
+        assert!(footer.toc_decoded_len > LEGACY_FRAME_SIZE as u64);
         let mut archive = vec![0];
         archive.extend(metadata);
         let mut source = crate::SliceReader::new(&archive);

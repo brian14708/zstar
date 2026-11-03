@@ -561,7 +561,6 @@ async fn put_defaults_preserve_explicit_headers() {
     for (path, kind) in [
         ("report.v1.ZSTAR", "application/zstd"),
         ("chunk.zst", "application/zstd"),
-        ("pack.zstp", "application/zstd"),
         ("catalog.cbor", "application/cbor"),
         ("unknown", "application/octet-stream"),
     ] {

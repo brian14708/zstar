@@ -1,6 +1,10 @@
 //! Shared native S3 configuration for synchronous and asynchronous bindings.
 
-use pyo3::{PyResult, exceptions::PyValueError};
+use pyo3::{
+    exceptions::PyValueError,
+    prelude::*,
+    types::{PyMemoryView, PySlice},
+};
 use std::{num::NonZeroUsize, sync::Arc};
 use zstar::s3::{AmazonS3Builder, Path, S3BlobStore, S3RangeSource};
 
@@ -76,4 +80,28 @@ pub fn source(
         });
     }
     Ok(Arc::new(S3RangeSource::new(store, Path::from(key))))
+}
+
+#[pyfunction]
+pub fn s3_archive_metadata(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<std::collections::BTreeMap<String, String>> {
+    let view = PyMemoryView::from(data)?.call_method1("cast", ("B",))?;
+    let source_size = view.len()? as u64;
+    let tail = view.get_item(PySlice::new(py, -80, isize::MAX, 1))?;
+    let footer = crate::support::buffer_vec(py, &tail)?;
+    let footer = zstar::parse_footer(&footer).map_err(crate::support::core_error)?;
+    let attributes =
+        zstar::s3::archive_attributes(&footer, source_size).map_err(crate::support::core_error)?;
+    Ok(attributes
+        .iter()
+        .filter_map(|(key, value)| {
+            if let zstar::s3::object_store::Attribute::Metadata(key) = key {
+                Some((key.to_string(), value.as_ref().to_owned()))
+            } else {
+                None
+            }
+        })
+        .collect())
 }

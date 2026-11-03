@@ -86,12 +86,19 @@ impl FileSelection {
 }
 
 /// Reusable random-access member cursor retaining owned metadata.
-/// The caller supplies the live archive for each operation.
+/// The caller supplies the live archive for each operation. Positional reads
+/// borrow the cursor immutably and can run concurrently.
 pub struct FileCursor {
     pub(crate) owner: Option<std::sync::Weak<crate::ManifestReader>>,
     selection: FileSelection,
 }
 impl FileCursor {
+    /// Returns the logical payload length in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.selection.size
+    }
+
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
@@ -113,7 +120,7 @@ impl FileCursor {
     /// Reads an exact bounded range with the archive's hash/resolver policy.
     /// Cancellation does not change any logical stream position.
     pub async fn read<R: AsyncRangeReader + ?Sized + 'static>(
-        &mut self,
+        &self,
         archive: &Archive<R>,
         offset: u64,
         length: u64,

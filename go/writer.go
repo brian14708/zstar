@@ -11,7 +11,7 @@ import (
 	"unicode/utf8"
 )
 
-const maxFrameSize = 16 << 20
+const defaultEncoderWindow = 16 << 20
 
 // Header supplies effective tar metadata and an inline physical size. External
 // files supply Extents with Size zero and no body. Kind defaults to file.
@@ -28,7 +28,7 @@ type Header struct {
 
 // WriterOptions controls frame size and manifest encoding/storage budgets.
 // A zero FrameSize selects 1 MiB; nonzero values must be multiples of 512
-// between 512 bytes and 16 MiB.
+// at least 512 bytes, subject to Manifest.Limits.
 type WriterOptions struct {
 	Manifest  ManifestWriterOptions
 	FrameSize int
