@@ -1,0 +1,195 @@
+/* Navy and blue echo the logo; shared tokens keep guides and API pages aligned. */
+:root {
+  --sl-color-accent-low: #172e4d;
+  --sl-color-accent: #679ce3;
+  --sl-color-accent-high: #b7d3f7;
+  --sl-color-bg: #101722;
+  --sl-color-bg-nav: #101722;
+  --sl-color-bg-sidebar: #131c29;
+  --pyd-surface: color-mix(in srgb, var(--sl-color-text) 4%, var(--sl-color-bg));
+  --pyd-border: var(--sl-color-hairline-light);
+  --pyd-radius: 0.625rem;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #eaf1fb;
+  --sl-color-accent: #315f9c;
+  --sl-color-accent-high: #203958;
+  --sl-color-bg: #ffffff;
+  --sl-color-bg-nav: #ffffff;
+  --sl-color-bg-sidebar: #f8fafc;
+}
+
+/* API sections read as a reference, with one divider instead of nested rails. */
+.pyd-member {
+  min-inline-size: 0;
+  margin-block: 3rem;
+  padding-inline-start: 0;
+  border-inline-start: 0;
+}
+
+.pyd-member .pyd-member {
+  margin-block: 2rem;
+  padding-block-start: 1.25rem;
+  border-block-start: 1px solid var(--pyd-border);
+}
+
+.pyd-member-header > .pyd-heading {
+  margin-block: 0 0.5rem;
+  letter-spacing: normal;
+}
+
+.pyd-member[data-pydocs-kind="class"] > .pyd-member-header > .pyd-heading {
+  font-size: clamp(1.4rem, 2.5vw, 1.8rem);
+}
+
+.pyd-member .pyd-member-header > .pyd-heading {
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.pyd-badge {
+  padding: 0.125rem 0.4375rem;
+  border-radius: 0.375rem;
+  font-family: var(--sl-font);
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+.pyd-badge--kind {
+  color: var(--sl-color-text-accent);
+  background: var(--sl-color-accent-low);
+  border-color: transparent;
+}
+
+.pyd-provenance,
+.pyd-bases {
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+.pyd-signature {
+  margin-block: 0.875rem 1.125rem;
+  padding: 1rem 1.125rem;
+  border-color: var(--pyd-border);
+  font-size: 0.8125rem;
+  line-height: 1.85;
+  tab-size: 4;
+}
+
+/* Explicit argument lines replace the plugin's hanging indent. */
+.pyd-signature[data-signature-layout="vertical"] {
+  padding-inline: 1.125rem;
+  text-indent: 0;
+  overflow-wrap: anywhere;
+}
+
+.pyd-signature .pyd-type {
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+
+.pyd-signature .pyd-type:hover {
+  text-decoration-color: currentColor;
+}
+
+.pyd-table-wrap {
+  border: 1px solid var(--pyd-border);
+  border-radius: var(--pyd-radius);
+}
+
+.pyd-params,
+.pyd-summary-table {
+  /* Starlight makes prose tables blocks; the wrapper owns scrolling here. */
+  display: table;
+  margin: 0;
+}
+
+:is(.pyd-params, .pyd-summary-table) :is(th, td) {
+  padding: 0.625rem 0.875rem;
+}
+
+:is(.pyd-params, .pyd-summary-table) thead {
+  background: var(--pyd-surface);
+}
+
+:is(.pyd-params, .pyd-summary-table) tbody tr:last-child > :is(th, td) {
+  border-block-end: 0;
+}
+
+.pyd-inherited {
+  padding: 0.875rem;
+  border: 1px solid var(--pyd-border);
+  border-radius: var(--pyd-radius);
+}
+
+.pyd-member :is(a, summary):focus-visible {
+  outline: 2px solid var(--sl-color-text-accent);
+  outline-offset: 3px;
+  border-radius: 0.125rem;
+}
+
+@media (max-width: 50rem) {
+  .pyd-member {
+    margin-block: 2rem;
+  }
+
+  .pyd-signature,
+  .pyd-signature[data-signature-layout="vertical"] {
+    padding: 0.75rem;
+  }
+}
+
+/* Names and source links share a row; signatures still span the full width. */
+.pyd-member-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.pyd-member-header > .pyd-source-link {
+  flex-shrink: 0;
+  margin: 0 0 0.5rem auto;
+  font-size: 0.75rem;
+}
+
+.pyd-member .pyd-group-title {
+  margin-block: 2.5rem 0.75rem;
+  font-family: var(--sl-font);
+  font-size: 1.125rem;
+}
+
+.pyd-module,
+.pyd-member {
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.pyd-summary-table a > code {
+  padding: 0;
+  background: none;
+  font-family: var(--sl-font);
+  font-size: 0.9375rem;
+  font-weight: 550;
+}
+
+.pyd-summary-table {
+  table-layout: fixed;
+}
+
+.pyd-summary-table :is(th, td) {
+  overflow-wrap: anywhere;
+}
+
+.pyd-summary-table tr > :first-child {
+  width: 32%;
+}
+
+@media (max-width: 50rem) {
+  .pyd-summary-table tr > :first-child {
+    width: 40%;
+  }
+}

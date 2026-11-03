@@ -1,0 +1,7 @@
+---
+import { formatSignatureHtml } from './signature-layout.mjs';
+
+const html = formatSignatureHtml(await Astro.slots.render('default'));
+---
+
+<Fragment set:html={html} />

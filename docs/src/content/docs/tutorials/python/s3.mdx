@@ -1,0 +1,113 @@
+---
+title: "Read an S3 archive with Python"
+---
+
+import Example from "../../../../components/Example.astro";
+import source from "../../../../../../python/examples/tutorial_s3.py?raw";
+
+Create the archive from the [local-file tutorial](/zstar/tutorials/python/first-archive/),
+upload it to an S3 bucket, and read a file and byte range from it. In S3, a
+stored file is called an **object**, and its name is called a **key**. The
+example deletes the uploaded object when finished.
+
+## Set up
+
+You need an existing S3 bucket with versioning disabled and credentials that
+allow uploading, reading, and deleting objects whose keys start with
+`zstar-tutorial/`. Use a bucket intended for testing.
+
+The example gives each upload a unique key. It deletes only that object,
+leaving the bucket and any other objects in place.
+
+Replace the values below with your bucket name, AWS region, and credentials,
+then run these commands in your terminal:
+
+```sh
+export ZSTAR_S3_BUCKET=your-test-bucket
+export AWS_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+# Set AWS_SESSION_TOKEN too when using temporary credentials.
+```
+
+For an S3-compatible service, also set `ZSTAR_S3_ENDPOINT` to its URL. For example,
+a local RustFS service may use `http://127.0.0.1:9000`. The bucket must already
+exist; an endpoint URL alone does not create it.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then save
+the complete example below as `tutorial_s3.py` and run:
+
+```sh
+uv run tutorial_s3.py
+```
+
+PEP 723 metadata declares the script's Python version and dependencies, which uv
+installs automatically. boto3 uploads and deletes the object; Zstar reads archive
+ranges directly.
+
+## Configure access
+
+The example reads environment variables and passes credentials explicitly to
+both clients. Zstar's native S3 reader does not discover environment credentials,
+profiles, or instance roles on its own. `AWS_SESSION_TOKEN` is optional.
+
+<Example source={source} lang="python" region="configure" />
+
+## Create and upload the archive
+
+The complete example generates the same `example.txt` contents as the first
+tutorial: `Hello from Zstar\n`. It finalizes the archive before uploading it to a
+unique key under `zstar-tutorial/`.
+
+<Example source={source} lang="python" region="upload" />
+
+## Read from S3
+
+Open the uploaded archive through Zstar's S3 adapter. It reads the archive
+index and fetches the compressed data needed for each request. You do not need
+to download the archive to a local file first.
+
+This small archive stores its text in a single compressed block, so reading
+just five bytes still fetches that block.
+
+<Example source={source} lang="python" region="read" />
+
+The selected range returns the first five bytes, `Hello`. Verifying the entire
+archive would require reading all of its content; this example only reads the
+requested file and byte range.
+
+## Delete the S3 object
+
+After closing the reader, delete the uploaded object. The complete example
+also attempts deletion if a read fails. If you interrupt the process before
+cleanup finishes, remove the object from your bucket yourself. Its key starts
+with `zstar-tutorial/`.
+
+<Example source={source} lang="python" region="cleanup" />
+
+A successful run prints:
+
+```text
+Hello from Zstar
+Hello
+Deleted S3 object
+```
+
+## Complete example
+
+<details>
+<summary>Show the complete runnable example</summary>
+
+<Example source={source} lang="python" />
+
+</details>
+
+[View the source](https://github.com/brian14708/zstar/blob/main/python/examples/tutorial_s3.py).
+If you have cloned the Zstar repository, run this from its root directory:
+
+```sh
+uv run python/examples/tutorial_s3.py
+```
+
+See [advanced usage](/zstar/guides/python/configuration/) for caching,
+external objects, and memory budgets supported by this SDK.

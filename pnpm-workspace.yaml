@@ -1,0 +1,8 @@
+packages:
+  - 'docs'
+
+allowBuilds:
+  sharp: true
+
+patchedDependencies:
+  starlight-pydocs@0.3.0: patches/starlight-pydocs@0.3.0.patch

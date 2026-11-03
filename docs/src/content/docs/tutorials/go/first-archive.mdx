@@ -1,0 +1,89 @@
+---
+title: "Create your first archive with Go"
+---
+
+import Example from "../../../../components/Example.astro";
+import source from "../../../../../../go/examples/tutorial_file/main.go?raw";
+
+Create an archive containing a small text file, save it as `example.zstar`,
+and read it back. Then read just the first five bytes and check the archive for
+errors.
+
+The example creates the text for you, so you do not need any input files.
+`example.txt` is the file inside the archive; `example.zstar` is the archive
+saved in your current directory. Running the example again replaces it.
+
+## Set up
+
+Create a Go module and add the SDK:
+
+```sh
+mkdir zstar-tutorial
+cd zstar-tutorial
+go mod init example.com/zstar-tutorial
+go get github.com/brian14708/zstar/go
+```
+
+Save the complete example below as `main.go`, then run `go run .`.
+
+## Write the archive
+
+`os.Create()` opens `example.zstar` for writing. The header names the file
+inside the archive (`example.txt`), sets its permissions (`0644`), and records
+its size in bytes. `Add()` writes the text from `bytes.NewReader`.
+
+The complete example puts this code in `writeArchive()`. Closing the writer
+finishes the archive; the deferred calls close the writer and output file even
+if an error occurs.
+
+<Example source={source} lang="go" region="create" />
+
+## Read a file and a byte range
+
+Reopen `example.zstar` with `os.Open()`. `ReaderAtSource` adapts the file to a
+source that can read selected parts of the file, using its size from `Stat()`.
+
+`Read()` takes a starting offset and a byte count. The first call reads all of
+`example.txt`; the second reads five bytes starting at offset 0, giving `Hello`.
+The example checks both results. Deferred calls close the reader and input file
+when the function returns.
+
+<Example source={source} lang="go" region="read" />
+
+## Verify the archive
+
+`Verify(ctx, false)` checks the entire archive for errors, including content
+you have not read. The `false` argument limits the check to this archive.
+Zstar also supports content stored separately, but this example keeps everything
+in one archive.
+
+<Example source={source} lang="go" region="verify" />
+
+You should see:
+
+```text
+Hello from Zstar
+Hello
+Archive verified
+```
+
+## Complete example
+
+<details>
+<summary>Show the complete runnable example</summary>
+
+<Example source={source} lang="go" />
+
+</details>
+
+[View the source](https://github.com/brian14708/zstar/blob/main/go/examples/tutorial_file/main.go).
+If you have cloned the Zstar repository, run this from its root directory:
+
+```sh
+go run ./go/examples/tutorial_file
+```
+
+## Next
+
+[Upload and read an S3 archive](/zstar/tutorials/go/s3/), or see
+[advanced usage](/zstar/guides/go/configuration/) for storage and resource limits.

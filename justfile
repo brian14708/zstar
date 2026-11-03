@@ -32,6 +32,12 @@ package *args: prepare-python
 prepare-python:
     uv sync --locked --package zstar-py --group test --no-editable --python "{{ python }}"
 
+# Build the portal and Python API from source with static analysis.
+docs:
+    uv sync --locked --only-group docs --python "{{ python }}"
+    pnpm install --frozen-lockfile
+    pnpm --filter zstar-docs run build
+
 check-integration: prepare-python
     #!/usr/bin/env bash
     set -euo pipefail

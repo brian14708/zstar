@@ -1,0 +1,223 @@
+diff --git a/components/ClassDoc.astro b/components/ClassDoc.astro
+index 7845680b95aa13eaa423864a1600fbccbfd8a77d..f5a11ef110ed6ebe58aefcd02e32ebfcaa70ce43 100644
+--- a/components/ClassDoc.astro
++++ b/components/ClassDoc.astro
+@@ -22,6 +22,7 @@ interface Props {
+ const { doc, scope, labels } = Astro.props;
+ 
+ const resolve = createStringResolver(Astro.locals, labels);
++const constructor = doc.members.find((member) => member.name === '__init__');
+ const bases = (doc.bases ?? []).map((base) => annotationTokens(base.expression, doc.path, scope.resolver));
+ ---
+ 
+@@ -44,3 +45,4 @@ const bases = (doc.bases ?? []).map((base) => annotationTokens(base.expression,
+ }
+ 
+ <DocstringSections doc={doc} scope={scope} labels={labels} />
++{constructor && <DocstringSections doc={constructor} scope={scope} labels={labels} />}
+diff --git a/components/ModuleDoc.astro b/components/ModuleDoc.astro
+index d7ff2e1f9c658412c5185cadd649c3b4b1d3e07f..34bd8cb400b6ce56792ce6eb63f1ce322fb13f3a 100644
+--- a/components/ModuleDoc.astro
++++ b/components/ModuleDoc.astro
+@@ -30,7 +30,9 @@ const resolve = createStringResolver(Astro.locals, labels);
+ 
+ // The model already buckets members, submodules included, so nothing here has
+ // to look at kinds: the `modules` group is the submodule list.
+-const groups = doc.groups.filter((group) => group.id !== 'modules');
++const groups = doc.groups
++  .filter((group) => group.id !== 'modules')
++  .map((group) => ({ ...group, members: group.members.filter((member) => member.pageSlug === doc.pageSlug) }));
+ const submodules = (doc.groups.find((group) => group.id === 'modules')?.members ?? []).map((member) => ({
+   name: member.name,
+   href: pageHref(scope, member.pageSlug),
+@@ -40,13 +42,34 @@ const submodules = (doc.groups.find((group) => group.id === 'modules')?.members
+ // Empty groups are dropped when the model builds them, so any group at all
+ // means the module documents something.
+ const hasMembers = doc.groups.length > 0;
++const classPages = Object.fromEntries(doc.members
++  .filter((member) => member.kind === 'class' && member.pageSlug !== doc.pageSlug)
++  .map((member) => [member.path, pageHref(scope, member.pageSlug)]));
+ ---
+ 
++{doc.kind === 'class' ? <ObjectDoc doc={doc} scope={scope} headingLevel={headingLevel} labels={labels} /> : (
+ <div class="pyd-module" data-pydocs-kind="module" data-pydocs-path={doc.path}>
+   <DocstringSections doc={doc} scope={scope} labels={labels} />
+ 
+   <MemberSummary doc={doc} scope={scope} labels={labels} />
+ 
++  {Object.keys(classPages).length > 0 && <script is:inline define:vars={{ classPages }}>
++    (() => {
++      const followClassAnchor = () => {
++      let anchor;
++      try { anchor = decodeURIComponent(location.hash.slice(1)); } catch { return; }
++      for (const [path, href] of Object.entries(classPages)) {
++        if (anchor === path || anchor.startsWith(path + '.')) {
++          location.replace(href + '#' + encodeURIComponent(anchor));
++          break;
++        }
++      }
++      };
++      addEventListener('hashchange', followClassAnchor);
++      followClassAnchor();
++    })();
++  </script>}
++
+   {
+     submodules.length === 0 ? null : (
+       <div class="pyd-submodules" data-pydocs-group="modules">
+@@ -77,3 +100,4 @@ const hasMembers = doc.groups.length > 0;
+ 
+   {hasMembers ? null : <p class="pyd-no-members">{resolve('noMembers')}</p>}
+ </div>
++)}
+diff --git a/components/ObjectDoc.astro b/components/ObjectDoc.astro
+index df5e147c13e41e363cf6be5f8ca023b88133e5de..28157a1f70de34bc77775b8e5421cc45a2d7996a 100644
+--- a/components/ObjectDoc.astro
++++ b/components/ObjectDoc.astro
+@@ -40,7 +40,7 @@ const Body = doc.kind === 'class' ? ClassDoc : doc.kind === 'function' ? Functio
+ 
+ const memberParentKind = doc.kind === 'class' ? 'class' : 'module';
+ const { own, inherited } = splitInherited(doc.members);
+-const ownGroups = groupMembers(own, memberParentKind);
++const ownGroups = groupMembers(own.filter((member) => member.name !== '__init__'), memberParentKind);
+ const inheritedGroups = inherited.map((bucket) => ({
+   from: bucket.from,
+   groups: groupMembers(bucket.members, memberParentKind),
+@@ -83,10 +83,15 @@ const deprecationHtml = deprecation === undefined ? '' : renderedDeprecation(sco
+ ---
+ 
+ <section class="pyd-member" data-pydocs-kind={doc.kind} data-pydocs-path={doc.path}>
++  {doc.kind === 'class' && doc.members.some((member) => member.name === '__init__') &&
++    <span id={`${doc.path}.__init__`} aria-hidden="true" />}
++  <header class="pyd-member-header">
+   <Heading level={headingLevel} id={doc.path} labels={labels}>
+-    <code class="pyd-member-name">{doc.name}</code>
++    <code class="pyd-member-name">{doc.kind === 'class' ? `${doc.name}(...)` : doc.name}</code>
+     <Badges doc={doc} labels={labels} />
+   </Heading>
++  <SourceLink doc={doc} labels={labels} />
++  </header>
+ 
+   <div class="pyd-provenance">
+     {
+@@ -116,7 +121,6 @@ const deprecationHtml = deprecation === undefined ? '' : renderedDeprecation(sco
+         </span>
+       ))
+     }
+-    <SourceLink doc={doc} labels={labels} />
+   </div>
+ 
+   {
+@@ -137,8 +141,9 @@ const deprecationHtml = deprecation === undefined ? '' : renderedDeprecation(sco
+   {
+     ownGroups.map((group) => (
+       <div class="pyd-group" data-pydocs-group={group.id}>
++        {doc.kind === 'class' && <h3 class="pyd-group-title" id={`${doc.path}.${group.id}`}>{resolve(group.id)}</h3>}
+         {group.members.map((member) => (
+-          <Astro.self doc={member} scope={scope} headingLevel={headingLevel + 1} labels={labels} />
++          <Astro.self doc={member} scope={scope} headingLevel={headingLevel + (doc.kind === 'class' ? 2 : 1)} labels={labels} />
+         ))}
+       </div>
+     ))
+@@ -153,7 +158,7 @@ const deprecationHtml = deprecation === undefined ? '' : renderedDeprecation(sco
+         {bucket.groups.map((group) => (
+           <div class="pyd-group" data-pydocs-group={group.id}>
+             {group.members.map((member) => (
+-              <Astro.self doc={member} scope={scope} headingLevel={headingLevel + 1} labels={labels} />
++              <Astro.self doc={member} scope={scope} headingLevel={headingLevel + (doc.kind === 'class' ? 2 : 1)} labels={labels} />
+             ))}
+           </div>
+         ))}
+diff --git a/lib/markdown-doc.ts b/lib/markdown-doc.ts
+index 2a4cd3cf0f0d86afd7e6fd566a525a7560c7574e..8d3c2bcf7079fa79c502cf3a324de6f34f7fe9e9 100644
+--- a/lib/markdown-doc.ts
++++ b/lib/markdown-doc.ts
+@@ -38,7 +38,7 @@ export function renderPageMarkdown(page: PageModel, options: MarkdownDocOptions
+   renderObject(page.object, 1, lines, options);
+ 
+   if (page.children.length > 0) {
+-    lines.push(`**${label('modules', options)}**`, '');
++    lines.push('**Reference pages**', '');
+     for (const child of page.children) lines.push(`- \`${child}\``);
+     lines.push('');
+   }
+@@ -98,7 +98,7 @@ function renderObject(doc: DocObject, depth: number, lines: string[], options: M
+   }
+ 
+   for (const group of doc.groups) {
+-    renderGroup(group, depth, lines, options);
++    renderGroup({ ...group, members: group.members.filter((member) => member.pageSlug === doc.pageSlug) }, depth, lines, options);
+   }
+ }
+ 
+diff --git a/lib/model.ts b/lib/model.ts
+index 2b8470e72504b35e3c9cfaabab300515cbc6a2b8..925e744d92cdc1f127e14bcc87f0e5239a8079b7 100644
+--- a/lib/model.ts
++++ b/lib/model.ts
+@@ -359,7 +359,9 @@ class ModelBuilder {
+     const reexportedFrom = context.reexportedFrom ?? resolved.reexportedFrom;
+ 
+     const kind: DocKind = target.kind === 'type alias' ? 'attribute' : (target.kind as DocKind);
+-    const pageSlug = target.kind === 'module' ? moduleSlug(this.options.base, docPath) : context.pageSlug;
++    const ownPage = target.kind === 'module' ||
++      (target.kind === 'class' && docPath.split('.').length === this.options.packageName.split('.').length + 1);
++    const pageSlug = ownPage ? moduleSlug(this.options.base, docPath) : context.pageSlug;
+ 
+     const doc: DocObject = {
+       path: docPath,
+@@ -639,10 +641,10 @@ class ModelBuilder {
+     const pages: PageModel[] = [];
+ 
+     const visit = (module: DocObject, parent: string | undefined): void => {
+-      const children = module.members.filter((member) => member.kind === 'module');
++      const children = module.members.filter((member) => member.pageSlug !== module.pageSlug);
+       pages.push({
+         slug: module.pageSlug,
+-        title: module.path,
++        title: module.kind === 'class' ? module.name : module.path,
+         modulePath: module.path,
+         object: module,
+         headings: pageHeadings(module),
+@@ -748,18 +750,21 @@ function groupIdFor(member: DocObject, parentKind: 'module' | 'class'): MemberGr
+ export function pageHeadings(module: DocObject): PageHeading[] {
+   const headings: PageHeading[] = [];
+ 
++  if (module.kind === 'class') {
++    headings.push({ depth: 2, slug: module.path, text: `${module.name}(...)` });
++    for (const group of module.groups) {
++      if (group.members.some((member) => !member.inheritedFrom && member.name !== '__init__')) {
++        headings.push({ depth: 3, slug: `${module.path}.${group.id}`, text: group.id[0].toUpperCase() + group.id.slice(1) });
++      }
++    }
++    return headings;
++  }
++
+   for (const group of module.groups) {
+-    // Submodules get pages of their own, so they are links rather than headings.
+     if (group.id === 'modules') continue;
+     for (const member of group.members) {
++      if (member.pageSlug !== module.pageSlug) continue;
+       headings.push({ depth: 2, slug: member.path, text: member.name });
+-      // Group order, not source order: the table of contents has to match what
+-      // the renderer emits.
+-      for (const childGroup of member.groups) {
+-        for (const child of childGroup.members) {
+-          headings.push({ depth: 3, slug: child.path, text: child.name });
+-        }
+-      }
+     }
+   }
+ 
+diff --git a/routes/starlight.astro b/routes/starlight.astro
+index 141631a7e937a8c8858ccd7e4400c7ddb265c38c..9524ca945c3d710a201971a678ab76c42e1c5340 100644
+--- a/routes/starlight.astro
++++ b/routes/starlight.astro
+@@ -28,7 +28,7 @@ const { scope, page, withSearch } = await resolvePydocsPage(context, props);
+ 
+ <StarlightPage
+   frontmatter={{
+-    title: page.title,
++    title: page.parent === undefined ? scope.pkg.label : page.title,
+     // The module's first docstring line, so the page carries its own meta and
+     // OpenGraph description instead of the site-wide one.
+     ...(page.object.summary === '' ? {} : { description: page.object.summary }),

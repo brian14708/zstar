@@ -1,0 +1,64 @@
+/* Reading styles for Starlight guides and API reference pages. */
+:root {
+  --docs-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --docs-font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --sl-font: var(--docs-font);
+  --sl-font-mono: var(--docs-font-mono);
+  --sl-text-body: 1.0625rem;
+  --sl-content-width: 48rem;
+  --sl-line-height: 1.7;
+}
+
+/* Embedded SVG media queries follow the selected docs theme. */
+.site-title img {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] .site-title img {
+  color-scheme: dark;
+}
+
+.sl-markdown-content {
+  font-size: 1.0625rem;
+  line-height: 1.7;
+}
+
+main h1 {
+  font-size: clamp(2rem, 4vw, 2.75rem);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+
+.sl-markdown-content :is(h2, h3, h4) {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.sl-markdown-content h2 {
+  font-size: clamp(1.5rem, 2.5vw, 1.875rem);
+}
+
+.sl-markdown-content h3 {
+  font-size: 1.25rem;
+}
+
+.sl-markdown-content p {
+  text-wrap: pretty;
+}
+
+.sl-markdown-content > :is(p, ul, ol) {
+  max-inline-size: 76ch;
+}
+
+.sl-markdown-content a {
+  text-underline-offset: 0.18em;
+}
+
+.sl-markdown-content table {
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}

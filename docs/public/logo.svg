@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title" preserveAspectRatio="xMinYMid meet">
+  <title id="title">Zstar</title>
+  <rect x="1" y="1" width="126" height="126" fill="#0F172A" stroke="#FFFFFF" stroke-opacity=".16" stroke-width="2"/>
+  <path fill="#FFFFFF" transform="translate(21.0835 94) scale(.0402685 -.0402685)" d="M52 0V274L662 1006Q700 1050 739 1094.5Q778 1139 818 1184H70V1490H1258V1216L658 487Q620 442 580.5 396.5Q541 351 500 306H1265V0Z"/>
+  <path fill="#FFC247" transform="translate(71.6770 83.7852) scale(.0334129 -.0334129)" d="M471 652L492 923L266 770L160 952L406 1070L160 1188L266 1372L492 1219L471 1490H681L661 1219L887 1372L992 1188L748 1070L992 952L887 770L661 923L681 652Z"/>
+</svg>

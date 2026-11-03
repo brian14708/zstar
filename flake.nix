@@ -19,6 +19,8 @@
             go_1_27
             python3
             uv
+            nodejs_24
+            pnpm
             pkg-config
             zstd
             cmake
