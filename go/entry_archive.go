@@ -21,18 +21,22 @@ import (
 type EntryArchiveWriter struct {
 	output                io.Writer
 	codec                 *zstd.Encoder
+	workers               *frameWorkers
 	options               manifestOptions
 	target                int
 	pending               []byte
+	encodedBuffer         []byte
 	raw, emitted, encoded uint64
 	frames, records       manifestSpool
 	err                   error
 	closed                bool
 }
 
-// NewEntryArchiveWriter creates an archive encoder with bounded frame and
-// metadata storage. Zero frameSize selects 1 MiB. The caller owns output.
-func NewEntryArchiveWriter(output io.Writer, frameSize int, config ManifestWriterOptions) (*EntryArchiveWriter, error) {
+// NewEntryArchiveWriter creates a bounded archive encoder. Options select data
+// compression, ordered workers and manifest storage. The caller owns output;
+// Close finalizes the archive, joins workers and reports cleanup errors.
+func NewEntryArchiveWriter(output io.Writer, config WriterOptions) (*EntryArchiveWriter, error) {
+	frameSize := config.FrameSize
 	if output == nil {
 		return nil, errors.New("zstar: nil destination")
 	}
@@ -42,7 +46,10 @@ func NewEntryArchiveWriter(output io.Writer, frameSize int, config ManifestWrite
 	if frameSize < 512 || frameSize%512 != 0 {
 		return nil, errors.New("zstar: invalid frame target")
 	}
-	options := config.defaults()
+	if config.Workers < 0 || config.Workers > 16 {
+		return nil, errors.New("zstar: compression workers must be in [0,16]")
+	}
+	options := config.Manifest.defaults()
 	if err := checkLimit(uint64(frameSize), options.Limits.MaxFrameDecodedBytes, "writer frame size"); err != nil {
 		return nil, err
 	}
@@ -50,43 +57,76 @@ func NewEntryArchiveWriter(output io.Writer, frameSize int, config ManifestWrite
 		return nil, err
 	}
 	options.RootExtensions = cloneExtensions(options.RootExtensions)
-	codec, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderCRC(true), zstd.WithWindowSize(frameWindow(frameSize)), zstd.WithEncoderLevel(manifestCompressionLevel(options.CompressionLevel)))
-	if err != nil {
-		return nil, err
+	w := &EntryArchiveWriter{output: output, options: options, target: frameSize, pending: make([]byte, 0, frameSize), frames: manifestSpool{options: options}, records: manifestSpool{options: options}}
+	if config.Workers != 0 {
+		workers, err := newFrameWorkers(config.Workers, frameSize, config.CompressionLevel)
+		if err != nil {
+			return nil, err
+		}
+		w.workers = workers
+	} else {
+		codec, err := newFrameEncoder(frameSize, config.CompressionLevel)
+		if err != nil {
+			return nil, err
+		}
+		w.codec = codec
 	}
-	return &EntryArchiveWriter{output: output, codec: codec, options: options, target: frameSize, pending: make([]byte, 0, frameSize), frames: manifestSpool{options: options}, records: manifestSpool{options: options}}, nil
+	return w, nil
 }
 
 func (w *EntryArchiveWriter) flush() error {
 	if len(w.pending) == 0 {
 		return nil
 	}
-	encoded := w.codec.EncodeAll(w.pending, nil)
+	if w.workers != nil {
+		var recycled []byte
+		if w.workers.pending == len(w.workers.workers) {
+			frame := w.workers.receive()
+			if err := w.emitFrame(len(frame.raw), frame.encoded); err != nil {
+				return err
+			}
+			recycled = frame.raw
+		}
+		w.workers.submit(w.pending)
+		if recycled == nil {
+			recycled = make([]byte, 0, w.target)
+		}
+		w.pending = recycled[:0]
+		return nil
+	}
+	w.encodedBuffer = w.codec.EncodeAll(w.pending, w.encodedBuffer[:0])
+	if err := w.emitFrame(len(w.pending), w.encodedBuffer); err != nil {
+		return err
+	}
+	w.pending = w.pending[:0]
+	return nil
+}
+
+func (w *EntryArchiveWriter) emitFrame(decoded int, encoded []byte) error {
 	if err := w.options.Limits.frame(encoded); err != nil {
 		return err
 	}
 	if uint64(len(encoded)) > math.MaxUint64-w.encoded {
-		return rejected("resource-limit", "archive size overflow")
+		return rejected(CategoryResourceLimit, "archive size overflow")
 	}
 	if err := writeExact(w.output, encoded); err != nil {
 		return err
 	}
 	record := make([]byte, 32)
-	for i, n := range []uint64{w.emitted, uint64(len(w.pending)), w.encoded, uint64(len(encoded))} {
+	for i, n := range []uint64{w.emitted, uint64(decoded), w.encoded, uint64(len(encoded))} {
 		binary.LittleEndian.PutUint64(record[i*8:], n)
 	}
 	if err := w.frames.append(record); err != nil {
 		return err
 	}
-	w.emitted += uint64(len(w.pending))
+	w.emitted += uint64(decoded)
 	w.encoded += uint64(len(encoded))
-	w.pending = w.pending[:0]
 	return nil
 }
 
 func (w *EntryArchiveWriter) append(data []byte) error {
 	if uint64(len(data)) > math.MaxUint64-w.raw {
-		return rejected("resource-limit", "decoded archive overflow")
+		return rejected(CategoryResourceLimit, "decoded archive overflow")
 	}
 	for len(data) != 0 {
 		n := min(len(data), w.target-len(w.pending))
@@ -158,27 +198,27 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 	if physicalSize != 0 && body == nil {
 		return errors.New("zstar: missing file body")
 	}
-	kind := "file"
+	kind := KindFile
 	if entry.Type == TypeSymlink {
-		kind = "symlink"
+		kind = KindSymlink
 	}
 	if entry.Type == TypeDirectory {
-		kind = "directory"
+		kind = KindDirectory
 	}
 	target := ""
 	if entry.Linkname != nil {
 		target = *entry.Linkname
 	}
-	header, err := memberHeader(Header{Path: entry.Path, Kind: Kind(kind), Mode: entry.Mode, UID: entry.UID, GID: entry.GID, MtimeNS: entry.MtimeNS, Size: physicalSize, Target: target})
+	header, err := memberHeader(Header{Path: entry.Path, Kind: kind, Mode: entry.Mode, UID: entry.UID, GID: entry.GID, MtimeNS: entry.MtimeNS, Size: physicalSize, Target: target})
 	if err != nil {
 		return err
 	}
 	if physicalSize > math.MaxUint64-511 {
-		return rejected("resource-limit", "payload padding overflow")
+		return rejected(CategoryResourceLimit, "payload padding overflow")
 	}
 	padded := (physicalSize + 511) / 512 * 512
 	if padded > math.MaxUint64-uint64(len(header)) || padded+uint64(len(header)) > math.MaxUint64-w.raw {
-		return rejected("resource-limit", "member size overflow")
+		return rejected(CategoryResourceLimit, "member size overflow")
 	}
 	if !entry.External() && physicalSize != 0 {
 		pending := len(w.pending)
@@ -195,7 +235,7 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 			return err
 		}
 		if w.options.Limits.MaxEntryBytes != 0 && count > (w.options.Limits.MaxEntryBytes-uint64(len(entryRaw)))/4 {
-			return rejected("resource-limit", "inline entry metadata size")
+			return rejected(CategoryResourceLimit, "inline entry metadata size")
 		}
 	}
 	mutated = true
@@ -269,7 +309,19 @@ func (w *EntryArchiveWriter) Close() (err error) {
 		return w.err
 	}
 	w.closed = true
-	defer func() { w.err = errors.Join(w.err, w.codec.Close(), w.frames.close(), w.records.close()); err = w.err }()
+	defer func() {
+		w.pending, w.encodedBuffer = nil, nil
+		var codecErr error
+		if w.workers != nil {
+			codecErr = w.workers.close()
+			w.workers = nil
+		}
+		if w.codec != nil {
+			codecErr = w.codec.Close()
+		}
+		w.err = errors.Join(w.err, codecErr, w.frames.close(), w.records.close())
+		err = w.err
+	}()
 	if w.err != nil {
 		return w.err
 	}
@@ -284,11 +336,23 @@ func (w *EntryArchiveWriter) finish() (err error) {
 	if err := w.flush(); err != nil {
 		return err
 	}
+	if w.workers != nil {
+		for w.workers.pending != 0 {
+			frame := w.workers.receive()
+			if err := w.emitFrame(len(frame.raw), frame.encoded); err != nil {
+				return err
+			}
+		}
+	}
 	metadata, err := NewManifestWriter(w.output, w.encoded, w.options.writerOptions())
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, metadata.encoder.Close()) }()
+	defer func() {
+		if !metadata.closed {
+			err = errors.Join(err, metadata.encoder.Close(), metadata.entries.close())
+		}
+	}()
 	var at, frameAt uint64
 	var current [4]uint64
 	loaded := false
@@ -344,7 +408,7 @@ func (w *EntryArchiveWriter) finish() (err error) {
 				}
 				// Leave room for the array head and metadata; AddEntry checks the exact final size.
 				if w.options.Limits.MaxEntryBytes != 0 && uint64(extentBytes) > w.options.Limits.MaxEntryBytes {
-					return rejected("resource-limit", "entry size maximum")
+					return rejected(CategoryResourceLimit, "entry size maximum")
 				}
 				if raw+decoded >= end {
 					break

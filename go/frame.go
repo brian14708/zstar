@@ -72,7 +72,7 @@ func decodeBoundedFrame(encoded []byte, expected, decodedLimit, encodedLimit int
 
 func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLimit int) ([]byte, error) {
 	if expected < 0 || expected > decodedLimit || len(encoded) > encodedLimit {
-		return nil, rejected("resource-limit", "frame size limits")
+		return nil, rejected(CategoryResourceLimit, "frame size limits")
 	}
 	var header zstd.Header
 	if err := header.Decode(encoded); err != nil {
@@ -123,7 +123,7 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 	// by the decoder. Reuse it to reserve once for unknown-size callers.
 	if expected == 0 && header.HasFCS {
 		if header.FrameContentSize > uint64(decodedLimit) {
-			return nil, rejected("resource-limit", "decoded output limit")
+			return nil, rejected(CategoryResourceLimit, "decoded output limit")
 		}
 		if header.FrameContentSize != 0 {
 			expected = int(header.FrameContentSize)
@@ -148,7 +148,7 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 			return nil, readErr
 		}
 		if len(raw) > decodedLimit {
-			return nil, rejected("resource-limit", "decoded output limit")
+			return nil, rejected(CategoryResourceLimit, "decoded output limit")
 		}
 		return raw, nil
 	}

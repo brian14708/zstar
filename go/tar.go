@@ -8,8 +8,8 @@ import (
 	"unicode/utf8"
 )
 
-func badTar(reason string) error      { return rejected("malformed-tar", reason) }
-func tarMismatch(reason string) error { return rejected("tar-toc-mismatch", reason) }
+func badTar(reason string) error      { return rejected(CategoryMalformedTar, reason) }
+func tarMismatch(reason string) error { return rejected(CategoryTarTOCMismatch, reason) }
 func tarText(raw []byte) (string, error) {
 	at := bytes.IndexByte(raw, 0)
 	if at < 0 {

@@ -25,7 +25,7 @@ func validateExtensions(ext Extensions) error {
 
 func validateExtensionValue(value any, depth int) error {
 	if depth > 64 {
-		return rejected("resource-limit", "extension nesting budget exceeded")
+		return rejected(CategoryResourceLimit, "extension nesting budget exceeded")
 	}
 	switch value := value.(type) {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, bool:

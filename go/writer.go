@@ -32,6 +32,12 @@ type Header struct {
 type WriterOptions struct {
 	Manifest  ManifestWriterOptions
 	FrameSize int
+	// CompressionLevel selects data compression independently of Manifest.
+	// Zero selects the codec default (Zstandard level 3).
+	CompressionLevel int
+	// Workers selects ordered frame compression workers: zero is serial;
+	// nonzero values must be in [1,16]. Each worker owns one codec and frame.
+	Workers int
 }
 
 // Writer streams checksummed tar frames and bounded, spooled entry metadata.
@@ -42,7 +48,7 @@ type Writer struct{ engine *EntryArchiveWriter }
 // NewWriter creates an archive encoder. The caller owns output and must call
 // Close to finalize metadata and release temporary storage.
 func NewWriter(output io.Writer, options WriterOptions) (*Writer, error) {
-	engine, err := NewEntryArchiveWriter(output, options.FrameSize, options.Manifest)
+	engine, err := NewEntryArchiveWriter(output, options)
 	if err != nil {
 		return nil, err
 	}
@@ -63,21 +69,21 @@ func (w *Writer) Add(ctx context.Context, header Header, body io.Reader) error {
 	}
 	kind := header.Kind
 	if kind == "" {
-		kind = "file"
+		kind = KindFile
 	}
 	entry := Entry{Path: header.Path, Mode: header.Mode, UID: header.UID, GID: header.GID, MtimeNS: header.MtimeNS, Extents: header.Extents, Attributes: header.Extensions}
 	switch kind {
-	case "file":
-	case "directory":
+	case KindFile:
+	case KindDirectory:
 		entry.Type = TypeDirectory
-	case "symlink":
+	case KindSymlink:
 		entry.Type = TypeSymlink
 		target := header.Target
 		entry.Linkname = &target
 	default:
 		return errors.New("zstar: unsupported member kind")
 	}
-	if kind != "symlink" && header.Target != "" {
+	if kind != KindSymlink && header.Target != "" {
 		return errors.New("zstar: target on nonsymlink")
 	}
 	return w.engine.Add(ctx, entry, header.Size, body)
@@ -100,21 +106,30 @@ func validPath(path string) bool {
 }
 
 func writeExact(destination io.Writer, data []byte) error {
-	n, err := destination.Write(data)
-	if err == nil && n != len(data) {
-		return io.ErrShortWrite
-	}
+	_, err := writeBuffer(destination, data)
 	return err
+}
+
+// Reject invalid counts without losing an accompanying destination error.
+func writeBuffer(destination io.Writer, data []byte) (int, error) {
+	n, err := destination.Write(data)
+	if n < 0 || n > len(data) {
+		return 0, errors.Join(err, io.ErrShortWrite)
+	}
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }
 
 func memberHeader(h Header) ([]byte, error) {
 	path := h.Path
 	kind := byte('0')
 	switch h.Kind {
-	case "directory":
+	case KindDirectory:
 		path += "/"
 		kind = '5'
-	case "symlink":
+	case KindSymlink:
 		kind = '2'
 	case KindFile, "":
 	}

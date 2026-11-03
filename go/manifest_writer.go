@@ -19,6 +19,7 @@ import (
 type ManifestWriter struct {
 	output                          io.Writer
 	encoder                         *zstd.Encoder
+	encodedBuffer                   []byte
 	start, position, decoded, count uint64
 	hash                            hash.Hash
 	options                         manifestOptions
@@ -77,7 +78,7 @@ func (w *ManifestWriter) AddEntry(entry Entry) error {
 		return err
 	}
 	if w.count == math.MaxUint64 {
-		w.err = rejected("malformed-toc", "entry count overflow")
+		w.err = rejected(CategoryMalformedTOC, "entry count overflow")
 		return w.err
 	}
 	w.count++
@@ -110,24 +111,25 @@ func cborHead(major byte, n uint64) []byte {
 
 func (w *ManifestWriter) writeSegment(raw []byte) error {
 	if len(raw) == 0 {
-		return rejected("malformed-toc", "metadata segment maximum")
+		return rejected(CategoryMalformedTOC, "metadata segment maximum")
 	}
 	if uint64(len(raw)) > w.options.MaxDecodedBytes-w.decoded {
-		return rejected("resource-limit", "decoded manifest size")
+		return rejected(CategoryResourceLimit, "decoded manifest size")
 	}
 	if err := checkLimit(uint64(len(raw)), w.options.Limits.MaxFrameDecodedBytes, "decoded metadata frame size"); err != nil {
 		return err
 	}
-	encoded := w.encoder.EncodeAll(raw, nil)
+	w.encodedBuffer = w.encoder.EncodeAll(raw, w.encodedBuffer[:0])
+	encoded := w.encodedBuffer
 	if err := w.options.Limits.frame(encoded); err != nil {
 		return err
 	}
 	if uint64(len(encoded)) > math.MaxUint32 {
-		return rejected("malformed-toc", "metadata wrapper length")
+		return rejected(CategoryMalformedTOC, "metadata wrapper length")
 	}
 	size := uint64(len(encoded)) + 8
 	if size > w.options.MaxEncodedBytes-(w.position-w.start) || size > math.MaxUint64-w.position {
-		return rejected("resource-limit", "encoded manifest size")
+		return rejected(CategoryResourceLimit, "encoded manifest size")
 	}
 	header := make([]byte, 8)
 	binary.LittleEndian.PutUint32(header, 0x184D2A5E)
@@ -173,7 +175,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 	}
 	for key, value := range w.options.RootExtensions {
 		if !strings.HasPrefix(key, "x-") {
-			return rejected("malformed-toc", "root extension key")
+			return rejected(CategoryMalformedTOC, "root extension key")
 		}
 		if err := add(key, value); err != nil {
 			return err
@@ -226,7 +228,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 			return e
 		}
 		if previous != "" && previous >= entry.Path {
-			return rejected("malformed-toc", "duplicate entry path")
+			return rejected(CategoryMalformedTOC, "duplicate entry path")
 		}
 		for d := range directories {
 			if !stringsHasPathPrefix(entry.Path, d) && entry.Path > d+"/" {
@@ -235,7 +237,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 		}
 		for _, parent := range pathAncestors(entry.Path) {
 			if !directories[parent] {
-				return rejected("malformed-toc", "missing ancestor directory")
+				return rejected(CategoryMalformedTOC, "missing ancestor directory")
 			}
 		}
 		if entry.Type == TypeDirectory {
@@ -277,7 +279,11 @@ func (w *ManifestWriter) Close() (err error) {
 		return w.err
 	}
 	w.closed = true
-	defer func() { err = errors.Join(err, w.encoder.Close(), w.entries.close()); w.err = err }()
+	defer func() {
+		w.encodedBuffer = nil
+		err = errors.Join(err, w.encoder.Close(), w.entries.close())
+		w.err = err
+	}()
 	if w.err != nil {
 		return w.err
 	}

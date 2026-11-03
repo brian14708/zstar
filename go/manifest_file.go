@@ -2,6 +2,7 @@ package zstar
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math"
 	"sort"
@@ -31,7 +32,7 @@ func (m *Manifest) OpenFile(ctx context.Context, path string, resolver EncodedCo
 		return nil, pathError("open", path, err)
 	}
 	if entry == nil || entry.Type != TypeFile {
-		return nil, rejected("unsupported-operation", "entry is not a file")
+		return nil, rejected(CategoryUnsupportedOperation, "entry is not a file")
 	}
 	return m.openEntryFile(entry, resolver, verifyExternal)
 }
@@ -46,6 +47,7 @@ func (m *Manifest) openEntryFile(entry *Entry, resolver EncodedContentResolver, 
 	for i, extent := range entry.Extents {
 		starts[i+1] = starts[i] + extent.Size
 	}
+	entry.extentEnds = starts[1:]
 	return &File{manifest: m, entry: entry, resolver: resolver, verifyExternal: verifyExternal, size: size, starts: starts}, nil
 }
 
@@ -60,12 +62,17 @@ func (f *File) ReadAt(output []byte, offset int64) (int, error) {
 
 // ReadAtContext reads a member range using ctx for this operation only.
 // A short read at the end of the member returns io.EOF.
-func (f *File) ReadAtContext(ctx context.Context, output []byte, offset int64) (int, error) {
+func (f *File) ReadAtContext(ctx context.Context, output []byte, offset int64) (n int, err error) {
+	defer func() {
+		if err != nil && !errors.Is(err, io.EOF) {
+			err = pathError("read", f.entry.Path, err)
+		}
+	}()
 	if err := f.manifest.content.checkOpen(ctx); err != nil {
 		return 0, err
 	}
 	if offset < 0 {
-		return 0, rejected("invalid-range", "negative file offset")
+		return 0, rejected(CategoryInvalidRange, "negative file offset")
 	}
 	if len(output) == 0 {
 		return 0, nil
@@ -74,14 +81,18 @@ func (f *File) ReadAtContext(ctx context.Context, output []byte, offset int64) (
 		return 0, io.EOF
 	}
 	size := min(uint64(len(output)), f.size-uint64(offset))
-	if size > f.manifest.maxRead {
-		return f.readAtSerial(ctx, output, uint64(offset), size)
+	first := sort.Search(len(f.entry.Extents), func(i int) bool { return f.starts[i+1] > uint64(offset) })
+	// A single extent needs no batch plan or temporary result buffer. Copy
+	// only after validating the complete source and declared selection.
+	if size <= f.starts[first+1]-uint64(offset) || size > f.manifest.maxRead {
+		return f.readAtSerial(ctx, output, first, uint64(offset), size)
 	}
-	data, err := f.manifest.Read(ctx, f.entry.Path, uint64(offset), size, f.resolver, f.verifyExternal)
+	_, _, err = f.manifest.readRanges(ctx,
+		[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, uint64(offset), size}, entry: f.entry, output: output[:int(size)]}}, f.resolver, f.verifyExternal, false)
 	if err != nil {
 		return 0, err
 	}
-	n := copy(output, data)
+	n = int(size)
 	if n < len(output) {
 		return n, io.EOF
 	}
@@ -96,19 +107,23 @@ func (f *File) WriteTo(output io.Writer) (int64, error) {
 
 // WriteToContext streams the complete member using ctx for this operation only.
 // The destination remains caller-owned; failures return the bytes written.
-func (f *File) WriteToContext(ctx context.Context, output io.Writer) (int64, error) {
+func (f *File) WriteToContext(ctx context.Context, output io.Writer) (written int64, err error) {
+	defer func() {
+		if err != nil {
+			err = pathError("read", f.entry.Path, err)
+		}
+	}()
 	if err := f.manifest.content.checkOpen(ctx); err != nil {
 		return 0, err
 	}
 	if f.size > math.MaxInt64 {
-		return 0, rejected("resource-limit", "stream count exceeds int64")
+		return 0, rejected(CategoryResourceLimit, "stream count exceeds int64")
 	}
 	for _, e := range f.entry.Extents {
 		if e.Size > f.manifest.maxRead {
 			return f.writeToSerial(ctx, output)
 		}
 	}
-	var written int64
 	for i := 0; i < len(f.entry.Extents); {
 		start := f.starts[i]
 		end := f.starts[i+1]
@@ -117,20 +132,17 @@ func (f *File) WriteToContext(ctx context.Context, output io.Writer) (int64, err
 			end = f.starts[i+1]
 			i++
 		}
-		data, err := f.manifest.Read(ctx, f.entry.Path, start, end-start, f.resolver, f.verifyExternal)
+		results, _, err := f.manifest.readRanges(ctx,
+			[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, start, end - start}, entry: f.entry}},
+			f.resolver, f.verifyExternal, false)
 		if err != nil {
 			return written, err
 		}
-		n, err := output.Write(data)
-		if n < 0 || n > len(data) {
-			return written, io.ErrShortWrite
-		}
+		data := results[0]
+		n, err := writeBuffer(output, data)
 		written += int64(n)
 		if err != nil {
 			return written, err
-		}
-		if n != len(data) {
-			return written, io.ErrShortWrite
 		}
 	}
 	return written, nil
@@ -174,8 +186,8 @@ func (m *Manifest) Verify(ctx context.Context, resolver EncodedContentResolver, 
 					}
 					previous = key
 				}
-				if extent.Offset > uint64(len(chunk.raw)) || extent.Size > uint64(len(chunk.raw))-extent.Offset {
-					return rejected("invalid-range", "decoded extent bounds")
+				if _, err := chunk.selection(extent); err != nil {
+					return err
 				}
 				if chunk.verified {
 					report.ExternalObjectsSHA256Checked = true
@@ -193,12 +205,14 @@ func (m *Manifest) Verify(ctx context.Context, resolver EncodedContentResolver, 
 	return report, nil
 }
 
-func (f *File) readAtSerial(ctx context.Context, output []byte, offset, size uint64) (int, error) {
-	first := sort.Search(len(f.entry.Extents), func(i int) bool { return f.starts[i+1] > offset })
+func (f *File) readAtSerial(ctx context.Context, output []byte, first int, offset, size uint64) (int, error) {
 	var n int
 	var previous manifestChunkKey
 	var chunk *manifestContentChunk
 	for i := first; uint64(n) < size; i++ {
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
 		extent := f.entry.Extents[i]
 		key := chunkKey(extent)
 		if chunk == nil || key != previous {
@@ -209,13 +223,13 @@ func (f *File) readAtSerial(ctx context.Context, output []byte, offset, size uin
 			}
 			previous = key
 		}
-		if extent.Offset > uint64(len(chunk.raw)) || extent.Size > uint64(len(chunk.raw))-extent.Offset {
-			return n, rejected("invalid-range", "decoded extent bounds")
+		selection, err := chunk.selection(extent)
+		if err != nil {
+			return n, err
 		}
 		within := offset + uint64(n) - f.starts[i]
 		length := min(extent.Size-within, size-uint64(n))
-		start := extent.Offset + within
-		n += copy(output[n:], chunk.raw[start:start+length])
+		n += copy(output[n:], selection[within:within+length])
 	}
 	if n < len(output) {
 		return n, io.EOF
@@ -240,19 +254,14 @@ func (f *File) writeToSerial(ctx context.Context, output io.Writer) (int64, erro
 			}
 			previous = key
 		}
-		if extent.Offset > uint64(len(chunk.raw)) || extent.Size > uint64(len(chunk.raw))-extent.Offset {
-			return written, rejected("invalid-range", "decoded extent bounds")
-		}
-		n, err := output.Write(chunk.raw[extent.Offset : extent.Offset+extent.Size])
-		if n < 0 || uint64(n) > extent.Size {
-			return written, io.ErrShortWrite
-		}
-		written += int64(n)
+		selection, err := chunk.selection(extent)
 		if err != nil {
 			return written, err
 		}
-		if uint64(n) != extent.Size {
-			return written, io.ErrShortWrite
+		n, err := writeBuffer(output, selection)
+		written += int64(n)
+		if err != nil {
+			return written, err
 		}
 	}
 	return written, nil

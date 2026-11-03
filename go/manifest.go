@@ -13,7 +13,7 @@ import (
 	"maps"
 	"math"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -50,11 +50,11 @@ func (e Extent) value() []any {
 
 func (e Extent) validate(dataEnd uint64) error {
 	if e.Size == 0 || e.EncodedSize == 0 || e.Size > math.MaxUint64-e.Offset {
-		return rejected("malformed-toc", "extent bounds")
+		return rejected(CategoryMalformedTOC, "extent bounds")
 	}
 	if s, archive := e.Source.ArchiveOffset(); archive {
 		if s > dataEnd || e.EncodedSize > dataEnd-s {
-			return rejected("malformed-toc", "archive extent bounds")
+			return rejected(CategoryMalformedTOC, "archive extent bounds")
 		}
 	} else {
 		if _, err := ParseContentAddress(e.Source.address); err != nil {
@@ -68,11 +68,11 @@ func (e Extent) validate(dataEnd uint64) error {
 func ParseContentAddress(s string) ([32]byte, error) {
 	var out [32]byte
 	if len(s) != 71 || !strings.HasPrefix(s, "sha256:") {
-		return out, rejected("malformed-toc", "object address")
+		return out, rejected(CategoryMalformedTOC, "object address")
 	}
 	for _, c := range s[7:] {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return out, rejected("malformed-toc", "object address")
+			return out, rejected(CategoryMalformedTOC, "object address")
 		}
 	}
 	b, err := hex.DecodeString(s[7:])
@@ -87,7 +87,7 @@ func parseExtent(value any, dataEnd uint64) (Extent, error) {
 	var e Extent
 	v, ok := value.([]any)
 	if !ok || len(v) < 3 || len(v) > 4 {
-		return e, rejected("malformed-toc", "extent tuple")
+		return e, rejected(CategoryMalformedTOC, "extent tuple")
 	}
 	var err error
 	e.Size, err = manifestUint(v[0])
@@ -103,7 +103,7 @@ func parseExtent(value any, dataEnd uint64) (Extent, error) {
 			return e, err
 		}
 	default:
-		return e, rejected("malformed-toc", "extent source")
+		return e, rejected(CategoryMalformedTOC, "extent source")
 	}
 	e.EncodedSize, err = manifestUint(v[2])
 	if err != nil {
@@ -112,7 +112,7 @@ func parseExtent(value any, dataEnd uint64) (Extent, error) {
 	if len(v) == 4 {
 		e.Offset, err = manifestUint(v[3])
 		if err != nil || e.Offset == 0 {
-			return e, rejected("malformed-toc", "explicit default offset")
+			return e, rejected(CategoryMalformedTOC, "explicit default offset")
 		}
 	}
 	return e, e.validate(dataEnd)
@@ -143,7 +143,7 @@ func (e Entry) Size() (uint64, error) {
 	var n uint64
 	for _, x := range e.Extents {
 		if x.Size > math.MaxUint64-n {
-			return 0, rejected("malformed-toc", "file size overflow")
+			return 0, rejected(CategoryMalformedTOC, "file size overflow")
 		}
 		n += x.Size
 	}
@@ -178,19 +178,19 @@ func (e Entry) value() []any {
 
 func (e Entry) validateFields(dataEnd uint64) error {
 	if !validPath(e.Path) || e.Mode > 4095 {
-		return rejected("malformed-toc", "entry metadata")
+		return rejected(CategoryMalformedTOC, "entry metadata")
 	}
 	if e.Type != TypeFile && e.Type != TypeSymlink && e.Type != TypeDirectory {
-		return rejected("malformed-toc", "entry type")
+		return rejected(CategoryMalformedTOC, "entry type")
 	}
 	if (e.Type == TypeSymlink) != (e.Linkname != nil) || e.Type != TypeFile && len(e.Extents) != 0 {
-		return rejected("malformed-toc", "entry fields")
+		return rejected(CategoryMalformedTOC, "entry fields")
 	}
 	if e.Linkname != nil && (len(*e.Linkname) == 0 || len(*e.Linkname) > 4096 || strings.ContainsRune(*e.Linkname, 0) || !utf8.ValidString(*e.Linkname)) {
-		return rejected("malformed-toc", "linkname")
+		return rejected(CategoryMalformedTOC, "linkname")
 	}
 	if err := validateExtensions(e.Attributes); err != nil {
-		return categorized("malformed-toc", err)
+		return categorized(CategoryMalformedTOC, err)
 	}
 	for _, x := range e.Extents {
 		if err := x.validate(dataEnd); err != nil {
@@ -198,7 +198,7 @@ func (e Entry) validateFields(dataEnd uint64) error {
 		}
 		_, external := x.Source.ContentAddress()
 		if external != e.External() {
-			return rejected("malformed-toc", "mixed extent sources")
+			return rejected(CategoryMalformedTOC, "mixed extent sources")
 		}
 	}
 	if _, err := e.Size(); err != nil {
@@ -213,11 +213,11 @@ func parseEntry(value any, dataEnd uint64) (Entry, error) {
 	var e Entry
 	v, ok := value.([]any)
 	if !ok || len(v) < 7 || len(v) > 8 {
-		return e, rejected("malformed-toc", "entry tuple")
+		return e, rejected(CategoryMalformedTOC, "entry tuple")
 	}
 	e.Path, ok = v[0].(string)
 	if !ok {
-		return e, rejected("malformed-toc", "entry path")
+		return e, rejected(CategoryMalformedTOC, "entry path")
 	}
 	var entryType uint64
 	ns := []*uint64{&entryType, &e.Mode, &e.UID, &e.GID}
@@ -232,17 +232,17 @@ func parseEntry(value any, dataEnd uint64) (Entry, error) {
 	switch n := v[5].(type) {
 	case uint64:
 		if n > math.MaxInt64 {
-			return e, rejected("malformed-toc", "mtime range")
+			return e, rejected(CategoryMalformedTOC, "mtime range")
 		}
 		e.MtimeNS = int64(n)
 	case int64:
 		e.MtimeNS = n
 	default:
-		return e, rejected("malformed-toc", "mtime")
+		return e, rejected(CategoryMalformedTOC, "mtime")
 	}
 	values, ok := v[6].([]any)
 	if !ok {
-		return e, rejected("malformed-toc", "extent list")
+		return e, rejected(CategoryMalformedTOC, "extent list")
 	}
 	e.Extents = make([]Extent, 0, len(values))
 	for _, v := range values {
@@ -256,24 +256,24 @@ func parseEntry(value any, dataEnd uint64) (Entry, error) {
 	if len(v) == 8 {
 		m, ok := v[7].(map[any]any)
 		if !ok || len(m) == 0 {
-			return e, rejected("malformed-toc", "attributes")
+			return e, rejected(CategoryMalformedTOC, "attributes")
 		}
 		for key, value := range m {
 			s, ok := key.(string)
 			if !ok {
-				return e, rejected("malformed-toc", "attribute key")
+				return e, rejected(CategoryMalformedTOC, "attribute key")
 			}
 			switch {
 			case s == "linkname":
 				s, ok := value.(string)
 				if !ok {
-					return e, rejected("malformed-toc", "linkname")
+					return e, rejected(CategoryMalformedTOC, "linkname")
 				}
 				e.Linkname = &s
 			case strings.HasPrefix(s, "x-"):
 				e.Attributes[s] = value
 			default:
-				return e, rejected("malformed-toc", "unknown attribute")
+				return e, rejected(CategoryMalformedTOC, "unknown attribute")
 			}
 		}
 	}
@@ -300,7 +300,7 @@ func entryRetainedCost(e Entry, encoded int) uint64 {
 func manifestUint(v any) (uint64, error) {
 	n, ok := v.(uint64)
 	if !ok {
-		return 0, rejected("malformed-toc", "uint64")
+		return 0, rejected(CategoryMalformedTOC, "uint64")
 	}
 	return n, nil
 }
@@ -326,7 +326,7 @@ type ManifestReaderOptions struct {
 	MaxReadBytes                                  uint64
 	// MaxRetainedEntryBytes bounds the estimated heap retained by parsed
 	// entry metadata, including spare entry-slice capacity (default 1 GiB). Exceeding it, or MaxEntries,
-	// fails OpenManifest with a "resource-limit" error.
+	// fails OpenManifest with a CategoryResourceLimit error.
 	MaxRetainedEntryBytes uint64
 	// MaxEntries bounds the number of entries; zero means no separate count cap.
 	MaxEntries uint64
@@ -455,7 +455,7 @@ func (s *manifestSpool) appendParts(first, second []byte) (err error) {
 	}
 	added := uint64(len(first)) + uint64(len(second))
 	if s.size > s.options.MaxEncodedBytes || added > s.options.MaxEncodedBytes-s.size {
-		return rejected("resource-limit", "manifest spool size")
+		return rejected(CategoryResourceLimit, "manifest spool size")
 	}
 	end := s.size + added
 	charge := end - min(end, s.charged)
@@ -480,7 +480,7 @@ func (s *manifestSpool) appendParts(first, second []byte) (err error) {
 			}
 			var probe [1]byte
 			if n, probeErr := store.ReadAt(probe[:], 0); n != 0 || !errors.Is(probeErr, io.EOF) {
-				return errors.Join(rejected("unsupported-operation", "spill store must be empty"), probeErr, store.Close())
+				return errors.Join(rejected(CategoryUnsupportedOperation, "spill store must be empty"), probeErr, store.Close())
 			}
 			if err = writeExact(store, s.memory); err != nil {
 				return errors.Join(err, store.Close())
@@ -488,7 +488,7 @@ func (s *manifestSpool) appendParts(first, second []byte) (err error) {
 			s.custom, s.memory = store, nil
 		} else {
 			if s.options.DisableDisk {
-				return rejected("resource-limit", "manifest memory; supply disk storage")
+				return rejected(CategoryResourceLimit, "manifest memory; supply disk storage")
 			}
 			f, err := os.CreateTemp("", "zstar-manifest-*")
 			if err != nil {
@@ -541,7 +541,7 @@ func (s *manifestSpool) read(at, n uint64) ([]byte, error) {
 		return nil, errors.New("zstar: closed manifest spool")
 	}
 	if at > s.size || n > s.size-at {
-		return nil, rejected("malformed-toc", "spool range")
+		return nil, rejected(CategoryMalformedTOC, "spool range")
 	}
 	out := make([]byte, int(n))
 	if s.custom != nil {
@@ -644,7 +644,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 	}
 	options := config.defaults()
 	if options.Limits.MaxFrameEncodedBytes != 0 && options.ReadAheadBytes > options.Limits.MaxFrameEncodedBytes {
-		return nil, rejected("resource-limit", "read-ahead exceeds configured frame budget")
+		return nil, rejected(CategoryResourceLimit, "read-ahead exceeds configured frame budget")
 	}
 	if options.ConcurrentChunks < 1 || options.ConcurrentChunks > 256 {
 		return nil, errors.New("zstar: concurrent chunks must be in [1, 256]")
@@ -657,7 +657,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		return nil, err
 	}
 	if n < 80 {
-		return nil, rejected("not-zstar", "source size")
+		return nil, rejected(CategoryNotZstar, "source size")
 	}
 	var footer Footer
 	var prefetched []byte
@@ -674,7 +674,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 				return nil, readErr
 			}
 			if uint64(len(raw)) != uint64(n)-offset {
-				return nil, rejected("malformed-toc", "short hinted metadata range")
+				return nil, rejected(CategoryMalformedTOC, "short hinted metadata range")
 			}
 			candidate, parseErr := ParseFooter(raw[len(raw)-80:])
 			if parseErr == nil && candidate.ManifestOffset == offset && candidate.ManifestEncodedSize == size {
@@ -693,10 +693,10 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		}
 	}
 	if footer.ManifestOffset > uint64(n-80) || footer.ManifestEncodedSize != uint64(n-80)-footer.ManifestOffset {
-		return nil, rejected("malformed-footer", "metadata coverage")
+		return nil, rejected(CategoryMalformedFooter, "metadata coverage")
 	}
 	if footer.ManifestEncodedSize > options.MaxEncodedBytes || footer.ManifestDecodedSize > options.MaxDecodedBytes {
-		return nil, rejected("resource-limit", "manifest size")
+		return nil, rejected(CategoryResourceLimit, "manifest size")
 	}
 	m := &Manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: footer.ManifestOffset, source: source, maxRead: options.MaxReadBytes, readAhead: options.ReadAheadBytes}
 	m.content = newManifestContentState(options, source)
@@ -711,24 +711,24 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 	hash := sha256.New()
 	var decoded uint64
 	if footer.ManifestDecodedSize > uint64(^uint(0)>>1) {
-		return nil, rejected("resource-limit", "manifest exceeds address space")
+		return nil, rejected(CategoryResourceLimit, "manifest exceeds address space")
 	}
 	end := footer.ManifestOffset + footer.ManifestEncodedSize
 	input := manifestRangeStream{ctx: ctx, source: source, at: footer.ManifestOffset, end: end, readAhead: options.ReadAheadBytes, buffer: prefetched}
 	for at := footer.ManifestOffset; at < end; {
 		if end-at < 8 {
-			return nil, rejected("malformed-toc", "metadata header")
+			return nil, rejected(CategoryMalformedTOC, "metadata header")
 		}
 		header, e := input.take(8)
 		if e != nil {
 			return nil, e
 		}
 		if len(header) != 8 || binary.LittleEndian.Uint32(header[:4]) != 0x184D2A5E {
-			return nil, rejected("malformed-toc", "metadata wrapper")
+			return nil, rejected(CategoryMalformedTOC, "metadata wrapper")
 		}
 		size := uint64(binary.LittleEndian.Uint32(header[4:]))
 		if size == 0 || size > end-at-8 {
-			return nil, rejected("malformed-toc", "metadata frame size")
+			return nil, rejected(CategoryMalformedTOC, "metadata frame size")
 		}
 		if e := checkLimit(size, options.Limits.MaxFrameEncodedBytes, "encoded metadata frame size"); e != nil {
 			return nil, e
@@ -738,14 +738,14 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			return nil, e
 		}
 		if uint64(len(encoded)) != size {
-			return nil, rejected("malformed-toc", "short metadata")
+			return nil, rejected(CategoryMalformedTOC, "short metadata")
 		}
 		raw, e := decoder.decode(encoded, 0, min(addressLimit(options.Limits.MaxFrameDecodedBytes), int(options.MaxDecodedBytes-decoded)), addressLimit(options.Limits.MaxFrameEncodedBytes))
 		if e != nil {
-			return nil, categorized("malformed-toc", e)
+			return nil, categorized(CategoryMalformedTOC, e)
 		}
 		if len(raw) == 0 || uint64(len(raw)) > footer.ManifestDecodedSize-decoded {
-			return nil, rejected("malformed-toc", "decoded metadata size")
+			return nil, rejected(CategoryMalformedTOC, "decoded metadata size")
 		}
 		decoded += uint64(len(raw))
 		hash.Write(raw)
@@ -755,19 +755,19 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		at += 8 + size
 	}
 	if decoded != footer.ManifestDecodedSize {
-		return nil, rejected("malformed-toc", "decoded manifest length")
+		return nil, rejected(CategoryMalformedTOC, "decoded manifest length")
 	}
 	if !bytes.Equal(hash.Sum(nil), footer.ManifestSHA256[:]) {
-		return nil, rejected("integrity-failure", "manifest hash")
+		return nil, rejected(CategoryIntegrityFailure, "manifest hash")
 	}
 	sequence := sequenceReader{spool: &m.spool, limit: manifestHeaderMax}
 	value, e := sequence.next()
 	if e != nil {
-		return nil, categorized("malformed-toc", e)
+		return nil, categorized(CategoryMalformedTOC, e)
 	}
 	root, e := schemaMap(value, []string{"version", "required_features"}, nil)
 	if e != nil {
-		return nil, categorized("malformed-toc", e)
+		return nil, categorized(CategoryMalformedTOC, e)
 	}
 	m.rootExtensions = Extensions{}
 	for key, value := range root {
@@ -776,26 +776,26 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 		}
 	}
 	if e = validateExtensions(m.rootExtensions); e != nil {
-		return nil, categorized("malformed-toc", e)
+		return nil, categorized(CategoryMalformedTOC, e)
 	}
 	version, e := manifestUint(root["version"])
 	if e != nil {
 		return nil, e
 	}
 	if version != 1 {
-		return nil, rejected("unsupported-version", "manifest root")
+		return nil, rejected(CategoryUnsupportedVersion, "manifest root")
 	}
 	requiredFeatures, ok := root["required_features"].([]any)
 	if !ok {
-		return nil, rejected("malformed-toc", "required_features")
+		return nil, rejected(CategoryMalformedTOC, "required_features")
 	}
 	for _, v := range requiredFeatures {
 		s, ok := v.(string)
 		if !ok || !validFeature(s) || len(m.requiredFeatures) > 0 && m.requiredFeatures[len(m.requiredFeatures)-1] >= s {
-			return nil, rejected("malformed-toc", "required_features")
+			return nil, rejected(CategoryMalformedTOC, "required_features")
 		}
 		if s != "external-content" {
-			return nil, rejected("unsupported-feature", "required feature")
+			return nil, rejected(CategoryUnsupportedFeature, "required feature")
 		}
 		m.requiredFeatures = append(m.requiredFeatures, s)
 	}
@@ -810,7 +810,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			return nil, e
 		}
 		if options.MaxEntries != 0 && uint64(len(m.entries)) >= options.MaxEntries {
-			return nil, rejected("resource-limit", "manifest entry count")
+			return nil, rejected(CategoryResourceLimit, "manifest entry count")
 		}
 		entry, e := parseEntry(value, m.start)
 		if e != nil {
@@ -820,17 +820,17 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			return nil, e
 		}
 		if len(m.entries) > 0 && m.entries[len(m.entries)-1].Path >= entry.Path {
-			return nil, rejected("malformed-toc", "entry order")
+			return nil, rejected(CategoryMalformedTOC, "entry order")
 		}
 		slotBytes := uint64(unsafe.Sizeof(Entry{}))
 		cost := entryRetainedCost(entry, sequence.lastSize) - slotBytes
 		if cost > options.MaxRetainedEntryBytes-min(retained, options.MaxRetainedEntryBytes) {
-			return nil, rejected("resource-limit", "manifest retained entry memory")
+			return nil, rejected(CategoryResourceLimit, "manifest retained entry memory")
 		}
 		retained += cost
 		slots := (options.MaxRetainedEntryBytes - retained) / slotBytes
 		if slots <= uint64(len(m.entries)) {
-			return nil, rejected("resource-limit", "manifest retained entry memory")
+			return nil, rejected(CategoryResourceLimit, "manifest retained entry memory")
 		}
 		if uint64(cap(m.entries)) > slots {
 			compact := make([]Entry, len(m.entries))
@@ -848,7 +848,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 			}
 			target = min(target, uint64(^uint(0)>>1)/slotBytes)
 			if target <= uint64(len(m.entries)) {
-				return nil, rejected("resource-limit", "manifest index address space")
+				return nil, rejected(CategoryResourceLimit, "manifest index address space")
 			}
 			grown := make([]Entry, len(m.entries), int(target))
 			copy(grown, m.entries)
@@ -909,24 +909,25 @@ func (m *Manifest) entrySnapshot(path string) (Entry, error) {
 	if !validPath(path) {
 		return Entry{}, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrInvalid}
 	}
-	i := sort.Search(len(m.entries), func(i int) bool { return m.entries[i].Path >= path })
-	if i == len(m.entries) || m.entries[i].Path != path {
+	i, found := slices.BinarySearchFunc(m.entries, path, compareEntryPath)
+	if !found {
 		return Entry{}, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
 	}
 	return m.entries[i], nil
 }
 
+func compareEntryPath(entry Entry, path string) int { return strings.Compare(entry.Path, path) }
+
 func cloneEntry(entry Entry) Entry {
 	entry.extentEnds = nil
-	entry.Extents = append([]Extent(nil), entry.Extents...)
+	entry.Extents = slices.Clone(entry.Extents)
 	if len(entry.Attributes) != 0 {
 		entry.Attributes = cloneExtensions(entry.Attributes)
 	} else {
 		entry.Attributes = nil
 	}
 	if entry.Linkname != nil {
-		text := *entry.Linkname
-		entry.Linkname = &text
+		entry.Linkname = new(*entry.Linkname)
 	}
 	return entry
 }
@@ -938,8 +939,8 @@ func (m *Manifest) entryRank(path string) (*Entry, uint64, error) {
 	if !validPath(path) {
 		return nil, 0, nil
 	}
-	i := sort.Search(len(m.entries), func(i int) bool { return m.entries[i].Path >= path })
-	if i == len(m.entries) || m.entries[i].Path != path {
+	i, found := slices.BinarySearchFunc(m.entries, path, compareEntryPath)
+	if !found {
 		return nil, 0, nil
 	}
 	owned := cloneEntry(m.entries[i])
@@ -952,21 +953,15 @@ func (m *Manifest) VisitEntries(visit func(Entry) error) error {
 	if visit == nil {
 		return errors.New("zstar: nil entry visitor")
 	}
-	cursor := m.Cursor()
-	for {
-		entries, err := cursor.Next(128)
+	for entry, err := range m.Entries("") {
 		if err != nil {
 			return err
 		}
-		if len(entries) == 0 {
-			return nil
-		}
-		for _, entry := range entries {
-			if err := visit(entry); err != nil {
-				return err
-			}
+		if err := visit(entry); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 // EncodedContentResolver returns a complete encoded object, with actual-input
@@ -981,19 +976,9 @@ type EncodedContentResolver interface {
 // policy. The returned buffer is caller-owned and bounded by MaxReadBytes.
 // Missing paths match fs.ErrNotExist; symlinks are never followed.
 func (m *Manifest) Read(ctx context.Context, path string, offset, size uint64, resolver EncodedContentResolver, verifyExternal bool) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	entry, err := m.entrySnapshot(path)
-	if err != nil {
-		return nil, pathError("read", path, err)
-	}
-	if entry.Type != TypeFile {
-		return nil, rejected("unsupported-operation", "entry is not a file")
-	}
 	out, err := m.ReadMany(ctx, []ReadRequest{{path, offset, size}}, resolver, verifyExternal)
 	if err != nil {
-		return nil, err
+		return nil, pathError("read", path, err)
 	}
 	return out[0], nil
 }

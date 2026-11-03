@@ -2,6 +2,7 @@ package zstar
 
 import (
 	"context"
+	"iter"
 	"reflect"
 )
 
@@ -31,28 +32,6 @@ type readerResolver struct{ inner EncodedContentResolver }
 
 func (r *readerResolver) GetEncoded(ctx context.Context, address [32]byte, hint, maxBytes uint64) ([]byte, error) {
 	return r.inner.GetEncoded(ctx, address, hint, maxBytes)
-}
-
-func (r *readerResolver) EncodedLength(d [32]byte) (uint64, bool) {
-	if b, ok := r.inner.(EncodedContentIndex); ok {
-		return b.EncodedLength(d)
-	}
-	return 0, false
-}
-
-func (r *readerResolver) GetEncodedMany(ctx context.Context, requests []ObjectRequest) ([][]byte, error) {
-	if b, ok := r.inner.(BatchEncodedContentResolver); ok {
-		return b.GetEncodedMany(ctx, requests)
-	}
-	out := make([][]byte, len(requests))
-	for i, q := range requests {
-		data, err := r.GetEncoded(ctx, q.Digest, q.Hint, q.MaxBytes)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = data
-	}
-	return out, nil
 }
 
 // Open authenticates an archive using default resource budgets. The caller
@@ -93,6 +72,18 @@ func (r *Reader) RootExtensions() Extensions { return r.manifest.RootExtensions(
 
 // Cursor creates an independent cursor over sorted owned member metadata.
 func (r *Reader) Cursor() *ManifestCursor { return r.manifest.Cursor() }
+
+// CursorPrefix visits paths beginning with prefix. Use "dir/" for descendants
+// and an empty prefix for all entries. Returned metadata is caller-owned.
+func (r *Reader) CursorPrefix(prefix string) *ManifestCursor {
+	return r.manifest.CursorPrefix(prefix)
+}
+
+// Entries yields owned entries whose paths begin with prefix, in path order.
+// Use "dir/" for descendants or "" for all entries. Stop on a nonnil error.
+func (r *Reader) Entries(prefix string) iter.Seq2[Entry, error] {
+	return r.manifest.Entries(prefix)
+}
 
 // VisitEntries visits sorted owned entries without holding the metadata lock.
 // Callbacks may read the archive. The first callback error stops visitation.
@@ -139,7 +130,7 @@ func (r *Reader) ReadLink(path string) (string, error) {
 		return "", pathError("readlink", path, err)
 	}
 	if entry.Type != TypeSymlink || entry.Linkname == nil {
-		return "", pathError("readlink", path, rejected("unsupported-operation", "entry is not a symlink"))
+		return "", pathError("readlink", path, rejected(CategoryUnsupportedOperation, "entry is not a symlink"))
 	}
 	return *entry.Linkname, nil
 }

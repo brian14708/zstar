@@ -2,7 +2,6 @@ package zstar
 
 import (
 	"context"
-	"io/fs"
 	"slices"
 	"sort"
 )
@@ -68,41 +67,59 @@ func (m *Manifest) ReadWithReport(ctx context.Context, path string, offset, size
 	return out[0], report, nil
 }
 
+// readSelection keeps a request with its optional retained entry and destination.
+// Nil fields select manifest lookup and an allocated result respectively.
+type readSelection struct {
+	ReadRequest
+	entry  *Entry
+	output []byte
+}
+
 func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, ReadReport{}, err
 	}
 	if len(requests) > MaxBatchRequests {
-		return nil, ReadReport{}, rejected("resource-limit", "batch request count")
+		return nil, ReadReport{}, rejected(CategoryResourceLimit, "batch request count")
 	}
-	// Check even empty batches against the reader's lifecycle.
-	m.mu.Lock()
-	closed := m.closed
-	m.mu.Unlock()
-	if closed {
-		return nil, ReadReport{}, categorized("unsupported-operation", fs.ErrClosed)
+	selections := make([]readSelection, len(requests))
+	for i, request := range requests {
+		selections[i].ReadRequest = request
+	}
+	return m.readRanges(ctx, selections, resolver, verifyExternal, wantReport)
+}
+
+func (m *Manifest) readRanges(ctx context.Context, requests []readSelection, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
+	if err := m.content.checkOpen(ctx); err != nil {
+		return nil, ReadReport{}, err
 	}
 	jobs := make([]manifestReadJob, 0)
 	byChunk := make(map[manifestChunkKey]int)
 	var total uint64
 	copyCount := 0
 	for i, request := range requests {
-		entry, err := m.entrySnapshot(request.Path)
-		if err != nil {
-			return nil, ReadReport{}, err
+		var entry Entry
+		if request.entry == nil {
+			var err error
+			entry, err = m.entrySnapshot(request.Path)
+			if err != nil {
+				return nil, ReadReport{}, err
+			}
+		} else {
+			entry = *request.entry
 		}
 		if entry.Type != TypeFile {
-			return nil, ReadReport{}, rejected("unsupported-operation", "entry is not a file")
+			return nil, ReadReport{}, rejected(CategoryUnsupportedOperation, "entry is not a file")
 		}
 		size, err := entry.indexedSize()
 		if err != nil {
 			return nil, ReadReport{}, err
 		}
 		if request.Offset > size || request.Length > size-request.Offset {
-			return nil, ReadReport{}, rejected("invalid-range", "file range")
+			return nil, ReadReport{}, rejected(CategoryInvalidRange, "file range")
 		}
 		if request.Length > m.maxRead-total {
-			return nil, ReadReport{}, rejected("resource-limit", "batch output size")
+			return nil, ReadReport{}, rejected(CategoryResourceLimit, "batch output size")
 		}
 		total += request.Length
 		if request.Length == 0 {
@@ -121,11 +138,11 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 			next := position + extent.Size
 			if position < end && next > request.Offset {
 				if entry.External() && resolver == nil {
-					return nil, ReadReport{}, rejected("unsupported-operation", "external resolver required")
+					return nil, ReadReport{}, rejected(CategoryUnsupportedOperation, "external resolver required")
 				}
 				copyCount++
 				if copyCount > maxBatchCopies {
-					return nil, ReadReport{}, rejected("resource-limit", "batch extent copies")
+					return nil, ReadReport{}, rejected(CategoryResourceLimit, "batch extent copies")
 				}
 				key := chunkKey(extent)
 				job, exists := byChunk[key]
@@ -145,7 +162,10 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 	}
 	out := make([][]byte, len(requests))
 	for i, request := range requests {
-		out[i] = make([]byte, int(request.Length))
+		out[i] = request.output
+		if out[i] == nil {
+			out[i] = make([]byte, int(request.Length))
+		}
 	}
 	extents := make([]Extent, len(jobs))
 	for i, job := range jobs {
@@ -185,7 +205,7 @@ func copyReadJob(job *manifestReadJob, out [][]byte, chunk *manifestContentChunk
 	job.verified = chunk.verified
 	for _, part := range job.copies {
 		if part.extentOffset > uint64(len(chunk.raw)) || part.extentSize > uint64(len(chunk.raw))-part.extentOffset {
-			return rejected("invalid-range", "decoded extent bounds")
+			return rejected(CategoryInvalidRange, "decoded extent bounds")
 		}
 		copy(out[part.output][part.destination:part.destination+part.length], chunk.raw[part.source:part.source+part.length])
 	}

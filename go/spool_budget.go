@@ -26,7 +26,7 @@ func (b *SpoolBudget) reserve(size uint64) error {
 	for {
 		used := b.used.Load()
 		if used > b.limit || size > b.limit-used {
-			return rejected("resource-limit", "aggregate spool storage")
+			return rejected(CategoryResourceLimit, "aggregate spool storage")
 		}
 		if b.used.CompareAndSwap(used, used+size) {
 			return nil

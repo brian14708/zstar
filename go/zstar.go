@@ -17,20 +17,20 @@ type Footer struct {
 func ParseFooter(data []byte) (Footer, error) {
 	var f Footer
 	if len(data) != 80 || binary.LittleEndian.Uint32(data[:4]) != 0x184D2A5F || string(data[8:16]) != "ZSTAR001" {
-		return f, rejected("not-zstar", "footer signature")
+		return f, rejected(CategoryNotZstar, "footer signature")
 	}
 	if binary.LittleEndian.Uint32(data[4:8]) != 72 || binary.LittleEndian.Uint32(data[20:24]) != 0 {
-		return f, rejected("malformed-footer", "footer lengths/reserved fields")
+		return f, rejected(CategoryMalformedFooter, "footer lengths/reserved fields")
 	}
 	if binary.LittleEndian.Uint32(data[16:20]) != 1 {
-		return f, rejected("unsupported-version", "footer version")
+		return f, rejected(CategoryUnsupportedVersion, "footer version")
 	}
 	f.ManifestOffset = binary.LittleEndian.Uint64(data[24:32])
 	f.ManifestEncodedSize = binary.LittleEndian.Uint64(data[32:40])
 	f.ManifestDecodedSize = binary.LittleEndian.Uint64(data[40:48])
 	copy(f.ManifestSHA256[:], data[48:80])
 	if f.ManifestOffset == 0 || f.ManifestEncodedSize <= 8 || f.ManifestDecodedSize == 0 {
-		return Footer{}, rejected("malformed-footer", "invalid footer bounds")
+		return Footer{}, rejected(CategoryMalformedFooter, "invalid footer bounds")
 	}
 	return f, nil
 }
@@ -38,7 +38,7 @@ func ParseFooter(data []byte) (Footer, error) {
 // VerifySHA256 checks a decoded buffer against the expected SHA-256 digest.
 func VerifySHA256(data []byte, expected [32]byte) error {
 	if sha256.Sum256(data) != expected {
-		return rejected("integrity-failure", "digest mismatch")
+		return rejected(CategoryIntegrityFailure, "digest mismatch")
 	}
 	return nil
 }
