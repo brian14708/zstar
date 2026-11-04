@@ -15,7 +15,7 @@ from typing_extensions import Reader
 
 from . import _native
 from ._info import _to_entry
-from .types import BinaryWriter, CborValue, EntryTuple, Limits, SpillStore, WriterOptions
+from .types import BinaryWriter, Limits, SpillStore, WriterOptions
 
 
 def _open_no_follow(path: str | os.PathLike[str], flags: int, mode: int = 0o666) -> int:
@@ -48,7 +48,6 @@ class ArchiveWriter:
         max_spool_bytes: int = 4 << 30,
         create_spill_store: Callable[[], SpillStore] | None = None,
         workers: int = 0,
-        root_extensions: dict[str, CborValue] | None = None,
     ) -> None:
         self._writer = _native.EntryArchiveWriter(
             fileobj,
@@ -60,7 +59,6 @@ class ArchiveWriter:
             max_spool_bytes=max_spool_bytes,
             create_spill_store=create_spill_store,
             workers=workers,
-            root_extensions=root_extensions,
         )
         self._owned: ExitStack | None = None
         self._path: tuple[str, tuple[int, int]] | None = None
@@ -125,23 +123,6 @@ class ArchiveWriter:
         if tarinfo.isfile() and tarinfo.size and fileobj is None:
             raise ValueError("nonempty regular file requires fileobj")
         self._writer.add(entry, fileobj, tarinfo.size if tarinfo.isfile() else 0)
-
-    def add_entry(
-        self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0
-    ) -> None:
-        """Write lossless manifest metadata, optionally with a sized file body.
-
-        File bodies receive new inline extents. Without a body, a regular-file
-        entry may reference external objects; inline archive offsets cannot be
-        copied between archives. Directories and symlinks have no body.
-        """
-        if self.closed:
-            raise ValueError("writer closed")
-        if size and body is None:
-            raise ValueError("size requires a body")
-        if body is not None and entry[1] != 0:
-            raise ValueError("body requires a regular file")
-        self._writer.add(entry, body, size)
 
     def write_bytes(self, name: str, data: bytes, *, mode: int = 0o644) -> None:
         """Write bytes with normalized metadata; ancestor directories must exist."""
@@ -293,13 +274,6 @@ class AsyncArchiveWriter:
     async def addfile(self, tarinfo: _TarInfo, fileobj: Reader[bytes] | None = None) -> None:
         async with self._lock:
             await _writer_call(partial(self._writer.addfile, tarinfo, fileobj))
-
-    async def add_entry(
-        self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0
-    ) -> None:
-        """Write lossless entry metadata and an optional sized body on a worker."""
-        async with self._lock:
-            await _writer_call(partial(self._writer.add_entry, entry, body, size))
 
     async def write_bytes(self, name: str, data: bytes, *, mode: int = 0o644) -> None:
         """Write bytes on a native worker, serializing with other operations."""

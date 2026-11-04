@@ -547,13 +547,13 @@ def test_writer_discards_unfinished_output_after_context_exception():
 
 def test_writer_large_external_entry(corpus_dir):
     with zstar.Archive((corpus_dir / "limits/many-extents.zstar").read_bytes()) as reader:
-        entry = reader.entry("file")
+        entry = reader._reader.entry("file")
     assert len(entry[6]) == 65_537
     output = io.BytesIO()
     with ArchiveWriter(output) as writer:
-        writer.add_entry(entry)
+        writer._writer.add(entry)
     with zstar.Archive(output.getvalue()) as reader:
-        assert len(reader.entry("file")[6]) == 65_537
+        assert len(reader._reader.entry("file")[6]) == 65_537
         assert reader.verify()["full_archive_verified"]
 
 

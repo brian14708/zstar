@@ -32,6 +32,7 @@ fastcdc = "5.0"
 hex = "0.4"
 object_store = { version = "0.14", default-features = false }
 proptest = "1.9"
+quick-xml = { version = "0.41", features = ["serialize"] }
 pyo3 = "0.30"
 pyo3-async-runtimes = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }

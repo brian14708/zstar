@@ -2,6 +2,7 @@
 """Build and verify native or portable Python package candidates."""
 
 import argparse
+import io
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,7 @@ def prepare_source(sdist: Path, work: Path) -> Path:
             "src/zstar/_writer.py",
             "src/zstar/_fsspec.py",
             "src/zstar/types.py",
+            "src/zstar/_types.py",
             "src/zstar/_native.pyi",
             "src/zstar/py.typed",
         )
@@ -58,8 +60,32 @@ def prepare_source(sdist: Path, work: Path) -> Path:
             assert f"{prefix}/{name}" in names, f"sdist missing {name}"
         assert not any("/.venv/" in name or "/target/" in name for name in names)
         archive.extractall(work, filter="data")
-    source = work / prefix
+    return work / prefix
+
+
+def finalize_sdist(sdist: Path, work: Path) -> Path:
+    source = prepare_source(sdist, work)
     prune_lockfile(source)
+    lock = (source / "Cargo.lock").read_bytes()
+    repaired = sdist.with_name(f"{sdist.name}.tmp")
+    with tarfile.open(sdist) as original, tarfile.open(repaired, "w:gz") as archive:
+        for member in original:
+            if member.name == f"{source.name}/Cargo.lock":
+                member.size = len(lock)
+                archive.addfile(member, io.BytesIO(lock))
+            else:
+                archive.addfile(member, original.extractfile(member) if member.isfile() else None)
+    repaired.replace(sdist)
+    # Verify and build from the exact published archive, without repairing its extraction.
+    verified = work / "verified"
+    verified.mkdir()
+    source = prepare_source(sdist, verified)
+    subprocess.run(
+        ["cargo", "metadata", "--locked", "--format-version=1"],
+        cwd=source,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
     return source
 
 
@@ -163,7 +189,7 @@ def main() -> None:
             str(work),
         )
         [sdist] = work.glob("*.tar.gz")
-        source = prepare_source(sdist, work)
+        source = finalize_sdist(sdist, work)
         if args.sdist_only:
             wheels: list[Path] = []
         else:

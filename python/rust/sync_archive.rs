@@ -17,6 +17,19 @@ pub struct SyncArchive {
     session: reader::Session,
 }
 impl SyncArchive {
+    fn projected_entries(
+        slf: PyRef<'_, Self>,
+        prefix: Option<String>,
+        projection: reader::MetadataProjection,
+    ) -> PyResult<SyncEntries> {
+        slf.reader()?;
+        Ok(SyncEntries {
+            archive: slf.into(),
+            cursor: Arc::new(tokio::sync::Mutex::new(reader::EntryIterator::projected(
+                prefix, projection,
+            ))),
+        })
+    }
     fn open(
         py: Python<'_>,
         work: impl std::future::Future<Output = PyResult<Session>> + Send,
@@ -29,6 +42,20 @@ impl SyncArchive {
 }
 #[pymethods]
 impl SyncArchive {
+    fn _member_info(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyAny>>> {
+        let lease = self.reader()?;
+        block_on(py, lease.member_info(path))
+    }
+
+    #[pyo3(signature = (prefix = None))]
+    fn _iter_members(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<SyncEntries> {
+        Self::projected_entries(slf, prefix, reader::MetadataProjection::Member)
+    }
+
+    #[pyo3(signature = (prefix = None))]
+    fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<SyncEntries> {
+        Self::projected_entries(slf, prefix, reader::MetadataProjection::Name)
+    }
     fn _open_member(&self, py: Python<'_>, path: &str) -> PyResult<reader::MemberCursor> {
         let lease = self.reader()?;
         block_on(py, reader::MemberCursor::open(&lease.reader, path))
@@ -326,6 +353,13 @@ pub struct SyncEntries {
 }
 #[pymethods]
 impl SyncEntries {
+    fn _next_batch(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let lease = self.archive.get().reader()?;
+        block_on(py, async {
+            let mut cursor = self.cursor.lock().await;
+            cursor.next_batch(&lease.reader, 64).await
+        })
+    }
     const fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }

@@ -94,5 +94,6 @@ check-integration: prepare-python
     fi
     go test -race -tags=integration ./...
     cargo test --locked -p zstar --features s3 --test rustfs -- --ignored
+    cargo test --locked -p zstar-cli --test rustfs -- --ignored
     # Test caller-installed S3 chaining in an isolated environment; keep the base install free of s3fs.
     uv run --no-sync --with "s3fs>=2026.9.0" python -I -m pytest python/tests

@@ -13,10 +13,8 @@ from typing_extensions import Buffer
 
 from . import _native
 from ._file import ArchiveFile, AsyncArchiveFile
-from ._info import _from_entry
+from ._info import _from_metadata
 from .types import (
-    CborValue,
-    EntryTuple,
     ObjectResolver,
     RangeSource,
     ReaderOptions,
@@ -60,12 +58,6 @@ class _Metadata(Generic[_Reader]):
             raise ValueError("archive closed")
 
     @property
-    def root_extensions(self) -> dict[str, CborValue]:
-        """Return an owned snapshot of archive-level extension values."""
-        self._check_open()
-        return self._reader.root_extensions
-
-    @property
     def entry_count(self) -> int:
         self._check_open()
         return self._reader.entry_count
@@ -81,15 +73,10 @@ class Archive(_Metadata[_native.SyncArchive]):
     def getinfo(self, name: str) -> TarInfo:
         """Return an owned TarInfo snapshot; raise KeyError for a missing name."""
         self._check_open()
-        entry = self._reader.entry(name)
-        if entry is None:
+        metadata = self._reader._member_info(name)
+        if metadata is None:
             raise KeyError(name)
-        return _from_entry(entry)
-
-    def entry(self, name: str) -> EntryTuple | None:
-        """Return the lossless authenticated manifest tuple for one path."""
-        self._check_open()
-        return self._reader.entry(name)
+        return _from_metadata(metadata)
 
     @classmethod
     def from_source(cls, source: RangeSource, size: int, **options: Unpack[ReaderOptions]) -> Self:
@@ -151,21 +138,23 @@ class Archive(_Metadata[_native.SyncArchive]):
             ),
         )
 
-    def iter_entries(self, prefix: str | None = None) -> Iterator[EntryTuple]:
-        """Lazily yield lossless manifest tuples in path order."""
-        self._check_open()
-        for entry in self._reader.iter_entries(prefix):
-            self._check_open()
-            yield entry
-
     def members(self, prefix: str | None = None) -> Iterator[TarInfo]:
         """Lazily yield owned members in path order. Use list(...) for eager collection."""
-        for entry in self.iter_entries(prefix):
-            yield _from_entry(entry)
+        self._check_open()
+        iterator = self._reader._iter_members(prefix)
+        while batch := iterator._next_batch():
+            for metadata in batch:
+                self._check_open()
+                yield _from_metadata(metadata)
 
     def names(self, prefix: str | None = None) -> Iterator[str]:
-        for entry in self.iter_entries(prefix):
-            yield entry[0]
+        """Lazily yield names in path order without constructing member metadata."""
+        self._check_open()
+        iterator = self._reader._iter_names(prefix)
+        while batch := iterator._next_batch():
+            for name in batch:
+                self._check_open()
+                yield name
 
     def __iter__(self) -> Iterator[TarInfo]:
         return self.members()
@@ -252,15 +241,10 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         Awaitable so slow metadata sources never block the event loop.
         """
         self._check_open()
-        entry = await self._reader.entry(name)
-        if entry is None:
+        metadata = await self._reader._member_info(name)
+        if metadata is None:
             raise KeyError(name)
-        return _from_entry(entry)
-
-    async def entry(self, name: str) -> EntryTuple | None:
-        """Return the lossless authenticated manifest tuple for one path."""
-        self._check_open()
-        return await self._reader.entry(name)
+        return _from_metadata(metadata)
 
     @classmethod
     async def from_bytes(cls, data: Buffer, **options: Unpack[ReaderOptions]) -> Self:
@@ -328,23 +312,23 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
             ),
         )
 
-    async def iter_entries(self, prefix: str | None = None) -> AsyncIterator[EntryTuple]:
-        """Lazily yield lossless manifest tuples in path order."""
-        self._check_open()
-        iterator = self._reader.iter_entries(prefix)
-        while batch := await iterator._next_batch():
-            for entry in batch:
-                self._check_open()
-                yield entry
-
     async def members(self, prefix: str | None = None) -> AsyncIterator[TarInfo]:
         """Lazily yield owned members without fetching payloads."""
-        async for entry in self.iter_entries(prefix):
-            yield _from_entry(entry)
+        self._check_open()
+        iterator = self._reader._iter_members(prefix)
+        while batch := await iterator._next_batch():
+            for metadata in batch:
+                self._check_open()
+                yield _from_metadata(metadata)
 
     async def names(self, prefix: str | None = None) -> AsyncIterator[str]:
-        async for entry in self.iter_entries(prefix):
-            yield entry[0]
+        """Lazily yield names without constructing member metadata."""
+        self._check_open()
+        iterator = self._reader._iter_names(prefix)
+        while batch := await iterator._next_batch():
+            for name in batch:
+                self._check_open()
+                yield name
 
     def __aiter__(self) -> AsyncIterator[TarInfo]:
         return self.members()

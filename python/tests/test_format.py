@@ -1,5 +1,6 @@
 """Entry-oriented manifests use the same tuples in every SDK."""
 
+import asyncio
 import io
 import os
 import subprocess
@@ -41,6 +42,33 @@ def test_streaming_encoder_and_restricted_cbor(open_manifest):
     assert decode_manifest_block(encode_manifest_block(value)) == value
     with pytest.raises((ZstarError, TypeError)):
         encode_manifest_block({"x-float": 0.5})
+
+
+def test_native_lossless_metadata_remains_owned_and_authenticated():
+    fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
+    entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
+    output = io.BytesIO()
+    with EntryArchiveWriter(output, root_extensions=fields) as writer:
+        writer.add(entry, io.BytesIO(b"hello"), 5)
+    data = output.getvalue()
+    with _native.SyncArchive.from_bytes(data) as archive:
+        assert archive.root_extensions == fields
+        archive.root_extensions.clear()
+        assert archive.root_extensions == fields
+        saved = archive.entry("file")
+        assert saved[:6] == entry[:6]
+        assert saved[7] == fields
+        assert list(archive.iter_entries()) == [saved]
+
+    async def run():
+        async with await _native.AsyncArchive.from_bytes(data) as archive:
+            assert archive.root_extensions == fields
+            saved = await archive.entry("file")
+            assert saved[7] == fields
+            assert [entry async for entry in archive.iter_entries()] == [saved]
+            assert await archive.read("file") == b"hello"
+
+    asyncio.run(run())
 
 
 def test_iteration_and_owned_attributes(open_manifest):

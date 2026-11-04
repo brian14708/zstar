@@ -1,10 +1,11 @@
+mod remote;
+
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_runtime::env_config::{file::EnvConfigFiles, property::PropertiesKey};
 use aws_types::os_shim_internal::{Env as AwsEnv, Fs as AwsFs};
 use clap::{Parser, Subcommand};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,7 +13,7 @@ use zstar::ManifestOptions;
 use zstar::backend::BlockingArchive;
 use zstar::fs::{self as restore, LocalFileSource};
 use zstar::s3::object_store::client::CredentialProvider;
-use zstar::s3::object_store::{ObjectStoreExt, aws::AwsCredential, path::Path as ObjectPath};
+use zstar::s3::object_store::{aws::AwsCredential, path::Path as ObjectPath};
 
 #[expect(
     clippy::needless_pass_by_value,
@@ -243,26 +244,34 @@ async fn s3_store(bucket: &str) -> restore::AnyResult<Arc<zstar::s3::AmazonS3>> 
                 (key.trim() == "addressing_style").then(|| value.trim())
             })
         });
-    let profile_virtual = addressing_style == Some("virtual");
-    if std::env::var_os("AWS_VIRTUAL_HOSTED_STYLE_REQUEST").is_none() && addressing_style.is_some()
-    {
-        builder = builder.with_virtual_hosted_style_request(profile_virtual);
-    }
+    let virtual_hosted = match std::env::var("AWS_VIRTUAL_HOSTED_STYLE_REQUEST") {
+        Ok(value) => value.parse::<bool>()?,
+        Err(std::env::VarError::NotPresent) => addressing_style == Some("virtual"),
+        Err(error) => return Err(error.into()),
+    };
+    builder = builder.with_virtual_hosted_style_request(virtual_hosted);
     if std::env::var_os("AWS_ENDPOINT_URL_S3").is_none()
         && let Some(endpoint) = profile_endpoint
     {
-        let endpoint = endpoint_with_bucket(endpoint, bucket)?;
+        let endpoint = endpoint_for_style(endpoint, bucket, virtual_hosted)?;
         builder = builder.with_endpoint(endpoint);
     } else if std::env::var_os("AWS_ENDPOINT_URL_S3").is_none()
         && std::env::var_os("AWS_ENDPOINT").is_none()
         && let Some(endpoint) = config.endpoint_url()
     {
-        builder = builder.with_endpoint(endpoint);
+        builder = builder.with_endpoint(endpoint_for_style(endpoint, bucket, virtual_hosted)?);
     }
     Ok(Arc::new(builder.build()?))
 }
 
-fn endpoint_with_bucket(endpoint: &str, bucket: &str) -> restore::AnyResult<String> {
+fn endpoint_for_style(
+    endpoint: &str,
+    bucket: &str,
+    virtual_hosted: bool,
+) -> restore::AnyResult<String> {
+    if !virtual_hosted {
+        return Ok(endpoint.to_owned());
+    }
     let mut url = url::Url::parse(endpoint)?;
     let host = url
         .host_str()
@@ -275,15 +284,8 @@ fn endpoint_with_bucket(endpoint: &str, bucket: &str) -> restore::AnyResult<Stri
 async fn download(path: &Path) -> restore::AnyResult<tempfile::NamedTempFile> {
     let (bucket, key) = s3_location(path)?.ok_or("expected an s3://bucket/key URL")?;
     let store = s3_store(&bucket).await?;
-    let bytes = store
-        .get(&key)
-        .await
-        .map_err(|error| s3_error("GET", error))?
-        .bytes()
-        .await
-        .map_err(|error| s3_error("GET body", error))?;
     let mut file = tempfile::NamedTempFile::new()?;
-    std::io::Write::write_all(file.as_file_mut(), &bytes)?;
+    remote::download(store.as_ref(), &key, file.as_file_mut()).await?;
     Ok(file)
 }
 
@@ -349,26 +351,7 @@ async fn main() -> restore::AnyResult<()> {
             restore::pack_to_with_options(&input, staged.as_file_mut(), encoding.options())?;
             if let Some((bucket, key)) = remote {
                 let store = s3_store(&bucket).await?;
-                if !force {
-                    match store.head(&key).await {
-                        Ok(_) => {
-                            return Err(format!(
-                                "{} already exists; pass --force to replace it",
-                                output.display()
-                            )
-                            .into());
-                        }
-                        Err(zstar::s3::object_store::Error::NotFound { .. }) => {}
-                        Err(error) => return Err(s3_error("HEAD", error).into()),
-                    }
-                }
-                staged.as_file_mut().seek(SeekFrom::Start(0))?;
-                let mut bytes = Vec::new();
-                staged.as_file_mut().read_to_end(&mut bytes)?;
-                store
-                    .put(&key, bytes.into())
-                    .await
-                    .map_err(|error| s3_error("PUT", error))?;
+                remote::upload(store.as_ref(), &key, staged.as_file_mut(), force).await?;
             } else if force {
                 staged.persist(&output).map_err(|e| e.error)?;
             } else {
@@ -443,4 +426,26 @@ async fn main() -> restore::AnyResult<()> {
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::endpoint_for_style;
+
+    #[test]
+    fn profile_endpoints_follow_the_selected_addressing_style() {
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+            "https://s3.example",
+        ] {
+            assert_eq!(
+                endpoint_for_style(endpoint, "bucket", false).unwrap(),
+                endpoint
+            );
+        }
+        assert_eq!(
+            endpoint_for_style("https://s3.example", "bucket", true).unwrap(),
+            "https://bucket.s3.example"
+        );
+    }
 }

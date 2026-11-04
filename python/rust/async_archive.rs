@@ -11,6 +11,19 @@ pub struct AsyncArchive {
     session: Session,
 }
 impl AsyncArchive {
+    fn projected_entries(
+        slf: PyRef<'_, Self>,
+        prefix: Option<String>,
+        projection: super::reader::MetadataProjection,
+    ) -> PyResult<AsyncEntries> {
+        slf.lease()?;
+        Ok(AsyncEntries {
+            archive: slf.into(),
+            cursor: Arc::new(tokio::sync::Mutex::new(
+                super::reader::EntryIterator::projected(prefix, projection),
+            )),
+        })
+    }
     fn open(
         py: Python<'_>,
         work: impl std::future::Future<Output = PyResult<Session>> + Send + 'static,
@@ -27,6 +40,22 @@ impl AsyncArchive {
 }
 #[pymethods]
 impl AsyncArchive {
+    fn _member_info<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let lease = self.lease()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            lease.run(lease.member_info(&path)).await
+        })
+    }
+
+    #[pyo3(signature = (prefix = None))]
+    fn _iter_members(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<AsyncEntries> {
+        Self::projected_entries(slf, prefix, super::reader::MetadataProjection::Member)
+    }
+
+    #[pyo3(signature = (prefix = None))]
+    fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<AsyncEntries> {
+        Self::projected_entries(slf, prefix, super::reader::MetadataProjection::Name)
+    }
     fn _open_member<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

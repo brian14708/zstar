@@ -30,8 +30,6 @@ export default defineConfig({
                 'zstar.types', 'zstar.types.**',
                 'zstar.ZstarFileSystem', 'zstar.ZstarFileSystem.**',
               ],
-              // Helper shapes and base settings are covered by the public types.
-              exclude: ['zstar.types.EntryFields', 'zstar.types.ManifestOptions'],
             },
             sourceLink: { host: 'github', repo: 'brian14708/zstar', root: '..' },
           }],

@@ -17,6 +17,10 @@ doc = false
 
 [dependencies]
 bytes.workspace = true
+futures-util.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 clap = { workspace = true, features = ["derive"] }
 async-trait.workspace = true
 aws-config.workspace = true

@@ -7,13 +7,9 @@ from typing_extensions import Protocol, Reader, Writer
 
 __all__ = [
     "BinaryWriter",
-    "CborValue",
-    "EntryFields",
-    "EntryTuple",
     "ErrorCategory",
-    "ExtentTuple",
+    "FileInfo",
     "Limits",
-    "ManifestOptions",
     "ObjectResolver",
     "ProgressCallback",
     "RangeSource",
@@ -26,22 +22,6 @@ __all__ = [
     "VerificationReport",
     "WriterOptions",
 ]
-
-CborValue: TypeAlias = (
-    bool | int | str | bytes | list["CborValue"] | tuple["CborValue", ...] | dict[str, "CborValue"]
-)
-"""Recursive values accepted in archive and entry extension metadata."""
-ExtentTuple: TypeAlias = tuple[int, int | str, int] | tuple[int, int | str, int, int]
-"""Content extent: decoded size, source, encoded size, and optional decoded offset."""
-#: Entry metadata: path, type, mode, uid, gid, nanosecond mtime, and extents.
-EntryFields: TypeAlias = tuple[str, Literal[0, 2, 5], int, int, int, int, tuple[ExtentTuple, ...]]
-EntryTuple: TypeAlias = (
-    EntryFields
-    | tuple[
-        str, Literal[0, 2, 5], int, int, int, int, tuple[ExtentTuple, ...], dict[str, CborValue]
-    ]
-)
-"""Lossless entry metadata, with an optional final attributes dictionary."""
 
 ErrorCategory: TypeAlias = Literal[
     "not-zstar",
@@ -131,7 +111,6 @@ class WriterOptions(TypedDict, total=False):
 
     limits: Limits | None
     workers: int
-    root_extensions: dict[str, CborValue] | None
     frame_size: int
     compression_level: int
     memory_bytes: int
@@ -140,8 +119,8 @@ class WriterOptions(TypedDict, total=False):
     create_spill_store: Callable[[], SpillStore] | None
 
 
-class ManifestOptions(TypedDict, total=False):
-    """Shared metadata, memory, and validation budgets for archive readers."""
+class ReaderOptions(TypedDict, total=False):
+    """Reader budgets, concurrency, and external content resolution."""
 
     limits: Limits | None
     memory_bytes: int
@@ -152,10 +131,6 @@ class ManifestOptions(TypedDict, total=False):
     max_entries: int
     max_spool_bytes: int
     create_spill_store: Callable[[], SpillStore] | None
-
-
-class ReaderOptions(ManifestOptions, total=False):
-    """Typed reader keyword options, including metadata budgets and external content resolution."""
 
     concurrent_chunks: int
     verify_external: bool
@@ -186,3 +161,11 @@ class VerificationReport(TypedDict):
     data_frames: int
     external_objects_sha256_checked: list[str]
     external_objects_unchecked: list[str]
+
+
+class FileInfo(TypedDict):
+    """File metadata returned by the fsspec filesystem."""
+
+    name: str
+    size: int
+    type: Literal["file", "directory", "link"]

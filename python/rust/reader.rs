@@ -405,6 +405,16 @@ impl Lease {
     }
 }
 impl State {
+    pub async fn member_info(&self, path: &str) -> PyResult<Option<Py<PyAny>>> {
+        let entry = self.reader.entry(path).await.map_err(core_error)?;
+        Python::attach(|py| {
+            entry
+                .as_ref()
+                .map(|entry| member_metadata(py, entry))
+                .transpose()
+        })
+    }
+
     fn object_resolver<'a>(
         &'a self,
         resolver: Option<&'a dyn ObjectResolver>,
@@ -762,14 +772,44 @@ pub struct EntryIterator {
     checkpoint: Option<zstar::EntryCursor>,
     exhausted: bool,
     buffer: std::collections::VecDeque<Py<PyAny>>,
+    projection: MetadataProjection,
 }
+
+#[derive(Clone, Copy)]
+pub enum MetadataProjection {
+    Wire,
+    Member,
+    Name,
+}
+
+fn member_metadata(py: Python<'_>, entry: &zstar::Entry) -> PyResult<Py<PyAny>> {
+    Ok((
+        &entry.path,
+        entry.kind.code(),
+        entry.mode,
+        entry.uid,
+        entry.gid,
+        entry.mtime_ns,
+        entry.size().map_err(core_error)?,
+        entry.linkname.as_deref().unwrap_or(""),
+    )
+        .into_pyobject(py)?
+        .into_any()
+        .unbind())
+}
+
 impl EntryIterator {
     pub const fn new(prefix: Option<String>) -> Self {
+        Self::projected(prefix, MetadataProjection::Wire)
+    }
+
+    pub const fn projected(prefix: Option<String>, projection: MetadataProjection) -> Self {
         Self {
             prefix,
             checkpoint: None,
             exhausted: false,
             buffer: std::collections::VecDeque::new(),
+            projection,
         }
     }
     pub async fn next_batch(&mut self, reader: &Reader, limit: usize) -> PyResult<Vec<Py<PyAny>>> {
@@ -789,7 +829,13 @@ impl EntryIterator {
             let output = Python::attach(|py| {
                 entries
                     .iter()
-                    .map(|entry| super::manifest::to_py(py, &entry.to_value()))
+                    .map(|entry| match self.projection {
+                        MetadataProjection::Wire => super::manifest::to_py(py, &entry.to_value()),
+                        MetadataProjection::Member => member_metadata(py, entry),
+                        MetadataProjection::Name => {
+                            Ok(entry.path.as_str().into_pyobject(py)?.into_any().unbind())
+                        }
+                    })
                     .collect::<PyResult<std::collections::VecDeque<_>>>()
             })?;
             self.exhausted = output.is_empty();

@@ -13,7 +13,7 @@ from os import PathLike, fspath
 from pathlib import Path
 from tarfile import ExtractError, TarInfo
 from types import TracebackType
-from typing import BinaryIO, Literal, TypedDict, cast, overload
+from typing import BinaryIO, Literal, cast, overload
 
 from fsspec.archive import AbstractArchiveFileSystem
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem, sync
@@ -27,7 +27,7 @@ from ._file import AsyncArchiveFile
 from ._info import _nanoseconds
 from ._publication import _Publication, _WriteSession
 from ._writer import _writer_call
-from .types import ProgressCallback, ReaderOptions, WriterOptions
+from .types import FileInfo, ProgressCallback, ReaderOptions, WriterOptions
 
 __all__ = ["FileInfo", "ZstarFileSystem"]
 
@@ -48,12 +48,6 @@ def _range_bounds(size: int, start: int | None, end: int | None) -> tuple[int, i
     """Clip fsspec's positive and end-relative offsets to a member's bounds."""
     start, end, _ = slice(start, end).indices(size)
     return start, max(start, end)
-
-
-class FileInfo(TypedDict):
-    name: str
-    size: int
-    type: Literal["file", "directory", "link"]
 
 
 def _file_info(name: str, entry: TarInfo) -> FileInfo:

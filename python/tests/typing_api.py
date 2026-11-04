@@ -18,11 +18,10 @@ from zstar import (
     AsyncArchiveWriter,
     ZstarError,
 )
-from zstar._fsspec import FileInfo
 from zstar.types import (
     BinaryWriter,
-    EntryTuple,
     ErrorCategory,
+    FileInfo,
     ObjectResolver,
     RangeSource,
     ReaderOptions,
@@ -46,8 +45,6 @@ def synchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(archive, Archive)
         assert_type(archive.members(), Iterator[StandardTarInfo])
         assert_type(archive.names(), Iterator[str])
-        assert_type(archive.iter_entries("hello"), Iterator[EntryTuple])
-        assert_type(archive.entry("hello"), EntryTuple | None)
         assert_type(archive.read_range("hello", 0, 1), bytes)
         assert_type(archive.getinfo("hello"), StandardTarInfo)
         assert_type(archive.read("hello"), bytes)
@@ -80,8 +77,6 @@ async def asynchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(archive, AsyncArchive)
         assert_type(archive.members(), AsyncIterator[StandardTarInfo])
         assert_type(archive.names(), AsyncIterator[str])
-        assert_type(archive.iter_entries("hello"), AsyncIterator[EntryTuple])
-        assert_type(await archive.entry("hello"), EntryTuple | None)
         assert_type(await archive.read_range("hello", 0, 1), bytes)
         assert_type(await archive.getinfo("hello"), StandardTarInfo)
         assert_type(await archive.read("hello"), bytes)

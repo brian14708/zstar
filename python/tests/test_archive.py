@@ -45,7 +45,7 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
         assert list(members) == []
         assert list(archive.names()) == [member.name for member in archive]
         info = archive.getinfo("dir/file")
-        assert isinstance(info, tarfile.TarInfo) and info.isfile()
+        assert isinstance(info, TarInfo) and info.isfile()
         assert (info.size, info.uid, info.gid, _nanoseconds(info.pax_headers["mtime"])) == (
             12,
             123,
@@ -511,7 +511,6 @@ def test_prefix_iteration_and_async_metadata(encoded_archive):
         async with await zstar.AsyncArchive.from_bytes(
             encoded_archive, concurrent_chunks=1
         ) as archive:
-            assert archive.root_extensions == {}
             assert await archive.read_link("dir/link") == "file"
             assert await archive.read_range("dir/file", 0, 5) == b"hello"
             assert [name async for name in archive.names("dir/f")] == ["dir/file"]
@@ -519,40 +518,80 @@ def test_prefix_iteration_and_async_metadata(encoded_archive):
     asyncio.run(run())
 
 
-def test_lossless_entry_writing():
-    fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
-    entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
+def test_wire_metadata_stays_private():
+    from zstar import types
+
+    for name in ("CborValue", "EntryFields", "EntryTuple", "ExtentTuple", "ManifestOptions"):
+        assert not hasattr(types, name)
+    for cls in (zstar.Archive, zstar.AsyncArchive):
+        for name in ("entry", "iter_entries", "root_extensions"):
+            assert not hasattr(cls, name)
+    for cls in (ArchiveWriter, AsyncArchiveWriter):
+        assert not hasattr(cls, "add_entry")
+    with pytest.raises(TypeError, match="root_extensions"):
+        ArchiveWriter(io.BytesIO(), root_extensions={})
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
+    # Exercise more than one native batch and multiple extents without fetching
+    # external objects. Extensions are authenticated but stay private.
     output = io.BytesIO()
-    with ArchiveWriter(output, workers=2, root_extensions=fields) as writer:
-        with pytest.raises(ValueError, match="size requires"):
-            writer.add_entry(entry, size=5)
-        writer.add_entry(entry, io.BytesIO(b"hello"), 5)
-    with zstar.Archive(output.getvalue(), concurrent_chunks=2) as archive:
-        assert archive.root_extensions == fields
-        archive.root_extensions.clear()
-        assert archive.root_extensions == fields
-        saved = archive.entry("file")
-        assert list(archive.iter_entries()) == [saved]
-        assert saved[:6] == entry[:6]
-        assert saved[7] == fields
-        assert sum(extent[0] for extent in saved[6]) == 5
-        assert archive.read("file") == b"hello"
-        assert archive.entry("missing") is None
+    extents = ((2, "sha256:" + "01" * 32, 10), (3, "sha256:" + "02" * 32, 12))
+    with _native.EntryArchiveWriter(output) as writer:
+        for index in range(130):
+            writer.add(
+                (
+                    f"f{index:04}",
+                    0,
+                    0o640,
+                    12,
+                    34,
+                    -1234567891,
+                    extents,
+                    {"x-note": b"private" * 1024},
+                )
+            )
+        writer.add(("link", 2, 0o777, 56, 78, 1234567891, (), {"linkname": "./f0000"}))
+
+    def check(info):
+        assert isinstance(info, TarInfo)
+        assert (info.size, info.mode, info.uid, info.gid) == (5, 0o640, 12, 34)
+        assert info.pax_headers == {"mtime": "-1.234567891"}
+        info.pax_headers.clear()
 
     async def run():
-        output = io.BytesIO()
-        async with await AsyncArchiveWriter.from_file(
-            output, workers=1, root_extensions=fields
-        ) as writer:
-            await writer.add_entry(entry, io.BytesIO(b"hello"), 5)
-        async with await zstar.AsyncArchive.from_bytes(output.getvalue()) as archive:
-            assert archive.root_extensions == fields
-            saved = await archive.entry("file")
-            assert [entry async for entry in archive.iter_entries()] == [saved]
-            assert saved[:6] == entry[:6]
-            assert saved[7] == fields
-            assert await archive.read("file") == b"hello"
-            assert await archive.entry("missing") is None
+        data = output.getvalue()
+        if asynchronous:
+            async with await zstar.AsyncArchive.from_bytes(data, memory_bytes=1) as archive:
+                assert [name async for name in archive.names("f01")] == [
+                    f"f{i:04}" for i in range(100, 130)
+                ]
+                members = [info async for info in archive.members()]
+                assert len(members) == 131
+                check(members[0])
+                check(await archive.getinfo("f0000"))
+                assert (await archive.getinfo("link")).linkname == "./f0000"
+                with pytest.raises(KeyError):
+                    await archive.getinfo("missing")
+                pending = archive.names()
+                assert await anext(pending) == "f0000"
+            with pytest.raises(ValueError, match="closed"):
+                await anext(pending)
+        else:
+            with zstar.Archive(data, memory_bytes=1) as archive:
+                assert list(archive.names("f01")) == [f"f{i:04}" for i in range(100, 130)]
+                members = list(archive.members())
+                assert len(members) == 131
+                check(members[0])
+                check(archive.getinfo("f0000"))
+                assert archive.getinfo("link").linkname == "./f0000"
+                with pytest.raises(KeyError):
+                    archive.getinfo("missing")
+                pending = archive.names()
+                assert next(pending) == "f0000"
+            with pytest.raises(ValueError, match="closed"):
+                next(pending)
 
     asyncio.run(run())
 

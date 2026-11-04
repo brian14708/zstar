@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 from tarfile import DIRTYPE, REGTYPE, SYMTYPE, TarInfo
 from typing import Literal
 
-from .types import CborValue, EntryFields, EntryTuple
+from ._types import CborValue, EntryFields, EntryTuple, MemberMetadata
 
 
 def _nanoseconds(value: int | float | str) -> int:
@@ -27,18 +27,22 @@ def _nanoseconds(value: int | float | str) -> int:
 
 
 def _from_entry(entry: EntryTuple) -> TarInfo:
-    name, kind, mode, uid, gid, mtime_ns, extents = entry[:7]
+    fields = entry[7] if len(entry) == 8 else {}
+    linkname = fields.get("linkname", "")
+    assert isinstance(linkname, str)
+    return _from_metadata((*entry[:6], sum(extent[0] for extent in entry[6]), linkname))
+
+
+def _from_metadata(metadata: MemberMetadata) -> TarInfo:
+    name, kind, mode, uid, gid, mtime_ns, size, linkname = metadata
     info = TarInfo(name)
     info.type = {0: REGTYPE, 5: DIRTYPE, 2: SYMTYPE}[kind]
-    info.size = sum(extent[0] for extent in extents)
+    info.size = size
     info.mode, info.uid, info.gid = mode, uid, gid
     seconds, fraction = divmod(abs(mtime_ns), 1_000_000_000)
     text = f"{'-' if mtime_ns < 0 else ''}{seconds}.{fraction:09d}"
     info.mtime = mtime_ns // 1_000_000_000 if fraction == 0 else float(text)
     info.pax_headers = {"mtime": text}
-    fields = dict(entry[7]) if len(entry) == 8 else {}
-    linkname = fields.pop("linkname", "")
-    assert isinstance(linkname, str)
     info.linkname = linkname
     return info
 

@@ -25,8 +25,11 @@ for async use, caching, S3 backends, and external objects.
 
 Use `Archive` and `AsyncArchive` to read, or `ArchiveWriter` and
 `AsyncArchiveWriter` to write. `ZstarError` reports failures, and `zstar.types`
-defines options and storage protocols. See the
+defines options, reports, file metadata, and storage protocols. See the
 [archive interface guide](https://brian14708.github.io/zstar/guides/python/configuration/#raw-archive-interface).
+Metadata uses standard `tarfile.TarInfo` objects through `getinfo()` and `members()`;
+`names()` yields filenames. Writers accept `TarInfo` through `addfile()`.
+CBOR values, manifest tuples, and extent layouts are private implementation details.
 Underscored modules and methods are implementation details.
 
 On failure, writers close owned files before removing unfinished output, including
@@ -35,7 +38,9 @@ caller-owned sinks passed to `ArchiveWriter` remain open.
 
 ## Performance
 
-Keep readers open to reuse metadata and batch related ranges. See
+Keep readers open to reuse metadata and batch related ranges. Filename and member
+iteration uses bounded native batches and avoids constructing Python extent or
+extension objects. Prefer `names()` when only filenames are needed. See
 [performance guidance](https://brian14708.github.io/zstar/guides/python/configuration/#performance).
 
 ## Resource limits

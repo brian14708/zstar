@@ -126,19 +126,20 @@ follow symlinks. Opening a symlink as a member stream raises `tarfile.ExtractErr
 use `read_link()` to inspect its exact stored target. The fsspec adapter likewise
 reports links as links and rejects opening them or traversing through them.
 
-For metadata that does not fit `TarInfo`, `entry()` and `iter_entries()` return
-the lossless manifest tuples, including entry attributes and extent references.
-`root_extensions` and `read_link()` expose archive-level metadata and symlink
-targets. Opening completes metadata authentication and validation; use `verify()`
-for physical archive or external-closure validation. Reader options also
-include `concurrent_chunks`; writer options include `workers` and
-`root_extensions`.
-
-`ArchiveWriter.add_entry(entry, body=None, size=0)` and its async counterpart
-write lossless entry tuples, including extension attributes. Supply a body and its
-size to encode new inline extents, or omit the body for entries referencing external
-objects. Existing inline offsets belong to their source archive and cannot be copied.
+Use `getinfo(name)` for one `TarInfo`, `members(prefix=None)` to iterate metadata,
+and `names(prefix=None)` to iterate filenames. Prefixes select paths by their UTF-8
+byte prefix. Results are owned snapshots; changing them does not change the archive.
+`read_link()` returns a symlink's exact stored target, and
 `read_range(name, start, end)` reads a half-open member range.
+
+Opening completes metadata authentication and validation; use `verify()` for
+physical archive or external-closure validation. Reader options include
+`concurrent_chunks`; writer options include `workers`. Public option, report,
+and storage protocol types live in `zstar.types`.
+
+Write file metadata with `ArchiveWriter.addfile(tarinfo, body)` or its async
+counterpart. Manifest tuples, CBOR values, extent references, and raw extension
+metadata are private implementation details.
 
 ```python
 from pathlib import Path
