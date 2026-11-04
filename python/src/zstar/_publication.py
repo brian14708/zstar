@@ -82,17 +82,9 @@ class _Publication:
         self._finished = True
         failures = list(errors)
         abort = abort or bool(failures)
-        discarded = False
-        if abort and self._discard is not None:
-            try:
-                self._discard()
-                discarded = True
-            except BaseException as error:
-                failures.append(error)
-            finally:
-                # Prevent buffered close from uploading discarded output.
-                if isinstance(self.output, AbstractBufferedFile):
-                    self.output.forced = True
+        if abort and self._discard is not None and isinstance(self.output, AbstractBufferedFile):
+            # Prevent close from uploading buffered output before it is discarded.
+            self.output.forced = True
         try:
             self.output.close()
         except BaseException as error:
@@ -104,7 +96,7 @@ class _Publication:
             except BaseException as error:
                 failures.append(error)
                 abort = True
-        if abort and self._discard is not None and not discarded:
+        if abort and self._discard is not None:
             try:
                 self._discard()
             except BaseException as error:

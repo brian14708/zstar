@@ -10,6 +10,7 @@ import pytest
 import zstar
 from fsspec.asyn import AsyncFileSystem
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.spec import AbstractBufferedFile
 from zstar import ZstarFileSystem
 
 
@@ -164,6 +165,59 @@ def test_abort_preserves_existing_archive_and_discards_staging(tmp_path):
         member.write(b"partial")
     assert member.closed
     assert path.read_bytes() == b"original"
+
+
+def test_abort_closes_local_output_before_discard(tmp_path):
+    class WindowsLocalFileSystem(LocalFileSystem):
+        def _open(self, *args, **kwargs):
+            output = super()._open(*args, **kwargs)
+            discard = output.discard
+
+            def discard_output():
+                if not output.closed:
+                    raise PermissionError("cannot delete an open file")
+                discard()
+
+            output.discard = discard_output
+            return output
+
+    path = tmp_path / "archive"
+    path.write_bytes(b"original")
+    with (
+        pytest.raises(RuntimeError, match="abort"),
+        ZstarFileSystem(
+            fo=path, fs=WindowsLocalFileSystem(skip_instance_cache=True), mode="w"
+        ) as fs,
+    ):
+        fs.pipe_file("data", b"partial")
+        raise RuntimeError("abort")
+    assert path.read_bytes() == b"original"
+
+
+def test_abort_discards_buffered_output_without_uploading(tmp_path):
+    outputs = []
+
+    class BufferedOutput(AbstractBufferedFile):
+        def _upload_chunk(self, final=False):
+            raise AssertionError("aborted output must not be uploaded")
+
+        def discard(self):
+            assert self.closed
+            outputs.append(self)
+
+    class BufferedFileSystem(LocalFileSystem):
+        def _open(self, path, mode="rb", **kwargs):
+            return BufferedOutput(self, path, mode=mode, **kwargs)
+
+    with (
+        pytest.raises(RuntimeError, match="abort"),
+        ZstarFileSystem(
+            fo=tmp_path / "archive", fs=BufferedFileSystem(skip_instance_cache=True), mode="w"
+        ) as fs,
+    ):
+        fs.pipe_file("data", b"partial")
+        raise RuntimeError("abort")
+    assert len(outputs) == 1
 
 
 @pytest.mark.parametrize("external", [False, True], ids=["archive", "external-object"])

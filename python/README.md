@@ -29,6 +29,10 @@ defines options and storage protocols. See the
 [archive interface guide](https://brian14708.github.io/zstar/guides/python/configuration/#raw-archive-interface).
 Underscored modules and methods are implementation details.
 
+On failure, writers close owned files before removing unfinished output, including
+on Windows. Transactional fsspec outputs are discarded without committing them;
+caller-owned sinks passed to `ArchiveWriter` remain open.
+
 ## Performance
 
 Keep readers open to reuse metadata and batch related ranges. See

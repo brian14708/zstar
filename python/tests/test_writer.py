@@ -61,6 +61,39 @@ def test_writer_creation_and_finalization_failures_discard_new_output(tmp_path):
     assert not path.exists()
 
 
+@pytest.mark.parametrize("failure", ["creation", "close", "context_exit"])
+def test_owned_writer_closes_output_before_removal(tmp_path, monkeypatch, failure):
+    path = tmp_path / "archive.zstar"
+    outputs = []
+    fdopen, unlink = os.fdopen, os.unlink
+
+    def track_output(*args, **kwargs):
+        output = fdopen(*args, **kwargs)
+        outputs.append(output)
+        return output
+
+    def windows_unlink(name, *args, **kwargs):
+        if os.fspath(name) == str(path) and any(not output.closed for output in outputs):
+            raise PermissionError("cannot delete an open file")
+        return unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr("zstar._writer.os.fdopen", track_output)
+    monkeypatch.setattr("zstar._writer.os.unlink", windows_unlink)
+    with pytest.raises(zstar.ZstarError):
+        if failure == "creation":
+            ArchiveWriter.from_file(path, "x", frame_size=0)
+        else:
+            writer = ArchiveWriter.from_file(path, "x")
+            writer.write_bytes("same", b"one")
+            writer.write_bytes("same", b"two")
+            if failure == "close":
+                writer.close()
+            else:
+                writer.__exit__(None, None, None)
+    assert outputs and all(output.closed for output in outputs)
+    assert not path.exists()
+
+
 def test_writer_abort_uses_stable_output_path(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"

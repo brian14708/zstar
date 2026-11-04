@@ -72,6 +72,11 @@ class ArchiveWriter:
         mode: str = "w",
         **options: Unpack[WriterOptions],
     ) -> Self:
+        """Create a writer from a path or a caller-owned binary sink.
+
+        Owned files are closed before unfinished output is removed on failure.
+        Borrowed sinks remain open.
+        """
         if mode not in ("w", "x"):
             raise ValueError("writer mode must be 'w' or 'x'")
         if not isinstance(file, (str, os.PathLike)):
@@ -92,8 +97,11 @@ class ArchiveWriter:
                 identity = (stat.st_dev, stat.st_ino)
                 writer = cls(output, **options)
             except BaseException:
-                if identity is not None:
-                    _discard_path(cleanup_path, identity)
+                try:
+                    owner.close()
+                finally:
+                    if identity is not None:
+                        _discard_path(cleanup_path, identity)
                 raise
             writer._owned = owner.pop_all()
             writer._path = (cleanup_path, identity)
@@ -179,11 +187,11 @@ class ArchiveWriter:
         try:
             self._writer.close()
             self._path = None
-        except BaseException:
-            self._discard_output()
-            raise
         finally:
-            self._close_owned()
+            try:
+                self._close_owned()
+            finally:
+                self._discard_output()
 
     def _discard_output(self) -> None:
         path, self._path = self._path, None
@@ -206,16 +214,12 @@ class ArchiveWriter:
             self._writer.__exit__(exc_type, exc_value, traceback)
             if exc_type is None:
                 self._path = None
-        except BaseException:
-            self._discard_output()
-            raise
         finally:
             try:
                 self._close_owned()
             finally:
-                if exc_type is not None:
-                    # Partial output is not a valid archive; remove files we created.
-                    self._discard_output()
+                # Remove unfinished output only after releasing its file handle.
+                self._discard_output()
 
 
 _T = TypeVar("_T")
