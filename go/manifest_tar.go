@@ -264,7 +264,7 @@ func (m *Manifest) ValidateArchive(ctx context.Context) (ArchiveReport, error) {
 }
 
 // VisitPayloads validates while streaming physical file payloads. External
-// payloads are pointer text. Empty regular files produce one empty callback;
+// payloads are pointer JSON. Empty regular files produce one empty callback;
 // directories and symlinks produce none. Bytes are borrowed until callback
 // return. Output is provisional until this method succeeds. Callbacks may read
 // metadata/content through m, but must not close it during validation. Entry
@@ -365,7 +365,7 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 			if e != nil {
 				return report, e
 			}
-			extents, e := DecodeContentPointer(pointer)
+			extents, e := decodeContentPointer(pointer, len(entry.Extents))
 			if e != nil {
 				return report, e
 			}

@@ -79,7 +79,15 @@ export default defineConfig({
         {
           label: 'Reference',
           items: [
-            { label: 'Format specification', link: '/reference/spec/' },
+            {
+              label: 'Draft specifications',
+              items: [
+                { label: 'Overview', link: '/reference/spec/' },
+                { label: 'Core format', link: '/reference/spec/core/' },
+                { label: 'External content', link: '/reference/spec/external-content/' },
+                { label: 'Catalog proposal', link: '/reference/spec/catalog/' },
+              ],
+            },
             pydocsSidebarGroup,
             { label: 'Rust API', link: 'https://docs.rs/zstar/latest/zstar/' },
             { label: 'Go API', link: 'https://pkg.go.dev/github.com/brian14708/zstar/go' },

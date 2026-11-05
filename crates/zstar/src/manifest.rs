@@ -495,14 +495,15 @@ pub fn valid_path(path: &str) -> bool {
 /// Sequence header metadata. Entry count is derived, never stored on the wire.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManifestRoot {
-    pub required_features: Vec<String>,
+    /// Mandatory extensions, sorted and unique. Unknown names are rejected.
+    pub requires: Vec<String>,
     pub entry_count: u64,
     pub extensions: BTreeMap<String, Value>,
 }
 impl ManifestRoot {
     pub(crate) fn validate(&self) -> Result<()> {
-        for (i, name) in self.required_features.iter().enumerate() {
-            if !valid_feature(name) || i > 0 && self.required_features[i - 1] >= *name {
+        for (i, name) in self.requires.iter().enumerate() {
+            if !valid_feature(name) || i > 0 && self.requires[i - 1] >= *name {
                 return Err(malformed("required feature syntax or order"));
             }
             if name != "external-content" {
@@ -591,12 +592,12 @@ pub(crate) fn decode_sequence_budgeted(
     if unsigned(field(m, "version")?)? != 1 {
         return Err(Error::UnsupportedVersion("manifest document"));
     }
-    let required_features = array(field(m, "required_features")?)?
+    let requires = array(field(m, "requires")?)?
         .iter()
         .map(|v| string(v).map(str::to_owned))
         .collect::<Result<Vec<_>>>()?;
     let mut root = ManifestRoot {
-        required_features,
+        requires,
         entry_count: 0,
         extensions: BTreeMap::new(),
     };
@@ -604,7 +605,7 @@ pub(crate) fn decode_sequence_budgeted(
         let name = string(key)?;
         if name.starts_with("x-") {
             root.extensions.insert(name.into(), value.clone());
-        } else if !["version", "required_features"].contains(&name) {
+        } else if !["version", "requires"].contains(&name) {
             return Err(malformed("unknown manifest field"));
         }
     }
@@ -684,12 +685,7 @@ pub(crate) fn decode_sequence_budgeted(
         external |= entry.is_external();
         entries.push(entry);
     }
-    if external
-        != root
-            .required_features
-            .iter()
-            .any(|s| s == "external-content")
-    {
+    if external != root.requires.iter().any(|s| s == "external-content") {
         return Err(malformed("external feature declaration"));
     }
     root.entry_count = entries.len() as u64;
@@ -717,12 +713,7 @@ fn valid_feature(name: &str) -> bool {
     !separator
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-/// Serialize the portable external reference. No whole-file identity is stored.
-pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
+fn validate_external_extents(extents: &[Extent]) -> Result<()> {
     if extents.is_empty()
         || extents
             .iter()
@@ -730,9 +721,23 @@ pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     {
         return Err(malformed("external extents"));
     }
-    for e in extents {
+    extents.iter().try_fold(0_u64, |total, e| {
         e.validate(0)?;
-    }
+        total
+            .checked_add(e.size)
+            .ok_or_else(|| malformed("external reference size overflow"))
+    })?;
+    Ok(())
+}
+
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+/// Serialize a standalone external reference with a logical size that fits uint64.
+/// No whole-file identity is stored.
+pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
+    validate_external_extents(extents)?;
     crate::cbor::encode_checked(&Value::Map(vec![
         (text("version"), number(1)),
         (
@@ -756,90 +761,157 @@ pub fn decode_external_reference(bytes: &[u8]) -> Result<Vec<Extent>> {
         .iter()
         .map(|v| Extent::from_value(v, 0))
         .collect::<Result<Vec<_>>>()?;
-    encode_external_reference(&extents)?;
+    validate_external_extents(&extents)?;
     Ok(extents)
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
-    use std::fmt::Write as _;
-    encode_external_reference(extents)?;
-    let mut out = String::from("version zstar-pointer-v1\n");
-    for e in extents {
-        let Source::Object(hash) = &e.source else {
-            return Err(malformed("pointer source"));
-        };
-        write!(
-            out,
-            "chunk {} {} {}",
-            object_address(hash),
-            e.size,
-            e.encoded_size
-        )
-        .expect("String write");
-        if e.offset != 0 {
-            write!(out, " {}", e.offset).expect("String write");
+// Serde struct visitors also accept sequences; pointers require JSON objects.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct JsonObject<T>(T);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for JsonObject<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = JsonObject<T>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(JsonObject)
+            }
         }
-        out.push('\n');
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
     }
-    Ok(out.into_bytes())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentPointer<T> {
+    version: String,
+    chunks: T,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointerChunk {
+    source: String,
+    size: u64,
+    encoded_size: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "positive_offset"
+    )]
+    offset: u64,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive a reference."
+)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn positive_offset<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u64, D::Error> {
+    let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("explicit zero pointer offset"));
+    }
+    Ok(value)
 }
 
 #[expect(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
+/// Serialize a JSON content pointer, omitting zero offsets.
+pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
+    validate_external_extents(extents)?;
+    let chunks = extents
+        .iter()
+        .map(|e| {
+            let Source::Object(hash) = &e.source else {
+                return Err(malformed("pointer source"));
+            };
+            Ok(JsonObject(PointerChunk {
+                source: object_address(hash),
+                size: e.size,
+                encoded_size: e.encoded_size,
+                offset: e.offset,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    serde_json::to_vec(&ContentPointer {
+        version: "zstar-pointer-v1".into(),
+        chunks,
+    })
+    .map_err(|e| Error::MalformedPointer(e.to_string()))
+}
+
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "Errors follow the documented operation contract and crate error types."
+)]
+/// Parse JSON pointer chunks with exact uint64 values and strict fields.
 pub fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
+    decode_pointer_bounded(bytes, usize::MAX)
+}
+
+pub(crate) fn decode_pointer_bounded(bytes: &[u8], maximum_chunks: usize) -> Result<Vec<Extent>> {
+    struct ChunkVisitor(usize);
+    impl<'de> serde::de::Visitor<'de> for ChunkVisitor {
+        type Value = Vec<Extent>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of pointer chunks")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut extents = Vec::new();
+            while let Some(JsonObject(chunk)) =
+                sequence.next_element::<JsonObject<PointerChunk>>()?
+            {
+                if extents.len() == self.0 {
+                    return Err(serde::de::Error::custom(
+                        "pointer chunk count exceeds manifest",
+                    ));
+                }
+                extents.push(Extent {
+                    source: Source::Object(
+                        parse_object_address(&chunk.source).map_err(serde::de::Error::custom)?,
+                    ),
+                    size: chunk.size,
+                    encoded_size: chunk.encoded_size,
+                    offset: chunk.offset,
+                });
+            }
+            Ok(extents)
+        }
+    }
     let parse = || -> Result<Vec<Extent>> {
-        let text = std::str::from_utf8(bytes).map_err(|_| malformed("pointer UTF-8"))?;
-        let text = text
-            .strip_suffix('\n')
-            .ok_or_else(|| malformed("pointer final LF"))?;
-        let mut lines = text.split('\n');
-        if lines.next() != Some("version zstar-pointer-v1") {
+        // Borrow the chunks' JSON bytes so parsing cannot allocate an unchecked
+        // intermediate vector before the manifest's extent count is enforced.
+        let JsonObject(pointer): JsonObject<ContentPointer<&serde_json::value::RawValue>> =
+            serde_json::from_slice(bytes).map_err(|e| malformed(&e.to_string()))?;
+        if pointer.version != "zstar-pointer-v1" {
             return Err(malformed("pointer version"));
         }
-        let mut extents = Vec::new();
-        for line in lines {
-            let fields: Vec<_> = line.split(' ').collect();
-            if !(4..=5).contains(&fields.len()) || fields[0] != "chunk" {
-                return Err(malformed("pointer line"));
-            }
-            let decimal = |s: &str| -> Result<u64> {
-                if s.is_empty()
-                    || !s.bytes().all(|b| b.is_ascii_digit())
-                    || s.len() > 1 && s.starts_with('0')
-                {
-                    return Err(malformed("pointer integer"));
-                }
-                s.parse().map_err(|_| malformed("pointer integer overflow"))
-            };
-            let e = Extent {
-                size: decimal(fields[2])?,
-                source: Source::Object(parse_object_address(fields[1])?),
-                encoded_size: decimal(fields[3])?,
-                offset: if fields.len() == 5 {
-                    decimal(fields[4])?
-                } else {
-                    0
-                },
-            };
-            if fields.len() == 5 && e.offset == 0 {
-                return Err(malformed("explicit zero pointer offset"));
-            }
-            e.validate(0)?;
-            extents.push(e);
-        }
-        if encode_pointer(&extents)? != bytes {
-            return Err(malformed("pointer canonical grammar"));
-        }
-        extents.iter().try_fold(0_u64, |n, e| {
-            n.checked_add(e.size)
-                .ok_or_else(|| malformed("pointer size overflow"))
-        })?;
+        let mut decoder = serde_json::Deserializer::from_str(pointer.chunks.get());
+        let extents =
+            serde::Deserializer::deserialize_seq(&mut decoder, ChunkVisitor(maximum_chunks))
+                .map_err(|e| malformed(&e.to_string()))?;
+        validate_external_extents(&extents)?;
         Ok(extents)
     };
     parse().map_err(|e| Error::MalformedPointer(e.to_string()))
@@ -885,10 +957,7 @@ mod tests {
     fn document_rejects_legacy_missing_fields_and_trailing_items() {
         let empty = Value::Map(vec![
             (Value::Text("version".into()), Value::Integer(1.into())),
-            (
-                Value::Text("required_features".into()),
-                Value::Array(vec![]),
-            ),
+            (Value::Text("requires".into()), Value::Array(vec![])),
         ]);
         assert!(decode_document(&[], 1).is_err());
         let raw = crate::cbor::encode(&empty).unwrap();
@@ -899,7 +968,7 @@ mod tests {
         let Value::Map(mut fields) = empty else {
             unreachable!()
         };
-        for name in ["version", "required_features"] {
+        for name in ["version", "requires"] {
             let mut missing = fields.clone();
             missing.retain(|(key, _)| key != &Value::Text(name.into()));
             assert!(
@@ -910,6 +979,34 @@ mod tests {
         assert!(decode_document(&crate::cbor::encode(&Value::Map(fields)).unwrap(), 1).is_err());
         let legacy = Value::Map(vec![(Value::Text("root".into()), Value::Map(vec![]))]);
         assert!(decode_document(&crate::cbor::encode(&legacy).unwrap(), 1).is_err());
+    }
+    #[test]
+    fn external_reference_and_pointer_sizes_fit_uint64() {
+        for (first_size, valid) in [(u64::MAX - 1, true), (u64::MAX, false)] {
+            let extents = [first_size, 1].map(|size| Extent {
+                size,
+                source: Source::Object([0; 32]),
+                encoded_size: 1,
+                offset: 0,
+            });
+            let reference = crate::cbor::encode(&Value::Map(vec![
+                (text("version"), number(1)),
+                (
+                    text("extents"),
+                    Value::Array(extents.iter().map(Extent::to_value).collect()),
+                ),
+            ]))
+            .unwrap();
+            let address = object_address(&[0; 32]);
+            let pointer = format!(
+                r#"{{"version":"zstar-pointer-v1","chunks":[{{"source":"{address}","size":{first_size},"encoded_size":1}},{{"source":"{address}","size":1,"encoded_size":1}}]}}"#
+            );
+            assert_eq!(encode_external_reference(&extents).is_ok(), valid);
+            assert_eq!(decode_external_reference(&reference).is_ok(), valid);
+            assert_eq!(encode_pointer(&extents).is_ok(), valid);
+            assert_eq!(decode_pointer(pointer.as_bytes()).is_ok(), valid);
+            assert!(decode_pointer_bounded(pointer.as_bytes(), 1).is_err());
+        }
     }
     #[test]
     fn tuple_length_matches_independent_cbor_at_integer_and_container_boundaries() {

@@ -170,7 +170,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 	if w.external {
 		features = append(features, "external-content")
 	}
-	if err := add("required_features", features); err != nil {
+	if err := add("requires", features); err != nil {
 		return err
 	}
 	for key, value := range w.options.RootExtensions {

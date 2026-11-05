@@ -94,4 +94,4 @@ cargo run --locked -p zstar --features fs --example local_range -- example.zstar
 
 The [format specification][spec] defines the wire rules and validation scopes.
 
-[spec]: /zstar/reference/spec/
+[spec]: /zstar/reference/spec/core/

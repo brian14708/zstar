@@ -623,17 +623,17 @@ func (s *manifestSpool) close() error {
 // Manifest exposes low-level metadata and content operations with per-call policy.
 // Prefer Reader for an archive with one fixed resolver and verification policy.
 type Manifest struct {
-	mu               sync.Mutex
-	closed           bool
-	spool            manifestSpool
-	start, count     uint64
-	entries          []Entry
-	requiredFeatures []string
-	rootExtensions   Extensions
-	source           RangeReader
-	maxRead          uint64
-	readAhead        uint64
-	content          *manifestContentState
+	mu             sync.Mutex
+	closed         bool
+	spool          manifestSpool
+	start, count   uint64
+	entries        []Entry
+	requires       []string
+	rootExtensions Extensions
+	source         RangeReader
+	maxRead        uint64
+	readAhead      uint64
+	content        *manifestContentState
 }
 
 // OpenManifest authenticates and validates metadata using the supplied budgets.
@@ -767,7 +767,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 	if e != nil {
 		return nil, categorized(CategoryMalformedTOC, e)
 	}
-	root, e := schemaMap(value, []string{"version", "required_features"}, nil)
+	root, e := schemaMap(value, []string{"version", "requires"}, nil)
 	if e != nil {
 		return nil, categorized(CategoryMalformedTOC, e)
 	}
@@ -787,19 +787,19 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 	if version != 1 {
 		return nil, rejected(CategoryUnsupportedVersion, "manifest root")
 	}
-	requiredFeatures, ok := root["required_features"].([]any)
+	requires, ok := root["requires"].([]any)
 	if !ok {
-		return nil, rejected(CategoryMalformedTOC, "required_features")
+		return nil, rejected(CategoryMalformedTOC, "requires")
 	}
-	for _, v := range requiredFeatures {
+	for _, v := range requires {
 		s, ok := v.(string)
-		if !ok || !validFeature(s) || len(m.requiredFeatures) > 0 && m.requiredFeatures[len(m.requiredFeatures)-1] >= s {
-			return nil, rejected(CategoryMalformedTOC, "required_features")
+		if !ok || !validFeature(s) || len(m.requires) > 0 && m.requires[len(m.requires)-1] >= s {
+			return nil, rejected(CategoryMalformedTOC, "requires")
 		}
 		if s != "external-content" {
 			return nil, rejected(CategoryUnsupportedFeature, "required feature")
 		}
-		m.requiredFeatures = append(m.requiredFeatures, s)
+		m.requires = append(m.requires, s)
 	}
 	sequence.limit = options.Limits.MaxEntryBytes
 	var retained uint64

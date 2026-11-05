@@ -7,10 +7,21 @@ byte ranges without decompressing the entire archive. It combines independently
 compressed Zstandard frames with deterministic CBOR metadata. Archives can keep
 all content inline or reference external objects by SHA-256.
 
-The [v1 specification](spec/v1.md) is a working draft. It defines the wire
-format, validation rules, implementation profiles, schema, and grammar. Standard
-Zstandard and tar tools can decode the tar stream; resolving external content
-requires a Zstar reader.
+The [draft specifications](spec/draft/README.md) are working drafts. The [core
+specification](spec/draft/core.md) defines archive framing, the manifest,
+validation, and implementation profiles. The standalone [external-content
+extension](spec/draft/external-content.md) defines thin archives and content
+references. Standard Zstandard and tar tools can decode the tar stream;
+resolving external content requires a Zstar reader.
+
+External-file pointer payloads are JSON documents using `zstar-pointer-v1`;
+archive manifests and standalone content references use deterministic CBOR.
+The [catalog proposal](spec/draft/catalog.md) defines named JSON collections of
+CAS-stored archive layers with nesting and whiteout merging. Catalog operations
+are not yet implemented by the SDKs.
+
+The informative [CAS storage appendix](spec/draft/external-content.md#appendix-cas-storage) explains how object
+identity remains independent of compressed storage representations.
 
 ## Libraries and CLI
 
@@ -21,10 +32,9 @@ requires a Zstar reader.
 | Python SDK | [Sync, async, and fsspec APIs](python/README.md) | `python/` |
 | Go SDK | [Package and API documentation](go/) | `go/` |
 
-The Rust storage adapters are documented in the generated API documentation
-for `zstar::fs`, `zstar::http`, and `zstar::s3`.
-Shared conformance fixtures under `testdata/` exercise the SDKs against the same
-valid and invalid archives.
+The Rust storage adapters are documented in the generated API documentation for
+`zstar::fs`, `zstar::http`, and `zstar::s3`. Shared conformance fixtures under
+`testdata/` exercise the SDKs against the same valid and invalid archives.
 
 ## Validation support
 
@@ -38,10 +48,11 @@ valid and invalid archives.
 | Portable and thin writing | Yes | Yes | Portable raw writer; thin fsspec writer |
 | Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
 
-External SHA-256 checking defaults to disabled. Metadata digests, frame checksums,
-and extent bounds are always checked. Selective reads do not establish full
-physical validity, and these checks establish consistency rather than publisher
-authenticity. See each SDK's configuration guide for resource budgets.
+External SHA-256 checking defaults to disabled. Metadata digests, frame
+checksums, and extent bounds are always checked. Selective reads do not
+establish full physical validity, and these checks establish consistency rather
+than publisher authenticity. See each SDK's configuration guide for resource
+budgets.
 
 ## Development
 
@@ -52,5 +63,5 @@ nix develop
 just
 ```
 
-See [justfile](justfile) for lint, test, integration, and packaging recipes, and
-[docs/README.md](docs/README.md) for documentation builds and previews.
+See [justfile](justfile) for lint, test, integration, and packaging recipes,
+and [docs/README.md](docs/README.md) for documentation builds and previews.

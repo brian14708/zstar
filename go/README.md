@@ -29,3 +29,17 @@ SHA-256 checking is opt-in through `ReaderOptions.VerifyExternalHash`; codec
 checksums remain mandatory. Checksum mismatches report `integrity-failure`.
 `Manifest` and `EntryArchiveWriter` are advanced interfaces; ordinary callers
 can use `Reader`, `Writer`, and `Header`.
+
+The [core specification](https://github.com/brian14708/zstar/blob/main/spec/draft/core.md)
+and [external-content extension](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md)
+define archive validation and external object semantics. The informative
+[CAS storage appendix](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md#appendix-cas-storage)
+explains object identity and storage encoding.
+
+The draft manifest header declares mandatory extensions in `requires`. Readers
+reject unsupported extensions and unknown unprefixed fields.
+
+External file pointer payloads use JSON with `"version": "zstar-pointer-v1"` and
+an ordered `chunks` array. This breaking draft change replaces line-based
+pointers; full archive validation rejects the old payloads. Standalone content
+references retain their deterministic CBOR encoding.

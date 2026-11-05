@@ -44,7 +44,7 @@ func FuzzIndexedArchive(f *testing.F) {
 }
 
 func FuzzCanonicalMetadata(f *testing.F) {
-	root, err := manifestEncode(map[string]any{"version": uint64(1), "required_features": []string{}})
+	root, err := manifestEncode(map[string]any{"version": uint64(1), "requires": []string{}})
 	if err != nil {
 		f.Fatal(err)
 	}

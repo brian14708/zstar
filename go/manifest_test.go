@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"strconv"
 	"testing"
 
@@ -218,8 +219,44 @@ func TestManifestContentReferences(t *testing.T) {
 	if err != nil || len(extents) != 1 || extents[0] != values[0] {
 		t.Fatalf("pointer: %v", err)
 	}
-	if _, err := DecodeContentPointer(bytes.Replace(pointer, []byte(" 1 9\n"), []byte(" 1 0\n"), 1)); err == nil {
+	if _, err := DecodeContentPointer(bytes.Replace(pointer, []byte(`"offset":9`), []byte(`"offset":0`), 1)); err == nil {
 		t.Fatal("explicit default accepted")
+	}
+}
+
+func TestContentReferenceAndPointerSizeBounds(t *testing.T) {
+	for _, firstSize := range []uint64{math.MaxUint64 - 1, math.MaxUint64} {
+		t.Run(strconv.FormatUint(firstSize, 10), func(t *testing.T) {
+			valid := firstSize == math.MaxUint64-1
+			source := ObjectSource([32]byte{})
+			extents := []Extent{
+				{Size: firstSize, Source: source, EncodedSize: 1},
+				{Size: 1, Source: source, EncodedSize: 1},
+			}
+			reference, err := manifestEncode(map[string]any{
+				"version": uint64(1),
+				"extents": [][]any{extents[0].value(), extents[1].value()},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pointer := []byte(fmt.Sprintf(`{"version":"zstar-pointer-v1","chunks":[{"source":"%s","size":%d,"encoded_size":1},{"source":"%s","size":1,"encoded_size":1}]}`, source.address, firstSize, source.address))
+			if _, err := EncodeContentReference(extents); (err == nil) != valid {
+				t.Fatalf("encode reference: %v", err)
+			}
+			if _, err := DecodeContentReference(reference); (err == nil) != valid {
+				t.Fatalf("decode reference: %v", err)
+			}
+			if _, err := EncodeContentPointer(extents); (err == nil) != valid {
+				t.Fatalf("encode pointer: %v", err)
+			}
+			if _, err := DecodeContentPointer(pointer); (err == nil) != valid {
+				t.Fatalf("decode pointer: %v", err)
+			}
+			if _, err := decodeContentPointer(pointer, 1); err == nil {
+				t.Fatal("pointer exceeded manifest extent count")
+			}
+		})
 	}
 }
 

@@ -709,7 +709,7 @@ pub fn extract_with_report<R: RangeReader>(
     if reader
         .manifest()
         .root()
-        .required_features
+        .requires
         .iter()
         .any(|s| s == "external-content")
         && objects.is_none()

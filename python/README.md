@@ -57,3 +57,17 @@ disables retention. Metadata projection reports omitted manifest extensions with
 `UserWarning`, so rewrites can detect metadata loss. Local fsspec downloads reject
 destination symlinks and require POSIX no-follow descriptor operations. They copy
 bytes and reject symlink members. Checksum mismatches report `integrity-failure`.
+
+The [core specification](https://github.com/brian14708/zstar/blob/main/spec/draft/core.md)
+and [external-content extension](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md)
+define archive validation and external object semantics. The informative
+[CAS storage appendix](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md#appendix-cas-storage)
+explains object identity and storage encoding.
+
+The draft manifest header declares mandatory extensions in `requires`. Readers
+reject unsupported extensions and unknown unprefixed fields.
+
+External file pointer payloads use JSON with `"version": "zstar-pointer-v1"` and
+an ordered `chunks` array. This breaking draft change replaces line-based
+pointers; full archive validation rejects the old payloads. Standalone content
+references retain their deterministic CBOR encoding.

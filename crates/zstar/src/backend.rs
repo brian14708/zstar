@@ -1,6 +1,6 @@
 //! Archive I/O for the entry-oriented manifest. No persistent frame table.
 use crate::decoded_body::DecodedBody;
-use crate::manifest::{Entry, EntryKind, Extent, Source, decode_pointer, encode_pointer};
+use crate::manifest::{Entry, EntryKind, Extent, Source, decode_pointer_bounded, encode_pointer};
 use crate::manifest_io::{ManifestEncoder, ManifestOptions, ManifestReader, SpillStore, Spool};
 use crate::{Error, Limits, RangeReader, Result};
 use std::collections::BTreeMap;
@@ -289,7 +289,7 @@ impl<W: Write> BlockingBuilder<W> {
     ) -> Result<Self> {
         // Enforce the same restricted CBOR values before emitting payloads.
         let root = crate::manifest::ManifestRoot {
-            required_features: vec![],
+            requires: vec![],
             entry_count: 0,
             extensions,
         };
@@ -770,7 +770,7 @@ impl<R: RangeReader> BlockingArchive<R> {
     }
 
     /// Validate and stream physical payloads. Output is provisional until this
-    /// call succeeds; external payloads are pointer text, not original content.
+    /// call succeeds; external payloads are pointer JSON, not original content.
     pub fn visit_payloads(
         &mut self,
         visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
@@ -901,6 +901,9 @@ impl<R: RangeReader> BlockingArchive<R> {
                     }
                     if entry.is_external() {
                         Limits::check(size, self.options.limits.max_pointer_bytes, "pointer size")?;
+                        if size == 0 {
+                            return Err(Error::MalformedPointer("empty pointer payload".into()));
+                        }
                     }
                     let padded = size.checked_add(511).ok_or(Error::Range)? / 512 * 512;
                     headers.clear();
@@ -949,8 +952,10 @@ impl<R: RangeReader> BlockingArchive<R> {
                 }
                 if current.remaining == 0 && current.padding == 0 {
                     if current.entry.is_external() {
-                        if decode_pointer(&current.pointer)? != current.entry.extents {
-                            return Err(Error::TarTocMismatch("pointer text/reference"));
+                        if decode_pointer_bounded(&current.pointer, current.entry.extents.len())?
+                            != current.entry.extents
+                        {
+                            return Err(Error::TarTocMismatch("pointer JSON/reference"));
                         }
                     } else if !normalized_extents(&current.extents)
                         .eq(normalized_extents(&current.entry.extents))
@@ -1394,7 +1399,7 @@ mod tests {
             &raw[5..11]
         );
         assert_eq!(
-            decode_pointer(&encode_pointer(&entry.extents).unwrap()).unwrap(),
+            crate::manifest::decode_pointer(&encode_pointer(&entry.extents).unwrap()).unwrap(),
             entry.extents
         );
         reader.validate().unwrap();

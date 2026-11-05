@@ -254,4 +254,4 @@ with Archive.from_file("archive.zstar", **options) as archive:
     data = archive.read("hello.txt")
 ```
 
-The [format specification](/zstar/reference/spec/) defines the format and validation rules.
+The [format specification](/zstar/reference/spec/core/) defines the format and validation rules.

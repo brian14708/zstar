@@ -6,7 +6,10 @@ const docsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const repositoryRoot = path.resolve(docsRoot, '..');
 const contentRoot = path.join(docsRoot, 'src/content/docs');
 const pages = [
-  ['spec/v1.md', 'reference/spec', 'Zstar v1 format specification'],
+  ['spec/draft/README.md', 'reference/spec', 'Zstar draft specifications'],
+  ['spec/draft/core.md', 'reference/spec/core', 'Zstar core draft'],
+  ['spec/draft/external-content.md', 'reference/spec/external-content', 'Zstar external-content draft'],
+  ['spec/draft/catalog.md', 'reference/spec/catalog', 'Zstar catalog proposal'],
   ['python/README.md', 'sdks/python', 'Python SDK'],
   ['crates/zstar/README.md', 'sdks/rust', 'Rust SDK'],
   ['go/README.md', 'sdks/go', 'Go SDK'],
@@ -17,16 +20,19 @@ for (const [source, route, title] of pages) {
   let content = await readFile(path.join(repositoryRoot, source), 'utf8');
   // Keep the published title in frontmatter while preserving existing anchors.
   content = content.replace(/^# .+\r?\n/, '');
-  content = content.replaceAll('(../spec/v1.md)', '(/zstar/reference/spec/)');
-  content = content.replaceAll(
-    'https://github.com/brian14708/zstar/blob/main/spec/v1.md',
-    '/zstar/reference/spec/',
-  );
   // README links point to repository sources; published links point to routes.
   content = content.replace(/\]\(([^)]+)\)/g, (match, target) => {
-    if (/^(?:[a-z]+:|\/|#)/i.test(target)) return match;
-    const [file, fragment] = target.split('#');
-    const resolved = path.resolve(path.dirname(path.join(repositoryRoot, source)), file);
+    const repositoryPrefix = 'https://github.com/brian14708/zstar/blob/main/';
+    const localTarget = target.startsWith(repositoryPrefix)
+      ? target.slice(repositoryPrefix.length)
+      : target;
+    if (/^(?:[a-z]+:|\/|#)/i.test(localTarget)) return match;
+    const [file, fragment] = localTarget.split('#');
+    const resolved = target.startsWith(repositoryPrefix)
+      ? path.resolve(repositoryRoot, file)
+      : path.resolve(path.dirname(path.join(repositoryRoot, source)), file);
+    const generated = pages.find(([pageSource]) => path.resolve(repositoryRoot, pageSource) === resolved);
+    if (generated) return `](/zstar/${generated[1]}/${fragment ? `#${fragment}` : ''})`;
     const relative = path.relative(contentRoot, resolved);
     if (relative.startsWith('..') || !/\.mdx?$/.test(relative)) return match;
     const route = relative.replace(/\.mdx?$/, '').split(path.sep).join('/');

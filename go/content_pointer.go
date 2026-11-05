@@ -2,9 +2,12 @@ package zstar
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"math"
+	"slices"
 	"strconv"
-	"strings"
+	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -25,7 +28,6 @@ func validateObjectExtents(extents []Extent) error {
 			return rejected(CategoryMalformedPointer, "file size overflow")
 		}
 		total += e.Size
-
 	}
 	return nil
 }
@@ -79,58 +81,124 @@ func DecodeContentReference(raw []byte) ([]Extent, error) {
 	return out, validateObjectExtents(out)
 }
 
-// EncodeContentPointer omits whole-file OID, file size and zero offsets.
+// EncodeContentPointer serializes JSON chunks, omitting zero offsets.
 func EncodeContentPointer(extents []Extent) ([]byte, error) {
 	if err := validateObjectExtents(extents); err != nil {
 		return nil, err
 	}
-	var out strings.Builder
-	out.WriteString("version zstar-pointer-v1\n")
-	for _, e := range extents {
-		out.WriteString("chunk ")
-		out.WriteString(e.Source.address)
-		out.WriteByte(' ')
-		out.WriteString(strconv.FormatUint(e.Size, 10))
-		out.WriteByte(' ')
-		out.WriteString(strconv.FormatUint(e.EncodedSize, 10))
-		if e.Offset != 0 {
-			out.WriteByte(' ')
-			out.WriteString(strconv.FormatUint(e.Offset, 10))
-		}
-		out.WriteByte('\n')
+	type chunk struct {
+		Source      string `json:"source"`
+		Size        uint64 `json:"size"`
+		EncodedSize uint64 `json:"encoded_size"`
+		Offset      uint64 `json:"offset,omitempty"`
 	}
-	return []byte(out.String()), nil
+	pointer := struct {
+		Version string  `json:"version"`
+		Chunks  []chunk `json:"chunks"`
+	}{Version: "zstar-pointer-v1", Chunks: make([]chunk, len(extents))}
+	for i, e := range extents {
+		pointer.Chunks[i] = chunk{e.Source.address, e.Size, e.EncodedSize, e.Offset}
+	}
+	return json.Marshal(pointer)
 }
 
-// DecodeContentPointer decodes and validates canonical external pointer text.
-func DecodeContentPointer(raw []byte) ([]Extent, error) {
-	if !bytes.HasPrefix(raw, []byte("version zstar-pointer-v1\n")) || len(raw) == 0 || raw[len(raw)-1] != '\n' {
-		return nil, rejected(CategoryMalformedPointer, "pointer header or length")
+// pointerFields reads a JSON object without accepting duplicate or unknown keys.
+func pointerFields(raw []byte, allowed ...string) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, rejected(CategoryMalformedPointer, "pointer object")
 	}
-	lines := strings.Split(string(raw[len("version zstar-pointer-v1\n"):len(raw)-1]), "\n")
-	var out []Extent
-	for _, line := range lines {
-		fields := strings.Split(line, " ")
-		if len(fields) < 4 || len(fields) > 5 || fields[0] != "chunk" {
-			return nil, rejected(CategoryMalformedPointer, "chunk grammar")
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, rejected(CategoryMalformedPointer, "pointer key")
 		}
-		source, err := ParseObjectSource(fields[1])
+		name, ok := key.(string)
+		if !ok {
+			return nil, rejected(CategoryMalformedPointer, "pointer key")
+		}
+		if _, duplicate := fields[name]; !slices.Contains(allowed, name) || duplicate {
+			return nil, rejected(CategoryMalformedPointer, "unknown or duplicate pointer field")
+		}
+		var value json.RawMessage
+		if err = decoder.Decode(&value); err != nil {
+			return nil, rejected(CategoryMalformedPointer, "pointer value")
+		}
+		fields[name] = value
+	}
+	if _, err = decoder.Token(); err != nil {
+		return nil, rejected(CategoryMalformedPointer, "pointer object end")
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		return nil, rejected(CategoryMalformedPointer, "pointer trailing bytes")
+	}
+	return fields, nil
+}
+
+// DecodeContentPointer parses strict JSON chunks with exact uint64 values.
+func DecodeContentPointer(raw []byte) ([]Extent, error) {
+	return decodeContentPointer(raw, math.MaxInt)
+}
+
+func decodeContentPointer(raw []byte, maximumChunks int) ([]Extent, error) {
+	if !utf8.Valid(raw) {
+		return nil, rejected(CategoryMalformedPointer, "pointer UTF-8")
+	}
+	fields, err := pointerFields(raw, "version", "chunks")
+	if err != nil {
+		return nil, err
+	}
+	var version string
+	if err = json.Unmarshal(fields["version"], &version); err != nil || version != "zstar-pointer-v1" {
+		return nil, rejected(CategoryMalformedPointer, "pointer version")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(fields["chunks"]))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('[') {
+		return nil, rejected(CategoryMalformedPointer, "pointer chunks")
+	}
+	var out []Extent
+	for decoder.More() {
+		if len(out) == maximumChunks {
+			return nil, rejected(CategoryMalformedPointer, "pointer chunk count exceeds manifest")
+		}
+		var chunk json.RawMessage
+		if err = decoder.Decode(&chunk); err != nil {
+			return nil, rejected(CategoryMalformedPointer, "pointer chunk")
+		}
+		fields, err := pointerFields(chunk, "source", "size", "encoded_size", "offset")
+		if err != nil {
+			return nil, err
+		}
+		var address string
+		if err = json.Unmarshal(fields["source"], &address); err != nil {
+			return nil, rejected(CategoryMalformedPointer, "pointer source")
+		}
+		source, err := ParseObjectSource(address)
 		if err != nil {
 			return nil, &FormatError{Category: CategoryMalformedPointer, Cause: err}
 		}
 		e := Extent{Source: source}
-		values := []*uint64{&e.Size, &e.EncodedSize, &e.Offset}
-		for i, text := range fields[2:] {
-			n, err := strconv.ParseUint(text, 10, 64)
-			if err != nil || strconv.FormatUint(n, 10) != text {
-				return nil, rejected(CategoryMalformedPointer, "canonical integer")
+		for _, field := range [...]struct {
+			name   string
+			target *uint64
+		}{{"size", &e.Size}, {"encoded_size", &e.EncodedSize}, {"offset", &e.Offset}} {
+			value, exists := fields[field.name]
+			if field.name == "offset" && !exists {
+				continue
 			}
-			*values[i] = n
-		}
-		if len(fields) == 5 && e.Offset == 0 {
-			return nil, rejected(CategoryMalformedPointer, "explicit default offset")
+			n, err := strconv.ParseUint(string(value), 10, 64)
+			if err != nil || n == 0 || strconv.FormatUint(n, 10) != string(value) {
+				return nil, rejected(CategoryMalformedPointer, "pointer positive uint64")
+			}
+			*field.target = n
 		}
 		out = append(out, e)
+	}
+	if _, err = decoder.Token(); err != nil {
+		return nil, rejected(CategoryMalformedPointer, "pointer chunks end")
 	}
 	return out, validateObjectExtents(out)
 }

@@ -26,4 +26,9 @@ support local files, HTTP ranges, and S3.
 ## Explore the reference
 
 See the [Python API reference](/zstar/api/python/) for methods and options, or the
-[v1 specification](reference/spec/) for format and validation rules.
+[draft specifications](reference/spec/) for the [core format](reference/spec/core/),
+[external-content extension](reference/spec/external-content/), and informative
+[CAS storage appendix](reference/spec/external-content/#appendix-cas-storage).
+
+The [catalog proposal](reference/spec/catalog/) describes named JSON collections
+of CAS-stored archive layers; catalog operations remain unimplemented.

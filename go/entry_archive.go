@@ -145,7 +145,7 @@ func (w *EntryArchiveWriter) append(data []byte) error {
 }
 
 // Add consumes exactly physicalSize bytes for an inline regular file. For an
-// external entry, physicalSize must be zero and the canonical pointer text is
+// external entry, physicalSize must be zero and the pointer JSON is
 // generated from its extents. Non-files also require physicalSize zero.
 // Invalid arguments are rejected without side effects and do not poison the
 // writer; I/O, body-read and budget failures after output begins are sticky.

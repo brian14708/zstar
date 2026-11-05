@@ -199,18 +199,18 @@ impl<W: Write> ManifestEncoder<W> {
     )]
     pub fn finish(
         mut self,
-        mut required_features: Vec<String>,
+        mut requires: Vec<String>,
         extensions: BTreeMap<String, Value>,
     ) -> Result<(W, Footer)> {
         self.validate_target()?;
-        required_features.retain(|s| s != "external-content");
+        requires.retain(|s| s != "external-content");
         if self.external {
-            required_features.push("external-content".into());
+            requires.push("external-content".into());
         }
-        required_features.sort();
-        required_features.dedup();
+        requires.sort();
+        requires.dedup();
         let root = ManifestRoot {
-            required_features,
+            requires,
             entry_count: self.count,
             extensions,
         };
@@ -268,7 +268,7 @@ impl<W: Write> ManifestEncoder<W> {
             .collect();
         fields.extend([
             ("version", RootField::Version),
-            ("required_features", RootField::Features),
+            ("requires", RootField::Features),
         ]);
         fields.sort_unstable_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
         let mut raw = Vec::new();
@@ -280,8 +280,8 @@ impl<W: Write> ManifestEncoder<W> {
             match value {
                 RootField::Version => crate::cbor::append_head(&mut raw, 0, 1),
                 RootField::Features => {
-                    crate::cbor::append_head(&mut raw, 4, root.required_features.len() as u64);
-                    for feature in &root.required_features {
+                    crate::cbor::append_head(&mut raw, 4, root.requires.len() as u64);
+                    for feature in &root.requires {
                         crate::cbor::append_text(&mut raw, feature);
                     }
                 }
@@ -712,10 +712,7 @@ mod tests {
                 .collect();
             fields.extend([
                 (Value::Text("version".into()), Value::Integer(1.into())),
-                (
-                    Value::Text("required_features".into()),
-                    Value::Array(features),
-                ),
+                (Value::Text("requires".into()), Value::Array(features)),
             ]);
             let mut expected = crate::cbor::encode(&Value::Map(fields)).unwrap();
             expected.extend(crate::cbor::encode(&entry.to_value()).unwrap());

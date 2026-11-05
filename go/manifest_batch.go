@@ -20,7 +20,7 @@ type ReadRequest struct {
 
 // ReadReport describes selected content only. Successful reads always
 // authenticate metadata and check archive data-frame checksums; they never
-// establish that unread tar headers, pointer text or end markers are valid.
+// establish that unread tar headers, pointer JSON or end markers are valid.
 type ReadReport struct {
 	MetadataAuthenticated        bool     `json:"metadata_authenticated"`
 	FullArchiveValidated         bool     `json:"full_archive_validated"`

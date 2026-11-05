@@ -42,7 +42,7 @@ func (m *Manifest) validateEntries(ctx context.Context) error {
 		}
 		external = external || entry.External()
 	}
-	if external != (len(m.requiredFeatures) != 0) {
+	if external != (len(m.requires) != 0) {
 		return rejected(CategoryMalformedTOC, "manifest required feature")
 	}
 	return nil

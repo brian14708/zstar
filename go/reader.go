@@ -167,7 +167,7 @@ func (r *Reader) Verify(ctx context.Context, externalClosure bool) (Verification
 
 // VisitPayloads validates physical content while invoking borrowed payload
 // callbacks. Bytes are valid only until callback return and output remains
-// provisional until success. External payloads are pointer text; directories
+// provisional until success. External payloads are pointer JSON; directories
 // and symlinks yield no payload. Callbacks must not close the reader.
 func (r *Reader) VisitPayloads(ctx context.Context, visit func(Entry, []byte) error) (ArchiveReport, error) {
 	return r.manifest.VisitPayloads(ctx, visit)

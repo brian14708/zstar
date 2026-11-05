@@ -7,8 +7,8 @@ fn header() -> Vec<u8> {
     let mut out = vec![0xa2, 0x67];
     out.extend(b"version");
     out.push(1);
-    out.push(0x71);
-    out.extend(b"required_features");
+    out.push(0x68);
+    out.extend(b"requires");
     out.push(0x80);
     out
 }

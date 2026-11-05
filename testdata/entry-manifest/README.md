@@ -32,3 +32,18 @@ Checksum-mismatch cases for metadata, archive data, and external objects require
 `integrity-failure`. Missing checksums and malformed frame encodings retain their
 structural failure categories. Valid checksummed and checksum-optional metadata
 and object fixtures exercise the corresponding positive paths across all SDKs.
+
+Manifest headers use `requires`. The empty and thin archives cover empty and
+nonempty declarations; `invalid/missing-requires.zstar` omits the field. The
+`legacy-required-features` cases reject the obsolete key both alone and alongside
+`requires`. Header edits preserve each fixture's frame properties, segmentation,
+and intended defect; archive digests in `manifest.json` cover the updated bytes.
+
+External file payloads use JSON pointers exclusively. Thin and extent-limit
+fixtures were migrated independently with Python's standard-library JSON and
+Zstandard codecs, preserving CBOR manifests and updating tar sizes, checksums,
+footer positions, and archive digests. Existing pointer fixtures cover malformed
+fields and manifest agreement. Three new fixtures cover valid JSON whitespace
+without a final newline, rejection of legacy text, and the empty-payload
+regression. The empty-payload cases retain metadata, selective-read, and full
+validation checks to verify their different validation scopes.
