@@ -5,7 +5,7 @@ title: "Read an S3 archive with Python"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../python/examples/tutorial_s3.py?raw";
 
-Create the archive from the [local-file tutorial](/zstar/tutorials/python/first-archive/),
+Create the archive from the [direct archive tutorial](/zstar/tutorials/python/advanced-archive/),
 upload it to an S3 bucket, and read a file and byte range from it. In S3, a
 stored file is called an **object**, and its name is called a **key**. The
 example deletes the uploaded object when finished.
@@ -55,8 +55,8 @@ profiles, or instance roles on its own. `AWS_SESSION_TOKEN` is optional.
 
 ## Create and upload the archive
 
-The complete example generates the same `example.txt` contents as the first
-tutorial: `Hello from Zstar\n`. It finalizes the archive before uploading it to a
+The complete example generates the same `example.txt` contents as the direct
+archive tutorial: `Hello from Zstar\n`. It finalizes the archive before uploading it to a
 unique key under `zstar-tutorial/`.
 
 <Example source={source} lang="python" region="upload" />

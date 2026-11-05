@@ -53,6 +53,7 @@ export default defineConfig({
           items: [
             { label: 'Overview', link: '/sdks/python/' },
             { label: 'Create your first archive', link: '/tutorials/python/first-archive/' },
+            { label: 'Advanced archive creation', link: '/tutorials/python/advanced-archive/' },
             { label: 'Read from S3', link: '/tutorials/python/s3/' },
             { label: 'Advanced usage', link: '/guides/python/configuration/' },
           ],

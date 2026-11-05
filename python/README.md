@@ -6,11 +6,10 @@ Read and write indexed `.tar.zst` archives with Python 3.11 or later.
 pip install zstar-py
 ```
 
-Import `zstar` for archive readers and writers, or use fsspec for filesystem
-operations. The package includes fsspec; install optional storage backends
-separately.
+Use fsspec for filesystem operations. The package includes fsspec; install optional
+storage backends separately. Import `zstar` for direct archive readers and writers.
 
-Start with [your first archive](https://brian14708.github.io/zstar/tutorials/python/first-archive/),
+Start with [your first archive using fsspec](https://brian14708.github.io/zstar/tutorials/python/first-archive/),
 then [upload and read an S3 archive](https://brian14708.github.io/zstar/tutorials/python/s3/).
 Both tutorials create their own data; no input files are needed.
 
@@ -22,6 +21,9 @@ See [filesystem and storage configuration](https://brian14708.github.io/zstar/gu
 for async use, caching, S3 backends, and external objects.
 
 ## Raw archive interface
+
+See [advanced archive creation](https://brian14708.github.io/zstar/tutorials/python/advanced-archive/)
+for a runnable example using the direct reader and writer APIs.
 
 Use `Archive` and `AsyncArchive` to read, or `ArchiveWriter` and
 `AsyncArchiveWriter` to write. `ZstarError` reports failures, and `zstar.types`

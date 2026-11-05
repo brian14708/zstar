@@ -567,10 +567,13 @@ def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
                 assert [name async for name in archive.names("f01")] == [
                     f"f{i:04}" for i in range(100, 130)
                 ]
-                members = [info async for info in archive.members()]
+                with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
+                    members = [info async for info in archive.members()]
                 assert len(members) == 131
                 check(members[0])
-                check(await archive.getinfo("f0000"))
+                with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
+                    info = await archive.getinfo("f0000")
+                check(info)
                 assert (await archive.getinfo("link")).linkname == "./f0000"
                 with pytest.raises(KeyError):
                     await archive.getinfo("missing")
@@ -581,10 +584,13 @@ def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
         else:
             with zstar.Archive(data, memory_bytes=1) as archive:
                 assert list(archive.names("f01")) == [f"f{i:04}" for i in range(100, 130)]
-                members = list(archive.members())
+                with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
+                    members = list(archive.members())
                 assert len(members) == 131
                 check(members[0])
-                check(archive.getinfo("f0000"))
+                with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
+                    info = archive.getinfo("f0000")
+                check(info)
                 assert archive.getinfo("link").linkname == "./f0000"
                 with pytest.raises(KeyError):
                     archive.getinfo("missing")

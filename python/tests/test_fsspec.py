@@ -215,7 +215,12 @@ def test_external_members_expose_logical_bytes(thin_data, corpus_dir):
     )
     fs = ZstarFileSystem(fo=io.BytesIO(thin_data), external=objects)
     try:
-        assert fs.info("hello.txt")["size"] == 6
+        with pytest.warns(UserWarning, match="TarInfo omits .*extensions") as recorded:
+            assert fs.info("hello.txt")["size"] == 6
+        assert {str(warning.message) for warning in recorded} == {
+            "TarInfo omits archive-level Zstar extensions; rewriting metadata loses extensions",
+            "TarInfo omits Zstar manifest extensions; rewriting this metadata loses extensions",
+        }
         with fs.open("hello.txt", block_size=3) as member:
             assert member.read(2) == b"he"
             member.seek(1)

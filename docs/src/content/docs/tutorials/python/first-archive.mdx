@@ -3,59 +3,64 @@ title: "Create your first archive with Python"
 ---
 
 import Example from "../../../../components/Example.astro";
-import source from "../../../../../../python/examples/tutorial_file.py?raw";
+import source from "../../../../../../python/examples/tutorial_fsspec.py?raw";
 
-Create an archive containing a small text file, save it as `example.zstar`,
-and read it back. Then read just the first five bytes and check the archive for
-errors.
+Create an archive with fsspec's filesystem interface, then list and read its
+members. Use this interface for standard filesystem operations such as opening
+files, listing directories, and reading bytes.
 
-The example creates the text for you, so you do not need any input files.
-`example.txt` is the file inside the archive; `example.zstar` is the archive
-saved in your current directory. Running the example again replaces it.
+The example creates its own data. It writes `example-fsspec.zstar` in your current
+directory; running it again replaces that archive.
 
 ## Set up
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then save
-the complete example below as `tutorial_file.py` and run:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), save the
+complete example below as `tutorial_fsspec.py`, and run:
 
 ```sh
-uv run tutorial_file.py
+uv run tutorial_fsspec.py
 ```
 
 The script declares Python 3.11 or later and its dependencies with PEP 723
-metadata. uv installs them in an isolated environment automatically.
+metadata. uv installs them automatically. `zstar-py` includes fsspec and registers
+the `zstar` protocol, so no separate fsspec installation is needed.
 
-## Write the archive
+## Create the archive
 
-`ArchiveWriter.from_file()` opens the archive for writing. `write_bytes()` adds
-a file named `example.txt` with the text `Hello from Zstar` and a newline.
-Leaving the `with` block finishes writing the archive and closes it.
+Open a `zstar` filesystem with `mode="w"`. `fo` names the output archive;
+paths passed to filesystem methods name members inside it.
+
+Use `fs.open(..., "wt", encoding="utf-8")` to write text, or `pipe_file()` to
+add bytes. Parent directories are created automatically. Close each member
+before writing the next one. Leaving the outer `with` block finalizes the
+archive. Append and update modes are unsupported.
 
 <Example source={source} lang="python" region="create" />
 
-## Read a file and a byte range
+## List and read members
 
-Reopen the archive with `Archive.from_file()`. `read()` returns all the bytes
-of `example.txt`. `read_range()` returns bytes from the start position up to,
-but not including, the end position: `0, 5` selects `Hello`.
-
-The assertions check that both reads return the expected text.
+Reopen the filesystem in its default read mode. `ls()` lists a directory;
+`detail=False` returns names. Open a member in text mode to decode UTF-8, or
+use `cat_file()` to read its bytes.
 
 <Example source={source} lang="python" region="read" />
 
-## Verify the archive
+## Open a member by URL
 
-`verify()` checks the entire archive for errors, including content you have
-not read. Call it inside the `with` block, before the reader closes.
+Resolve a chained URL `zstar://<member>::<archive>` with
+`fsspec.core.url_to_fs()` to get a filesystem and member path. The `with` block
+closes both the member and the filesystem. Binary mode returns bytes, and
+`read(5)` selects the first five bytes. Keep a filesystem open as above when
+reading multiple members to reuse the archive's metadata.
 
-<Example source={source} lang="python" region="verify" />
+<Example source={source} lang="python" region="url" />
 
 You should see:
 
 ```text
+['docs/hello.txt']
 Hello from Zstar
-Hello
-Archive verified
+Read through a chained URL
 ```
 
 ## Complete example
@@ -67,14 +72,18 @@ Archive verified
 
 </details>
 
-[View the source](https://github.com/brian14708/zstar/blob/main/python/examples/tutorial_file.py).
-If you have cloned the Zstar repository, run this from its root directory:
+[View the source](https://github.com/brian14708/zstar/blob/main/python/examples/tutorial_fsspec.py).
+From a repository checkout, run:
 
 ```sh
-uv run python/examples/tutorial_file.py
+uv run python/examples/tutorial_fsspec.py
 ```
 
 ## Next
 
-[Upload and read an S3 archive](/zstar/tutorials/python/s3/), or see
-[advanced usage](/zstar/guides/python/configuration/) for storage and resource limits.
+Continue with [advanced archive creation](/zstar/tutorials/python/advanced-archive/)
+for the direct writer API, byte ranges, and archive verification, or
+[upload and read an S3 archive](/zstar/tutorials/python/s3/).
+
+See [advanced usage](/zstar/guides/python/configuration/#filesystem-interface)
+for async access, S3 backends, caching, and external objects.
