@@ -42,8 +42,8 @@ func TestBoundedSingleFrameDecodeAndChecksums(t *testing.T) {
 	}
 	corrupt := bytes.Clone(encoded)
 	corrupt[len(corrupt)-1] ^= 1
-	if _, err := decodeBoundedFrame(corrupt, 0, len(raw), 17<<20); err == nil {
-		t.Fatal("checksum corruption accepted")
+	if _, err := decodeBoundedFrame(corrupt, 0, len(raw), 17<<20); ErrorCategory(err) != CategoryIntegrityFailure {
+		t.Fatalf("checksum corruption category: %v", err)
 	}
 }
 

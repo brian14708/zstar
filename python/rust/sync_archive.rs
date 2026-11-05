@@ -42,6 +42,10 @@ impl SyncArchive {
 }
 #[pymethods]
 impl SyncArchive {
+    #[getter]
+    fn _has_root_extensions(&self) -> PyResult<bool> {
+        Ok(!self.reader()?.reader.root_extensions().is_empty())
+    }
     fn _member_info(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyAny>>> {
         let lease = self.reader()?;
         block_on(py, lease.member_info(path))
@@ -56,9 +60,17 @@ impl SyncArchive {
     fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<SyncEntries> {
         Self::projected_entries(slf, prefix, reader::MetadataProjection::Name)
     }
-    fn _open_member(&self, py: Python<'_>, path: &str) -> PyResult<reader::MemberCursor> {
+    fn _open_member(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        cache_bytes: usize,
+    ) -> PyResult<reader::MemberCursor> {
         let lease = self.reader()?;
-        block_on(py, reader::MemberCursor::open(&lease.reader, path))
+        block_on(
+            py,
+            reader::MemberCursor::open(&lease.reader, path, cache_bytes),
+        )
     }
     fn _read_member(
         &self,

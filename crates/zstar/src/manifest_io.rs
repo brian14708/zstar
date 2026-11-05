@@ -411,7 +411,7 @@ impl ManifestIngest {
         let raw =
             crate::decode_bounded_with_limits(encoded, limit, limits).map_err(
                 |error| match error {
-                    crate::Error::Budget(_) => error,
+                    crate::Error::Budget(_) | crate::Error::Integrity => error,
                     other => invalid(&other.to_string()),
                 },
             )?;

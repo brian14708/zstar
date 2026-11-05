@@ -617,3 +617,88 @@ async fn cancelling_physical_verification_drops_pending_source_reads() {
         payload()[..1]
     );
 }
+
+#[tokio::test]
+async fn modified_entries_cannot_become_authenticated_cursors() {
+    let archive = Archive::from_bytes(fixture().await).await.unwrap();
+    let mut entry = archive.entry("dir/file").await.unwrap().unwrap();
+    entry.extents[0].offset += 1;
+    assert!(matches!(
+        archive.cursor_from_entry(entry).await,
+        Err(Error::Unsupported(_))
+    ));
+}
+
+struct CountedSource {
+    bytes: Bytes,
+    calls: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl AsyncRangeReader for CountedSource {
+    async fn size(&self) -> Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.bytes.read_range(range).await
+    }
+}
+
+#[tokio::test]
+async fn stream_cache_reuses_validated_sources_and_obeys_its_budget() {
+    let mut builder = Builder::new(Vec::new());
+    builder
+        .append_bytes("file", &vec![7; 16_384])
+        .await
+        .unwrap();
+    let source = Arc::new(CountedSource {
+        bytes: builder.finish().await.unwrap().into(),
+        calls: AtomicUsize::new(0),
+    });
+    let archive = Archive::open(source.clone()).await.unwrap();
+    for (budget, expected) in [(2 << 20, 1), (0, 128), (1024, 128)] {
+        let mut file = archive
+            .open_file("file")
+            .await
+            .unwrap()
+            .with_cache_bytes(budget);
+        source.calls.store(0, Ordering::SeqCst);
+        for _ in 0..128 {
+            let mut byte = [0];
+            file.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [7]);
+        }
+        assert_eq!(source.calls.load(Ordering::SeqCst), expected);
+        file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [7]);
+    }
+}
+
+#[tokio::test]
+async fn standalone_cursor_cache_never_mixes_archive_sessions() {
+    let mut first = Builder::new(Vec::new());
+    first.append_bytes("file", b"aaaaaa").await.unwrap();
+    let first = Archive::from_bytes(first.finish().await.unwrap())
+        .await
+        .unwrap();
+    let mut second = Builder::new(Vec::new());
+    second.append_bytes("file", b"bbbbbb").await.unwrap();
+    let second = Archive::from_bytes(second.finish().await.unwrap())
+        .await
+        .unwrap();
+    let cursor = zstar::FileCursor::new(first.entry("file").await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        cursor.read(&first, 0, 6).await.unwrap(),
+        b"aaaaaa".as_slice()
+    );
+    assert_eq!(
+        cursor.read(&second, 0, 6).await.unwrap(),
+        b"bbbbbb".as_slice()
+    );
+    assert_eq!(
+        cursor.read(&first, 0, 6).await.unwrap(),
+        b"aaaaaa".as_slice()
+    );
+}

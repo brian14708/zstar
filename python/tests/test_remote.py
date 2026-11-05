@@ -472,7 +472,7 @@ def test_remote_external_policy_cannot_disable_data_checksums(serve, verify_exte
             archive = await zstar.AsyncArchive.from_url(url, verify_external=verify_external)
             with pytest.raises(zstar.ZstarError) as caught:
                 await archive.read("a-b")
-            assert caught.value.category == "malformed-frame"
+            assert caught.value.category == "integrity-failure"
 
         asyncio.run(exercise())
 
@@ -639,7 +639,7 @@ def test_native_http_sync_and_fsspec_read_without_head(serve):
         with zstar.Archive.from_url(url) as archive, archive.open("hello") as member:
             assert member.read(5) == b"hello"
             assert member.read() == b" world"
-        assert len(calls) == 5
+        assert len(calls) == 4  # The second member read reuses its decoded source.
         fs = ZstarFileSystem(fo=url, target_options={"headers": {"X-Test": "value"}})
         try:
             with fs.open("hello", block_size=3) as member:

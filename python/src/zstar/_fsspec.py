@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import io
+import os
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,43 @@ def _write_all(output: BinaryIO, data: bytes) -> None:
         if count <= 0 or count > len(remaining):
             raise OSError("invalid output stream write count")
         remaining = remaining[count:]
+
+
+def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
+    """Walk pinned directory descriptors; reject symlinks at every component."""
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise NotImplementedError(
+            "confined local downloads require descriptor-relative no-follow I/O"
+        )
+    # Resolve '.' and '..' lexically before opening anything, without following links.
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts[1:]
+    fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parents = parts if directory else parts[:-1]
+        for component in parents:
+            with suppress(FileExistsError):
+                os.mkdir(component, dir_fd=fd)
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if directory:
+            return None
+        leaf = os.open(
+            parts[-1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666, dir_fd=fd
+        )
+        try:
+            import stat
+
+            if not stat.S_ISREG(os.fstat(leaf).st_mode):
+                raise OSError("local download destination must be a regular file")
+            os.ftruncate(leaf, 0)
+            return os.fdopen(leaf, "wb")
+        except BaseException:
+            os.close(leaf)
+            raise
+    finally:
+        os.close(fd)
 
 
 def _range_bounds(size: int, start: int | None, end: int | None) -> tuple[int, int]:
@@ -369,6 +407,12 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     disk caching. Async backends use direct range I/O without a stream cache.
     Supplied streams are owned and must remain immutable. Loading
     is lazy; concurrent requests share one load, and close drains admitted work.
+
+    Member streams retain one decoded source within ``member_cache_bytes``
+    (2 MiB by default, including cache bookkeeping); zero disables retention.
+    Entry metadata and returned buffers are separate. Local downloads reject
+    destination symlinks and require POSIX descriptor-relative no-follow I/O.
+    Downloads copy bytes and reject symlink members; they do not restore metadata.
     """
 
     protocol = "zstar"
@@ -390,6 +434,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         asynchronous: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
         member_spool_bytes: int = 8 << 20,
+        member_cache_bytes: int = 2 << 20,
         writer_options: WriterOptions | None = None,
         reader_options: ReaderOptions | None = None,
         **kwargs: object,
@@ -410,6 +455,13 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                 "fs requires an archive path and is already configured; omit target_options"
             )
         self.fo, self.target_protocol, self.mode = fo, target_protocol, mode
+        if (
+            isinstance(member_cache_bytes, bool)
+            or not isinstance(member_cache_bytes, int)
+            or member_cache_bytes < 0
+        ):
+            raise ValueError("member_cache_bytes must be a nonnegative integer")
+        self.member_cache_bytes = member_cache_bytes
         self.member_spool_bytes = member_spool_bytes
         self._reader_options = cast(ReaderOptions, dict(reader_options or {}))
         if "resolver" in self._reader_options:
@@ -734,7 +786,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         if not member:
             raise IsADirectoryError(path)
         archive = await self._get_archive()
-        context = archive.open(member)
+        context = archive.open(member, cache_bytes=self.member_cache_bytes)
         try:
             stream = await context.__aenter__()
         except KeyError:
@@ -852,13 +904,13 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         except IsADirectoryError:
             if destination is None:
                 raise
-            await _writer_call(partial(destination.mkdir, parents=True, exist_ok=True))
+            await _writer_call(partial(_local_destination, destination, directory=True))
             return
         async with stream:
             if destination is not None:
-                await _writer_call(partial(destination.parent.mkdir, parents=True, exist_ok=True))
                 outfile = await _writer_call(
-                    partial(destination.open, "wb"), discard=lambda file: file.close()
+                    partial(_local_destination, destination),
+                    discard=lambda file: file.close() if file is not None else None,
                 )
             assert outfile is not None
             try:

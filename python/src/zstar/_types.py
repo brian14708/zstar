@@ -21,7 +21,7 @@ EntryTuple: TypeAlias = (
 """Lossless entry metadata, with an optional final attributes dictionary."""
 
 
-MemberMetadata: TypeAlias = tuple[str, int, int, int, int, int, int, str]
+MemberMetadata: TypeAlias = tuple[str, int, int, int, int, int, int, str, bool]
 """Name, kind, mode, uid, gid, nanosecond mtime, size, and symlink target."""
 
 

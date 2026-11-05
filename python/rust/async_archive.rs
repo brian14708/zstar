@@ -40,6 +40,10 @@ impl AsyncArchive {
 }
 #[pymethods]
 impl AsyncArchive {
+    #[getter]
+    fn _has_root_extensions(&self) -> PyResult<bool> {
+        Ok(!self.lease()?.reader.root_extensions().is_empty())
+    }
     fn _member_info<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -56,11 +60,20 @@ impl AsyncArchive {
     fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<AsyncEntries> {
         Self::projected_entries(slf, prefix, super::reader::MetadataProjection::Name)
     }
-    fn _open_member<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn _open_member<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        cache_bytes: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(super::reader::MemberCursor::open(&lease.reader, &path))
+                .run(super::reader::MemberCursor::open(
+                    &lease.reader,
+                    &path,
+                    cache_bytes,
+                ))
                 .await
         })
     }

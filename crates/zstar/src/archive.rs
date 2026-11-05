@@ -112,7 +112,7 @@ pub struct VerificationReport {
 pub struct ReadReport {
     /// Whether manifest authentication completed.
     pub metadata_authenticated: bool,
-    /// Selective reads do not claim full namespace or physical tar validation.
+    /// Selective reads do not claim physical tar validation.
     pub full_archive_validated: bool,
     /// Encoded offsets of the data frames checked.
     pub data_frames_checked: Vec<u64>,
@@ -407,18 +407,20 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     }
     /// Opens a borrowed cursor from metadata obtained from this archive.
     ///
-    /// The caller must supply this archive's unmodified entry. This avoids a
-    /// second metadata lookup after inspecting the entry kind.
+    /// The supplied metadata must match the authenticated entry at its path.
+    /// Metadata differing from the authenticated entry is rejected before content I/O.
     ///
     /// # Errors
     /// Returns an error for non-file entries or invalid extent selections.
     pub async fn cursor_from_entry(&self, entry: Entry) -> Result<crate::FileCursor> {
-        let mut cursor = if entry.extents.len() <= 64 {
-            crate::FileCursor::new(entry)?
-        } else {
-            self.metadata(move |_| crate::FileCursor::new(entry))
-                .await?
-        };
+        let mut cursor = self
+            .metadata(move |manifest| {
+                if manifest.range_entry(&entry.path).map(|(entry, _)| entry) != Some(&entry) {
+                    return Err(Error::Unsupported("entry does not match this archive"));
+                }
+                crate::FileCursor::new(entry)
+            })
+            .await?;
         cursor.owner = Some(Arc::downgrade(&self.manifest));
         Ok(cursor)
     }
@@ -731,6 +733,9 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .ok_or_else(|| Error::MissingEntry(path.into()))?
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
+    }
+    pub(crate) fn cursor_owner(&self) -> Weak<ManifestReader> {
+        Arc::downgrade(&self.manifest)
     }
     pub(crate) fn owns_cursor(&self, owner: &std::sync::Weak<ManifestReader>) -> bool {
         std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&self.manifest))
@@ -1542,7 +1547,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reader.read_range("a-b", 0..5).await,
-            Err(Error::MalformedFrame(_))
+            Err(Error::Integrity)
         ));
         let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/metadata-hash.zstar");
         assert!(

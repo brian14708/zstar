@@ -253,3 +253,16 @@ func TestArchiveDirectorySubtreeBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNamedVerificationScopes(t *testing.T) {
+	reader := testAPIReader(t, true)
+	for _, scope := range []VerificationScope{VerifyArchive, VerifyExternalClosure} {
+		report, err := reader.VerifyScope(context.Background(), scope)
+		if err != nil || !report.FullArchiveValidated || report.ExternalClosureValidated != (scope == VerifyExternalClosure) {
+			t.Fatalf("scope %v: %+v, %v", scope, report, err)
+		}
+	}
+	if _, err := reader.VerifyScope(context.Background(), VerificationScope(255)); ErrorCategory(err) != CategoryUnsupportedOperation {
+		t.Fatalf("invalid scope: %v", err)
+	}
+}

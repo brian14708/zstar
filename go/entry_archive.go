@@ -13,7 +13,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// EntryArchiveWriter emits checksummed data frames and a deterministic manifest
+// EntryArchiveWriter is the low-level encoder accepting manifest Entry values.
+// Prefer NewWriter with Header for ordinary archive creation.
+// It emits checksummed data frames and a deterministic manifest
 // sequence in bounded compressed segments.
 // Input paths may arrive in arbitrary order; tar follows insertion order. Metadata and transient frame
 // records spill to disk; no complete entry or frame table is kept in memory.

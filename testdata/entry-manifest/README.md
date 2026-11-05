@@ -27,3 +27,8 @@ historical names; over-limit cases now select a 16 MiB local window budget.
 These fixtures were generated independently with Python's standard-library
 `tarfile` and `compression.zstd` plus deterministic CBOR encoding; data frames
 include checksums and tar streams have exactly two terminal zero records.
+
+Checksum-mismatch cases for metadata, archive data, and external objects require
+`integrity-failure`. Missing checksums and malformed frame encodings retain their
+structural failure categories. Valid checksummed and checksum-optional metadata
+and object fixtures exercise the corresponding positive paths across all SDKs.

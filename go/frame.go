@@ -145,7 +145,7 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 	if expected == 0 {
 		raw, readErr := io.ReadAll(io.LimitReader(decoder, int64(decodedLimit)+1))
 		if readErr != nil {
-			return nil, readErr
+			return nil, frameDecodeError(readErr)
 		}
 		if len(raw) > decodedLimit {
 			return nil, rejected(CategoryResourceLimit, "decoded output limit")
@@ -169,7 +169,15 @@ func (d *frameDecoder) decode(encoded []byte, expected, decodedLimit, encodedLim
 			return raw[:n], nil
 		}
 		if readErr != nil {
-			return nil, readErr
+			return nil, frameDecodeError(readErr)
 		}
 	}
+}
+
+// Preserve codec integrity failures independently of frame structure errors.
+func frameDecodeError(err error) error {
+	if errors.Is(err, zstd.ErrCRCMismatch) {
+		return categorized(CategoryIntegrityFailure, err)
+	}
+	return err
 }

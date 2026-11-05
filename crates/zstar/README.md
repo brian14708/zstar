@@ -26,3 +26,9 @@ for features, credentials, ownership, and memory budgets.
 
 The [format specification](https://github.com/brian14708/zstar/blob/main/spec/v1.md)
 defines the wire format and validation rules.
+
+Member streams retain one decoded source within a configurable 2 MiB cache;
+use `with_cache_bytes(0)` to disable it. Authenticated cursors reject modified
+metadata. Filesystem extraction returns `ExtractReport`; inspect omitted metadata
+before treating restoration as complete. Distinguishable frame checksum failures
+return `Error::Integrity`.

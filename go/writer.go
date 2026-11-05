@@ -40,7 +40,8 @@ type WriterOptions struct {
 	Workers int
 }
 
-// Writer streams checksummed tar frames and bounded, spooled entry metadata.
+// Writer is the standard archive encoder. It streams checksummed tar frames
+// and bounded, spooled entry metadata.
 // Paths may arrive in any order with explicit ancestor directories. Close never
 // closes the destination. Methods are not concurrent; failures are sticky.
 type Writer struct{ engine *EntryArchiveWriter }

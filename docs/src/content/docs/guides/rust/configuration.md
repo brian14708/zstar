@@ -23,8 +23,9 @@ created the archive.
 
 Use `open_cursor()` for reusable positional member reads. A `FileCursor` borrows
 the archive on each read and supports concurrent reads without changing a stream
-position. After inspecting an entry, `cursor_from_entry()` avoids looking it up
-again; supply the unmodified entry from the same archive.
+position. `cursor_from_entry()` checks supplied metadata against the authenticated entry
+at that path and rejects changes. `FileCursor::new()` is a low-level selection
+constructor for caller-supplied metadata and does not establish membership.
 
 ## Features and storage
 
@@ -48,7 +49,41 @@ policies before constructing the builder.
 writer, and metadata budgets. Keep caller-owned sources immutable while a
 reader is in use.
 
+Member files and cursors retain at most one decoded source within a 2 MiB
+cache budget including bookkeeping. Use `with_cache_bytes(0)` to disable
+retention or select another budget. Entry metadata and returned buffers are
+separate. Larger sources are decoded and validated but are not retained.
+
+`fs::extract`, `extract_file`, and their options variants return `ExtractReport`.
+Inspect `is_lossless()` and `omitted`: ownership is never applied, and unauthorized
+set-id bits and unsupported symlink metadata are reported by field and count.
+
+External SHA-256 checking defaults to disabled. Opt in with
+`ReaderOptions { verify_external: true, ..Default::default() }`; metadata hashes,
+frame checksums, and extent bounds are always checked. Read and verification
+reports identify unchecked external objects.
+
 Manifest primitives and spool types are exported from the crate root.
+
+## Resource limits
+
+Frame and window limits default to zero (disabled), so defaults do not impose a
+finite aggregate content-memory ceiling. Peak content memory includes up to
+`concurrent_chunks` encoded inputs, complete decoded sources and codec workspaces,
+plus stream caches and returned buffers. Metadata spools and the retained index
+have separate budgets. For example:
+
+```rust
+let mut options = zstar::ReaderOptions::default();
+options.concurrent_chunks = 4;
+options.manifest.limits.max_frame_encoded_bytes = 64 << 20;
+options.manifest.limits.max_frame_decoded_bytes = 64 << 20;
+options.manifest.limits.max_window_bytes = 64 << 20;
+options.manifest.max_read_bytes = 8 << 20;
+```
+
+These are local resource policies, independent of wire validity. Spool limits
+exclude index memory and codec workspaces.
 
 From the repository root, run the examples with:
 

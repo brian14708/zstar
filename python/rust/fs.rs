@@ -108,28 +108,51 @@ fn extract(
     objects: Option<std::path::PathBuf>,
     allow_special_bits: bool,
     verify_external: bool,
-) -> PyResult<()> {
-    py.detach(|| -> zstar::fs::AnyResult<()> {
-        let mut archive = zstar::backend::BlockingArchive::open(
-            zstar::SliceReader::new(&data),
-            zstar::ManifestOptions::default(),
-        )?;
-        let objects = objects
-            .as_deref()
-            .map(zstar::fs::LocalObjects::open)
-            .transpose()?;
-        zstar::fs::extract_with_options(
-            &mut archive,
-            &destination,
-            objects,
-            zstar::fs::ExtractOptions {
-                allow_special_bits,
-                verify_external,
-                ..Default::default()
-            },
-        )
-    })
-    .map_err(filesystem_error)
+) -> PyResult<Py<pyo3::types::PyDict>> {
+    let report = py
+        .detach(|| -> zstar::fs::AnyResult<zstar::fs::ExtractReport> {
+            let mut archive = zstar::backend::BlockingArchive::open(
+                zstar::SliceReader::new(&data),
+                zstar::ManifestOptions::default(),
+            )?;
+            let objects = objects
+                .as_deref()
+                .map(zstar::fs::LocalObjects::open)
+                .transpose()?;
+            zstar::fs::extract_with_options(
+                &mut archive,
+                &destination,
+                objects,
+                zstar::fs::ExtractOptions {
+                    allow_special_bits,
+                    verify_external,
+                    ..Default::default()
+                },
+            )
+        })
+        .map_err(filesystem_error)?;
+    let result = pyo3::types::PyDict::new(py);
+    result.set_item("files", report.files)?;
+    result.set_item("directories", report.directories)?;
+    result.set_item("symlinks", report.symlinks)?;
+    result.set_item("lossless", report.is_lossless())?;
+    let omitted = pyo3::types::PyList::empty(py);
+    for item in report.omitted {
+        let field = match item.field {
+            zstar::fs::OmittedField::Ownership => "ownership",
+            zstar::fs::OmittedField::SpecialModeBits => "special-mode-bits",
+            zstar::fs::OmittedField::SymlinkMode => "symlink-mode",
+            zstar::fs::OmittedField::SymlinkTimes => "symlink-times",
+            _ => "unsupported-metadata",
+        };
+        let value = pyo3::types::PyDict::new(py);
+        value.set_item("field", field)?;
+        value.set_item("count", item.count)?;
+        value.set_item("examples", item.examples)?;
+        omitted.append(value)?;
+    }
+    result.set_item("omitted", omitted)?;
+    Ok(result.unbind())
 }
 #[expect(
     clippy::needless_pass_by_value,

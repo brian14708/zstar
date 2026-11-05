@@ -5,6 +5,7 @@ use bytes::Bytes;
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
@@ -16,9 +17,17 @@ struct FileSelection {
     entry: Entry,
     ends: Vec<u64>,
     size: u64,
+    cache_bytes: usize,
+    cache: Arc<Mutex<Option<CachedSource>>>,
+}
+struct CachedSource {
+    owner: Weak<crate::ManifestReader>,
+    key: Key,
+    bytes: Bytes,
 }
 impl FileSelection {
     fn new(entry: Entry) -> Result<Self> {
+        entry.validate(u64::MAX)?;
         let size = entry.size()?;
         let mut ends = Vec::new();
         ends.try_reserve_exact(entry.extents.len())
@@ -28,7 +37,13 @@ impl FileSelection {
             position = position.checked_add(extent.size).ok_or(Error::Range)?;
             ends.push(position);
         }
-        Ok(Self { entry, ends, size })
+        Ok(Self {
+            entry,
+            ends,
+            size,
+            cache_bytes: 2 << 20,
+            cache: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn extent_index(&self, offset: u64) -> usize {
@@ -72,20 +87,59 @@ impl FileSelection {
             }
             let extent = first.clone();
             let archive = archive.clone();
+            let cache = self.cache.clone();
+            let cache_bytes = self.cache_bytes;
             Ok(Box::pin(async move {
-                let raw = archive
-                    .content(&Key::of(&extent), extent.encoded_size, archive.resolver())
-                    .await?;
+                let key = Key::of(&extent);
+                let cached = {
+                    let mut cache = cache.lock().unwrap();
+                    if cache.as_ref().is_some_and(|cached| {
+                        archive.owns_cursor(&cached.owner) && cached.key == key
+                    }) {
+                        cache.as_ref().map(|cached| cached.bytes.clone())
+                    } else {
+                        *cache = None;
+                        None
+                    }
+                };
+                let raw = if let Some(raw) = cached {
+                    raw
+                } else {
+                    let raw = archive
+                        .content(&key, extent.encoded_size, archive.resolver())
+                        .await?;
+                    crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
+                    if raw.len().saturating_add(
+                        std::mem::size_of::<Mutex<Option<CachedSource>>>()
+                            + 2 * std::mem::size_of::<usize>(),
+                    ) <= cache_bytes
+                    {
+                        *cache.lock().unwrap() = Some(CachedSource {
+                            owner: archive.cursor_owner(),
+                            key,
+                            bytes: raw.clone(),
+                        });
+                    }
+                    raw
+                };
                 crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
                 let start = (extent.offset + within) as usize;
-                Ok(raw.slice(start..start + length))
+                let selected = raw.slice(start..start + length);
+                Ok(if length < raw.len() / 4 {
+                    Bytes::copy_from_slice(&selected)
+                } else {
+                    selected
+                })
             }))
         })();
         prepared.unwrap_or_else(|error| Box::pin(std::future::ready(Err(error))))
     }
 }
 
-/// Reusable random-access member cursor retaining owned metadata.
+/// Low-level random-access selection retaining caller-supplied metadata.
+///
+/// [`FileCursor::new`] does not authenticate its entry against an archive;
+/// prefer [`Archive::open_cursor`] for authenticated member cursors.
 /// The caller supplies the live archive for each operation. Positional reads
 /// borrow the cursor immutably and can run concurrently.
 pub struct FileCursor {
@@ -93,6 +147,16 @@ pub struct FileCursor {
     selection: FileSelection,
 }
 impl FileCursor {
+    /// Sets the retained decoded-source budget, including cache bookkeeping.
+    /// The default is 2 MiB. Zero disables retention. Entry metadata and
+    /// returned buffers are separate; larger sources are decoded without retention.
+    #[must_use]
+    pub fn with_cache_bytes(mut self, bytes: usize) -> Self {
+        self.selection.cache_bytes = bytes;
+        self.selection.cache = Arc::new(Mutex::new(None));
+        self
+    }
+
     /// Returns the logical payload length in bytes.
     #[must_use]
     pub const fn size(&self) -> u64 {
@@ -143,7 +207,7 @@ impl FileCursor {
 /// permitted; negative and overflowing positions return an invalid-input error.
 ///
 /// The handle retains its archive and pending read state. Dropping it cancels
-/// pending source I/O. Completed reads do not retain decoded content.
+/// pending source I/O. One decoded source is retained within a 2 MiB cache budget.
 pub struct File<R: AsyncRangeReader + ?Sized> {
     archive: Archive<R>,
     selection: FileSelection,
@@ -151,6 +215,15 @@ pub struct File<R: AsyncRangeReader + ?Sized> {
     pending: Option<(u64, Load)>,
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
+    /// Sets the decoded-source cache budget; see [`FileCursor::with_cache_bytes`].
+    #[must_use]
+    pub fn with_cache_bytes(mut self, bytes: usize) -> Self {
+        self.pending = None;
+        self.selection.cache_bytes = bytes;
+        self.selection.cache = Arc::new(Mutex::new(None));
+        self
+    }
+
     pub(crate) fn new(archive: Archive<R>, entry: Entry) -> Result<Self> {
         let selection = FileSelection::new(entry)?;
         Ok(Self {

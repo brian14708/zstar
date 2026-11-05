@@ -48,6 +48,6 @@ and source links beside headings. When upgrading the plugin, review the patch
 against its page model, HTML renderer, and Markdown output before updating the
 pin.
 
-The API member filter hides helper types `EntryFields` and `ManifestOptions`
-as standalone entries. Their fields remain represented by the public entry and
-reader types; the Python exports are unchanged.
+The Python API reference follows public exports in `zstar` and `zstar.types`.
+Wire tuples, CBOR extension values, and underscored helpers are private and do
+not appear as standalone public types.

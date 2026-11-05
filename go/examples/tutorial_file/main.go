@@ -53,7 +53,7 @@ func run(ctx context.Context) (result error) {
 	// endregion read
 
 	// region verify
-	if _, err := archive.Verify(ctx, false); err != nil {
+	if _, err := archive.VerifyScope(ctx, zstar.VerifyArchive); err != nil {
 		return err
 	}
 	fmt.Println("Archive verified")

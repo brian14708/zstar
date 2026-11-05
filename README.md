@@ -26,6 +26,23 @@ for `zstar::fs`, `zstar::http`, and `zstar::s3`.
 Shared conformance fixtures under `testdata/` exercise the SDKs against the same
 valid and invalid archives.
 
+## Validation support
+
+| Operation | Rust | Go | Python |
+| --- | --- | --- | --- |
+| Metadata validation on open | Yes | Yes | Yes |
+| Selective source and extent validation | Yes | Yes | Yes |
+| Full physical archive validation | `verify(Archive)` | `VerifyScope(VerifyArchive)` | `verify()` |
+| External closure validation | `verify(ExternalClosure)` | `VerifyScope(VerifyExternalClosure)` | `verify(external=True)` |
+| External SHA-256 opt-in | `verify_external` | `VerifyExternalHash` | `verify_external` |
+| Portable and thin writing | Yes | Yes | Portable raw writer; thin fsspec writer |
+| Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
+
+External SHA-256 checking defaults to disabled. Metadata digests, frame checksums,
+and extent bounds are always checked. Selective reads do not establish full
+physical validity, and these checks establish consistency rather than publisher
+authenticity. See each SDK's configuration guide for resource budgets.
+
 ## Development
 
 Use the pinned development shell and run the standard lint and test suite:

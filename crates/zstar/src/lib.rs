@@ -348,6 +348,15 @@ pub(crate) fn decode_bounded_with_limits(
     Ok(decoded)
 }
 
+// The streaming codec exposes its stable Zstandard error name through io::Error.
+fn frame_decode_error(error: &std::io::Error) -> Error {
+    if error.to_string() == "Restored data doesn't match checksum" {
+        Error::Integrity
+    } else {
+        Error::MalformedFrame(error.to_string())
+    }
+}
+
 fn decode_bounded_into(
     encoded: &[u8],
     limit: usize,
@@ -387,7 +396,7 @@ fn decode_bounded_into(
     };
     frame_decoder
         .window_log_max(window_log.min(31))
-        .map_err(|e| Error::MalformedFrame(e.to_string()))?;
+        .map_err(|error| frame_decode_error(&error))?;
     let start = decoded.len();
     if let Some(size) = declared {
         let size = usize::try_from(size).map_err(|_| Error::Budget("decoded frame size"))?;
@@ -397,13 +406,13 @@ fn decode_bounded_into(
         decoded.resize(start + size, 0);
         frame_decoder
             .read_exact(&mut decoded[start..])
-            .map_err(|e| Error::MalformedFrame(e.to_string()))?;
+            .map_err(|error| frame_decode_error(&error))?;
         // Read through EOF to verify the checksum without growing the output
         // allocation just to discover that a full frame has ended.
         let mut extra = [0];
         if frame_decoder
             .read(&mut extra)
-            .map_err(|e| Error::MalformedFrame(e.to_string()))?
+            .map_err(|error| frame_decode_error(&error))?
             != 0
         {
             return Err(Error::MalformedFrame("decoded size mismatch".into()));
@@ -412,7 +421,7 @@ fn decode_bounded_into(
         frame_decoder
             .take(limit as u64 + 1)
             .read_to_end(decoded)
-            .map_err(|e| Error::MalformedFrame(e.to_string()))?;
+            .map_err(|error| frame_decode_error(&error))?;
     }
     if decoded.len() - start > limit {
         return Err(Error::Budget("decoded frame size"));

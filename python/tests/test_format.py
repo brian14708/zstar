@@ -160,7 +160,7 @@ def test_indexed_external_policy_cannot_skip_archive_checksums(
     )
     with pytest.raises(zstar.ZstarError) as caught:
         archive.read("a-b")
-    assert caught.value.category == "malformed-frame"
+    assert caught.value.category == "integrity-failure"
     with pytest.raises(zstar.ZstarError):
         archive.read_many([("a-b", 0, 5)])
 

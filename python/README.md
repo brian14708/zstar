@@ -48,3 +48,10 @@ extension objects. Prefer `names()` when only filenames are needed. See
 Opening retains the complete index in memory. See
 [resource limits](https://brian14708.github.io/zstar/guides/python/configuration/#resource-limits)
 for metadata, frame, and extent budgets.
+
+Member streams retain one decoded source within a 2 MiB cache. Configure
+`archive.open(name, cache_bytes=...)` or fsspec's `member_cache_bytes`; zero
+disables retention. Metadata projection reports omitted manifest extensions with
+`UserWarning`, so rewrites can detect metadata loss. Local fsspec downloads reject
+destination symlinks and require POSIX no-follow descriptor operations. They copy
+bytes and reject symlink members. Checksum mismatches report `integrity-failure`.

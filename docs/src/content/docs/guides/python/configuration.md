@@ -25,7 +25,11 @@ with fsspec.filesystem("zstar", fo="archive.zstar") as fs:
 ```
 
 Standard helpers such as `glob`, `find`, `cat`, `get(..., recursive=True)`, and
-`get_mapper()` work with archive-relative paths. `get_file()` also accepts a
+`get_mapper()` work with archive-relative paths. Local downloads reject
+preexisting symlinks at every destination component and require POSIX
+no-follow descriptor operations. Unsupported hosts fail explicitly. Downloads
+copy regular-file bytes; they do not restore archived ownership, modes, timestamps,
+or symlinks. Symlink downloads are rejected by policy. `get_file()` also accepts a
 borrowed binary output stream and fsspec progress callbacks. `cat_ranges()` batches
 member ranges in Rust, supports negative offsets, and follows fsspec's per-range
 error handling. Pass `reader_options={"concurrent_chunks": 4, ...}` to tune native
@@ -75,7 +79,10 @@ save cache metadata, reuse the same block size, and manage the cache directory's
 disk usage. `check_files=True` checks source identity before reuse. Keep source
 objects immutable while an archive is open.
 
-Member streams read exact logical ranges without a decoded-content cache.
+Each member stream retains at most one validated decoded source within
+`member_cache_bytes` (2 MiB by default, including cache bookkeeping). Set it to
+zero to disable retention. Entry metadata and returned buffers are separate.
+Sources larger than the budget are decoded without retention.
 Backends configured with `asynchronous=True` use direct async range I/O and bypass
 stream caching; use a synchronous backend or disk-cache wrapper for source caching.
 
@@ -133,13 +140,21 @@ byte prefix. Results are owned snapshots; changing them does not change the arch
 `read_range(name, start, end)` reads a half-open member range.
 
 Opening completes metadata authentication and validation; use `verify()` for
-physical archive or external-closure validation. Reader options include
+physical archive or external-closure validation (`verify(external=True)`).
+External SHA-256 checking defaults to disabled; pass `verify_external=True` when
+opening to enable it. Metadata hashes, frame checksums, and extent bounds always
+remain enabled. Reports identify external objects read without hashing.
+Reader options include
 `concurrent_chunks`; writer options include `workers`. Public option, report,
 and storage protocol types live in `zstar.types`.
 
 Write file metadata with `ArchiveWriter.addfile(tarinfo, body)` or its async
 counterpart. Manifest tuples, CBOR values, extent references, and raw extension
-metadata are private implementation details.
+metadata are private implementation details. `getinfo()` and `members()` emit
+`UserWarning` when their `TarInfo` projection omits entry or archive-level
+extensions, including when enumerating an empty archive. Rewriting that metadata
+loses those extensions; applications requiring a lossless rewrite can treat the
+warning as an error.
 
 ```python
 from pathlib import Path
@@ -186,7 +201,9 @@ chain and is configured independently through `target_options` or `fs=`.
 
 Keep the archive or filesystem open across reads to reuse parsed metadata. Use
 `read_many()` or fsspec's `cat_ranges()` to share work across related ranges.
-Decoded content is not cached between calls.
+Direct archive reads do not retain decoded content. Member streams reuse one
+validated decoded source; configure `archive.open(name, cache_bytes=2 << 20)` or
+set `cache_bytes=0` to disable retention. The async interface uses the same option.
 
 Both interfaces use Rust for decoding, validation, and compression. Direct path
 reads use native file I/O; fsspec and supplied Python streams add callbacks.
@@ -217,5 +234,24 @@ pointer bytes. Zero or omission disables each additional limit; metadata and
 index budgets are separate. For example,
 `limits={"max_frame_decoded_bytes": 64 << 20, "max_extents": 100_000}` sets limits
 for your application without changing which archives are valid.
+
+Default frame and window limits are disabled, so defaults do not provide a
+finite aggregate content-memory ceiling. Peak memory includes the retained index,
+up to `concurrent_chunks` encoded inputs, decoded sources and codec workspaces,
+member caches, and returned buffers. For example:
+
+```python
+options = {
+    "concurrent_chunks": 4,
+    "max_read_bytes": 8 << 20,
+    "limits": {
+        "max_frame_encoded_bytes": 64 << 20,
+        "max_frame_decoded_bytes": 64 << 20,
+        "max_window_bytes": 64 << 20,
+    },
+}
+with Archive.from_file("archive.zstar", **options) as archive:
+    data = archive.read("hello.txt")
+```
 
 The [format specification](/zstar/reference/spec/) defines the format and validation rules.

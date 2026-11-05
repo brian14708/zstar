@@ -22,3 +22,10 @@ owned by the caller.
 
 See [advanced usage](https://brian14708.github.io/zstar/guides/go/configuration/)
 for options, streams, S3 storage, errors, and memory budgets.
+
+Use `VerifyScope(ctx, zstar.VerifyArchive)` for full physical validation or
+`zstar.VerifyExternalClosure` to also resolve external selections. External
+SHA-256 checking is opt-in through `ReaderOptions.VerifyExternalHash`; codec
+checksums remain mandatory. Checksum mismatches report `integrity-failure`.
+`Manifest` and `EntryArchiveWriter` are advanced interfaces; ordinary callers
+can use `Reader`, `Writer`, and `Header`.

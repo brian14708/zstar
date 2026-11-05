@@ -1,5 +1,6 @@
 """Convert native entries to standard tarfile metadata."""
 
+import warnings
 from decimal import Decimal, InvalidOperation
 from tarfile import DIRTYPE, REGTYPE, SYMTYPE, TarInfo
 from typing import Literal
@@ -30,11 +31,24 @@ def _from_entry(entry: EntryTuple) -> TarInfo:
     fields = entry[7] if len(entry) == 8 else {}
     linkname = fields.get("linkname", "")
     assert isinstance(linkname, str)
-    return _from_metadata((*entry[:6], sum(extent[0] for extent in entry[6]), linkname))
+    return _from_metadata(
+        (
+            *entry[:6],
+            sum(extent[0] for extent in entry[6]),
+            linkname,
+            bool(set(fields) - {"linkname"}),
+        )
+    )
 
 
 def _from_metadata(metadata: MemberMetadata) -> TarInfo:
-    name, kind, mode, uid, gid, mtime_ns, size, linkname = metadata
+    name, kind, mode, uid, gid, mtime_ns, size, linkname, extensions_omitted = metadata
+    if extensions_omitted:
+        warnings.warn(
+            "TarInfo omits Zstar manifest extensions; rewriting this metadata loses extensions",
+            UserWarning,
+            stacklevel=3,
+        )
     info = TarInfo(name)
     info.type = {0: REGTYPE, 5: DIRTYPE, 2: SYMTYPE}[kind]
     info.size = size

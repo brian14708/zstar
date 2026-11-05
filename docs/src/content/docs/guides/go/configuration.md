@@ -25,8 +25,17 @@ settings such as `CompressionLevel`, `RootExtensions`, and `BlockTarget` in
 
 ## Validation
 
-Opening validates all metadata; `Verify` checks content and, optionally, external
-objects. The index must fit `MaxRetainedEntryBytes`. Spooling metadata to disk
+Use `Open`/`OpenWithOptions` and `NewWriter` with `Header` for ordinary archive
+operations. `Manifest`, `NewManifestWriter`, and `EntryArchiveWriter` expose
+advanced metadata and encoding operations; they are not needed for normal reads
+and writes.
+
+Opening validates all metadata. `VerifyScope(ctx, zstar.VerifyArchive)` checks
+physical content; `VerifyScope(ctx, zstar.VerifyExternalClosure)` also resolves
+external selections. `Verify(ctx, bool)` remains a compatibility shorthand.
+External SHA-256 checking defaults to disabled; opt in through
+`ReaderOptions.VerifyExternalHash`. Metadata hashes, frame checksums, and extent
+bounds are always checked, and reports identify unchecked external content. The index must fit `MaxRetainedEntryBytes`. Spooling metadata to disk
 does not reduce index memory.
 
 Writers accept arbitrary input order and sort the manifest. Optional `Limits`

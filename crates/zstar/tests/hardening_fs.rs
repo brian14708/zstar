@@ -91,7 +91,7 @@ fn deep_and_wide_trees_exceed_the_default_handle_limit() {
         max_directory_handles: 2,
         ..Default::default()
     };
-    run(&bytes, &tiny, options).unwrap();
+    assert_eq!(run(&bytes, &tiny, options).unwrap().directories, 1240);
     assert_eq!(
         fs::read(tiny.join("d0500/f")).unwrap(),
         [(500_u32 % 256) as u8]
@@ -146,7 +146,10 @@ fn dot_destination_extracts_into_the_current_directory_handle() {
     let temp = tempfile::tempdir().unwrap();
     // "<dir>/." has no file name; no process-wide chdir is needed.
     let dest = temp.path().join(".");
-    run(&bytes, &dest, ExtractOptions::default()).unwrap();
+    assert_eq!(
+        run(&bytes, &dest, ExtractOptions::default()).unwrap().files,
+        1
+    );
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"x");
     let dotdot = temp.path().join("sub");
     fs::create_dir(&dotdot).unwrap();
@@ -210,6 +213,22 @@ fn metadata_not_applied_is_reported_and_symlink_modes_do_not_abort() {
     assert_eq!(report.omitted_count(OmittedField::SymlinkMode), 1);
     assert_eq!(report.files, 2);
     assert_eq!(report.symlinks, 1);
+    // Convenience extraction must expose the same omissions rather than discard them.
+    let mut archive = zstar::backend::BlockingArchive::open(
+        zstar::SliceReader::new(&bytes),
+        zstar::ManifestOptions::default(),
+    )
+    .unwrap();
+    let convenience = zstar::fs::extract_with_options(
+        &mut archive,
+        &temp.path().join("convenience"),
+        None,
+        ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(convenience.omitted_count(OmittedField::SpecialModeBits), 1);
+    assert!(!convenience.is_lossless());
+
     let ownership = report
         .omitted
         .iter()

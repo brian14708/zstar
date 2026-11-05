@@ -338,7 +338,7 @@
         {
           "name": "object-checksum-mismatch",
           "operation": "external-range",
-          "expected_error": "malformed-external-content",
+          "expected_error": "integrity-failure",
           "objects": {
             "sha256:4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92": "frames/object-checksum-mismatch.zst"
           },
@@ -379,7 +379,7 @@
     "invalid/data-checksum.zstar": {
       "sha256": "a70d4cf0243fd5e2ad5bf9b61446a407e476ae560cfdc5af4e66db19933ff035",
       "cases": [
-        {"name": "data-checksum-full", "operation": "full-archive", "expected_error": "malformed-frame"},
+        {"name": "data-checksum-full", "operation": "full-archive", "expected_error": "integrity-failure"},
         {"name": "data-checksum-metadata-only", "operation": "metadata"}
       ]
     },
@@ -1175,15 +1175,15 @@
     "frames/metadata-checksum-mismatch.zstar": {
       "sha256": "27bf2ba70b13aaa7e7db33adc216742b8164d9f95c1d4d5409a7339110e0aba1",
       "cases": [
-        {"name": "metadata-checksum-mismatch", "operation": "metadata", "expected_error": "malformed-toc"}
+        {"name": "metadata-checksum-mismatch", "operation": "metadata", "expected_error": "integrity-failure"}
       ]
     },
     "frames/data-checksum-mismatch.zstar": {
       "sha256": "1a44267c4cc77ad2712f4e1334560b3889165752a824a469547063b40433f9ae",
       "cases": [
         {"name": "data-checksum-mismatch-metadata", "operation": "metadata"},
-        {"name": "data-checksum-mismatch-full", "operation": "full-archive", "expected_error": "malformed-frame"},
-        {"name": "data-checksum-mismatch-read", "operation": "inline-range", "expected_error": "malformed-frame", "request": {"path": "file", "offset": 0, "length": 5}}
+        {"name": "data-checksum-mismatch-full", "operation": "full-archive", "expected_error": "integrity-failure"},
+        {"name": "data-checksum-mismatch-read", "operation": "inline-range", "expected_error": "integrity-failure", "request": {"path": "file", "offset": 0, "length": 5}}
       ]
     },
     "frames/metadata-unknown-size-no-checksum.zstar": {

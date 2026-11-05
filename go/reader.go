@@ -135,11 +135,34 @@ func (r *Reader) ReadLink(path string) (string, error) {
 	return *entry.Linkname, nil
 }
 
-// Verify validates the complete physical archive. If externalClosure is
-// true, it also resolves every external extent. External object SHA-256 is
+// VerificationScope selects the checks performed by Reader.VerifyScope.
+type VerificationScope uint8
+
+const (
+	// VerifyArchive checks metadata and every physical frame and tar member.
+	VerifyArchive VerificationScope = iota
+	// VerifyExternalClosure additionally resolves all external selections.
+	// Hash checking still follows ReaderOptions.VerifyExternalHash.
+	VerifyExternalClosure
+)
+
+// VerifyScope validates the archive under an explicit verification scope.
+func (r *Reader) VerifyScope(ctx context.Context, scope VerificationScope) (VerificationReport, error) {
+	if scope != VerifyArchive && scope != VerifyExternalClosure {
+		return VerificationReport{}, rejected(CategoryUnsupportedOperation, "unknown verification scope")
+	}
+	return r.manifest.Verify(ctx, r.resolver, r.verifyExternal, scope == VerifyExternalClosure)
+}
+
+// Verify is the compatibility shorthand for VerifyScope. It validates the
+// complete physical archive and, when externalClosure is true, every external extent. External object SHA-256 is
 // checked only when VerifyExternalHash is set; codec checksums and range checks always apply.
 func (r *Reader) Verify(ctx context.Context, externalClosure bool) (VerificationReport, error) {
-	return r.manifest.Verify(ctx, r.resolver, r.verifyExternal, externalClosure)
+	scope := VerifyArchive
+	if externalClosure {
+		scope = VerifyExternalClosure
+	}
+	return r.VerifyScope(ctx, scope)
 }
 
 // VisitPayloads validates physical content while invoking borrowed payload

@@ -620,6 +620,8 @@ func (s *manifestSpool) close() error {
 }
 
 // Manifest authenticates and validates the complete sequence before exposing entries.
+// Manifest exposes low-level metadata and content operations with per-call policy.
+// Prefer Reader for an archive with one fixed resolver and verification policy.
 type Manifest struct {
 	mu               sync.Mutex
 	closed           bool

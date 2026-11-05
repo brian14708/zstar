@@ -34,7 +34,7 @@ struct MemberState {
     position: Mutex<u64>,
 }
 impl MemberCursor {
-    pub(crate) async fn open(reader: &Reader, path: &str) -> PyResult<Self> {
+    pub(crate) async fn open(reader: &Reader, path: &str, cache_bytes: usize) -> PyResult<Self> {
         let entry = reader
             .entry(path)
             .await
@@ -60,7 +60,8 @@ impl MemberCursor {
         let cursor = reader
             .cursor_from_entry(entry)
             .await
-            .map_err(crate::support::core_error)?;
+            .map_err(crate::support::core_error)?
+            .with_cache_bytes(cache_bytes);
         Ok(Self {
             size: cursor.size(),
             inner: Arc::new(MemberState {
@@ -792,6 +793,7 @@ fn member_metadata(py: Python<'_>, entry: &zstar::Entry) -> PyResult<Py<PyAny>> 
         entry.mtime_ns,
         entry.size().map_err(core_error)?,
         entry.linkname.as_deref().unwrap_or(""),
+        !entry.attributes.is_empty(),
     )
         .into_pyobject(py)?
         .into_any()

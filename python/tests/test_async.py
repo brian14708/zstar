@@ -63,7 +63,7 @@ def test_async_open_authenticates_metadata_and_verify_checks_unread_content(corp
             assert (await archive.getinfo("a-b")).isfile()
             with pytest.raises(zstar.ZstarError) as caught:
                 await archive.verify()
-            assert caught.value.category == "malformed-frame"
+            assert caught.value.category == "integrity-failure"
 
     asyncio.run(exercise())
 

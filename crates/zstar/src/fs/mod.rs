@@ -172,9 +172,10 @@ pub struct OmittedMetadata {
     /// At most [`ExtractReport::EXAMPLES`] paths, in first-seen order.
     pub examples: Vec<String>,
 }
-/// Outcome of a successful extraction.
+/// Outcome of an extraction, including every class of omitted metadata.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
+#[must_use = "inspect omitted metadata before treating restoration as complete"]
 pub struct ExtractReport {
     pub files: u64,
     pub directories: u64,
@@ -353,6 +354,8 @@ impl DirCache {
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
+/// Extracts content and reports metadata that could not be applied.
+///
 /// Every descendant operation uses a captured directory plus one leaf name.
 /// Failure leaves no new entries; see [`extract_with_report`].
 pub fn extract<R: RangeReader>(
@@ -360,7 +363,7 @@ pub fn extract<R: RangeReader>(
     destination: &Path,
     objects: Option<LocalObjects>,
     allow_special_bits: bool,
-) -> AnyResult<()> {
+) -> AnyResult<ExtractReport> {
     extract_with_options(
         archive,
         destination,
@@ -647,12 +650,13 @@ fn finish_destination(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
+/// Extracts a local archive and returns its metadata-application report.
 pub fn extract_file(
     archive: &Path,
     destination: &Path,
     objects: Option<LocalObjects>,
     allow_special_bits: bool,
-) -> AnyResult<()> {
+) -> AnyResult<ExtractReport> {
     extract_file_with_options(
         archive,
         destination,
@@ -667,12 +671,13 @@ pub fn extract_file(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
+/// Extracts a local archive under the selected policies and reports metadata omissions.
 pub fn extract_file_with_options(
     archive: &Path,
     destination: &Path,
     objects: Option<LocalObjects>,
     options: ExtractOptions,
-) -> AnyResult<()> {
+) -> AnyResult<ExtractReport> {
     let mut reader =
         BlockingArchive::open(LocalFileSource::open(archive)?, options.manifest.clone())?;
     extract_with_options(&mut reader, destination, objects, options)
@@ -842,13 +847,14 @@ pub fn extract_with_report<R: RangeReader>(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
+/// Extracts under the selected policies and returns the metadata-application report.
 pub fn extract_with_options<R: RangeReader>(
     reader: &mut BlockingArchive<R>,
     destination: &Path,
     objects: Option<LocalObjects>,
     options: ExtractOptions,
-) -> AnyResult<()> {
-    extract_with_report(reader, destination, objects, options).map(|_| ())
+) -> AnyResult<ExtractReport> {
+    extract_with_report(reader, destination, objects, options)
 }
 #[expect(
     clippy::missing_errors_doc,

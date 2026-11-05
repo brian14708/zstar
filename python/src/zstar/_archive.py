@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from tarfile import TarInfo
@@ -45,6 +46,14 @@ class _Metadata(Generic[_Reader]):
         archive._reader = reader
         return archive
 
+    def _warn_root_extensions(self) -> None:
+        if self._reader._has_root_extensions:
+            warnings.warn(
+                "TarInfo omits archive-level Zstar extensions; rewriting metadata loses extensions",
+                UserWarning,
+                stacklevel=3,
+            )
+
     @property
     def _max_read_bytes(self) -> int:
         return self._reader.max_read_bytes
@@ -71,8 +80,12 @@ class Archive(_Metadata[_native.SyncArchive]):
         self._reader = _native.SyncArchive.from_bytes(data, **options)
 
     def getinfo(self, name: str) -> TarInfo:
-        """Return an owned TarInfo snapshot; raise KeyError for a missing name."""
+        """Return an owned TarInfo snapshot; raise KeyError for a missing name.
+
+        Warns with UserWarning if the projection omits manifest extensions.
+        """
         self._check_open()
+        self._warn_root_extensions()
         metadata = self._reader._member_info(name)
         if metadata is None:
             raise KeyError(name)
@@ -139,8 +152,12 @@ class Archive(_Metadata[_native.SyncArchive]):
         )
 
     def members(self, prefix: str | None = None) -> Iterator[TarInfo]:
-        """Lazily yield owned members in path order. Use list(...) for eager collection."""
+        """Lazily yield owned members in path order. Use list(...) for eager collection.
+
+        Warns with UserWarning when TarInfo omits entry or archive-level extensions.
+        """
         self._check_open()
+        self._warn_root_extensions()
         iterator = self._reader._iter_members(prefix)
         while batch := iterator._next_batch():
             for metadata in batch:
@@ -159,16 +176,18 @@ class Archive(_Metadata[_native.SyncArchive]):
     def __iter__(self) -> Iterator[TarInfo]:
         return self.members()
 
-    def open(self, member: str | TarInfo) -> ArchiveFile:
+    def open(self, member: str | TarInfo, *, cache_bytes: int = 2 << 20) -> ArchiveFile:
         """Open a read-only regular-file stream without following symlinks.
 
         Missing members raise KeyError; directories raise IsADirectoryError;
         symlinks raise tarfile.ExtractError without resolving their targets.
         The stream borrows this archive and must be closed before its owner.
+        cache_bytes bounds one retained decoded source, including bookkeeping;
+        zero disables caching. Metadata and returned bytes are separate.
         """
         self._check_open()
         name = _name(member)
-        return ArchiveFile(self, name, self._reader._open_member(name))
+        return ArchiveFile(self, name, self._reader._open_member(name, cache_bytes))
 
     def read(
         self,
@@ -238,9 +257,11 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     async def getinfo(self, name: str) -> TarInfo:
         """Return an owned TarInfo snapshot; raise KeyError for a missing name.
 
+        Warns with UserWarning if the projection omits manifest extensions.
         Awaitable so slow metadata sources never block the event loop.
         """
         self._check_open()
+        self._warn_root_extensions()
         metadata = await self._reader._member_info(name)
         if metadata is None:
             raise KeyError(name)
@@ -313,8 +334,12 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         )
 
     async def members(self, prefix: str | None = None) -> AsyncIterator[TarInfo]:
-        """Lazily yield owned members without fetching payloads."""
+        """Lazily yield owned members without fetching payloads.
+
+        Warns with UserWarning when TarInfo omits entry or archive-level extensions.
+        """
         self._check_open()
+        self._warn_root_extensions()
         iterator = self._reader._iter_members(prefix)
         while batch := await iterator._next_batch():
             for metadata in batch:
@@ -334,16 +359,19 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         return self.members()
 
     @asynccontextmanager
-    async def open(self, member: str | TarInfo) -> AsyncGenerator[AsyncArchiveFile]:
+    async def open(
+        self, member: str | TarInfo, *, cache_bytes: int = 2 << 20
+    ) -> AsyncGenerator[AsyncArchiveFile]:
         """Open a member with ``async with archive.open(name)``.
 
         Missing members raise KeyError; directories raise IsADirectoryError;
         symlinks raise tarfile.ExtractError without resolving their targets.
         The member closes on context exit; its owner stays open.
+        cache_bytes bounds one retained decoded source; zero disables caching.
         """
         self._check_open()
         name = _name(member)
-        cursor = await self._reader._open_member(name)
+        cursor = await self._reader._open_member(name, cache_bytes)
         async with AsyncArchiveFile(self, name, cursor) as stream:
             yield stream
 
