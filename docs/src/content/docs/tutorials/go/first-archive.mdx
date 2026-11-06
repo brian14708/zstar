@@ -52,10 +52,9 @@ when the function returns.
 
 ## Verify the archive
 
-`Verify(ctx, false)` checks the entire archive for errors, including content
-you have not read. The `false` argument limits the check to this archive.
-Zstar also supports content stored separately, but this example keeps everything
-in one archive.
+`VerifyScope(ctx, zstar.VerifyArchive)` checks the entire physical archive for
+errors, including content you have not read. This example keeps all content
+inline; use `zstar.VerifyExternalClosure` to also resolve external content.
 
 <Example source={source} lang="go" region="verify" />
 

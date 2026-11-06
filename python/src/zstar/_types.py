@@ -2,12 +2,9 @@
 
 from typing import Literal, TypeAlias
 
-from .types import WriterOptions
+from .types import ExtensionValue, WriterOptions
 
-CborValue: TypeAlias = (
-    bool | int | str | bytes | list["CborValue"] | tuple["CborValue", ...] | dict[str, "CborValue"]
-)
-"""Recursive values accepted in archive and entry extension metadata."""
+CborValue: TypeAlias = ExtensionValue
 ExtentTuple: TypeAlias = tuple[int, int | str, int] | tuple[int, int | str, int, int]
 """Content extent: decoded size, source, encoded size, and optional decoded offset."""
 #: Entry metadata: path, type, mode, uid, gid, nanosecond mtime, and extents.
@@ -26,4 +23,4 @@ MemberMetadata: TypeAlias = tuple[str, int, int, int, int, int, int, str, bool]
 
 
 class NativeWriterOptions(WriterOptions, total=False):
-    root_extensions: dict[str, CborValue] | None
+    pass

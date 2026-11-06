@@ -62,6 +62,7 @@ impl Default for ManifestOptions {
 }
 
 /// Disk-spooled, unknown-count producer of a deterministic manifest sequence.
+/// Entries already in path order reuse their spool; arbitrary input is sorted at finish.
 pub struct ManifestEncoder<W: Write> {
     output: W,
     start: u64,
@@ -69,6 +70,8 @@ pub struct ManifestEncoder<W: Write> {
     decoded: u64,
     hash: Sha256,
     records: Spool,
+    records_ordered: bool,
+    previous_path: Option<String>,
     count: u64,
     external: bool,
     level: i32,
@@ -88,6 +91,8 @@ impl<W: Write> ManifestEncoder<W> {
             decoded: 0,
             hash: Sha256::new(),
             records: Spool::new(spool_options),
+            records_ordered: true,
+            previous_path: None,
             count: 0,
             external: false,
             level: compression_level,
@@ -109,10 +114,6 @@ impl<W: Write> ManifestEncoder<W> {
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "Ownership matches the public API or asynchronous boundary."
-    )]
     pub fn add_entry(&mut self, entry: Entry) -> Result<()> {
         self.validate_target()?;
         entry.validate(self.start)?;
@@ -125,6 +126,13 @@ impl<W: Write> ManifestEncoder<W> {
             .checked_add(1)
             .ok_or_else(|| invalid("entry count overflow"))?;
         self.external |= entry.is_external();
+        if self.records_ordered {
+            self.records_ordered = self
+                .previous_path
+                .as_ref()
+                .is_none_or(|path| path.as_bytes() <= entry.path.as_bytes());
+            self.previous_path = self.records_ordered.then_some(entry.path);
+        }
         Ok(())
     }
     #[expect(
@@ -217,15 +225,20 @@ impl<W: Write> ManifestEncoder<W> {
         root.validate()?;
         let placeholder = Spool::new(self.records.options.clone());
         let records = std::mem::replace(&mut self.records, placeholder);
-        let mut records = sort_records(records, self.records.options.clone(), |v| {
-            let Value::Array(fields) = v else {
-                return Err(invalid("entry tuple"));
-            };
-            let Some(Value::Text(path)) = fields.first() else {
-                return Err(invalid("entry path"));
-            };
-            Ok(path.clone())
-        })?;
+        let mut records = if self.records_ordered {
+            // Keep the namespace validation below even when no sorting is needed.
+            records
+        } else {
+            sort_records(records, self.records.options.clone(), |v| {
+                let Value::Array(fields) = v else {
+                    return Err(invalid("entry tuple"));
+                };
+                let Some(Value::Text(path)) = fields.first() else {
+                    return Err(invalid("entry path"));
+                };
+                Ok(path.clone())
+            })?
+        };
         let mut at = 0;
         let mut previous: Option<String> = None;
         let mut directories: Vec<String> = Vec::new();
@@ -662,6 +675,115 @@ mod tests {
     use super::*;
     use crate::manifest::EntryKind;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn sorted_manifest_finishes_with_only_one_record_spool_budget() {
+        let entries: Vec<_> = (0..300)
+            .map(|i| Entry {
+                path: format!("f{i:04}"),
+                kind: EntryKind::File,
+                mode: 420,
+                uid: 0,
+                gid: 0,
+                mtime_ns: 0,
+                extents: vec![],
+                linkname: None,
+                attributes: BTreeMap::from([("x-padding".into(), Value::Bytes(vec![7; 512]))]),
+            })
+            .collect();
+        let retained: u64 = entries
+            .iter()
+            .map(|entry| crate::cbor::encode(&entry.to_value()).unwrap().len() as u64 + 4)
+            .sum();
+        let budget = Arc::new(SpoolBudget::new(retained));
+        let options = ManifestOptions {
+            spool_budget: budget.clone(),
+            ..Default::default()
+        };
+        let mut writer = ManifestEncoder::new(vec![0], 1, 3, options.clone());
+        for entry in &entries {
+            writer.add_entry(entry.clone()).unwrap();
+        }
+        assert_eq!(budget.used(), retained);
+        let (bytes, footer) = writer.finish(vec![], BTreeMap::new()).unwrap();
+        assert_eq!(budget.used(), 0);
+        let reader =
+            ManifestReader::open(&mut crate::SliceReader::new(&bytes), &footer, options).unwrap();
+        assert_eq!(reader.collect_entries().unwrap(), entries);
+    }
+
+    #[test]
+    fn manifest_bytes_match_for_sorted_reverse_and_late_unordered_entries() {
+        let entries: Vec<_> = (0..300)
+            .map(|i| Entry {
+                path: format!("f{i:04}"),
+                kind: EntryKind::File,
+                mode: 420,
+                uid: 0,
+                gid: 0,
+                mtime_ns: 0,
+                extents: vec![],
+                linkname: None,
+                attributes: BTreeMap::from([("x-padding".into(), Value::Bytes(vec![7; 512]))]),
+            })
+            .collect();
+        let mut expected = None;
+        for memory_bytes in [64, MEMORY_DEFAULT] {
+            for order in 0..3 {
+                let options = ManifestOptions {
+                    memory_bytes,
+                    create_spill_store: Some(SpillFactory::new(|| {
+                        Ok(Box::new(Cursor::new(Vec::<u8>::new())))
+                    })),
+                    ..Default::default()
+                };
+                let budget = options.spool_budget.clone();
+                let mut writer = ManifestEncoder::new(vec![0], 1, 3, options);
+                let mut input: Vec<_> = entries.iter().collect();
+                match order {
+                    1 => input.reverse(),
+                    2 => input.swap(298, 299),
+                    _ => {}
+                }
+                for entry in input {
+                    writer.add_entry(entry.clone()).unwrap();
+                }
+                let (bytes, _) = writer.finish(vec![], BTreeMap::new()).unwrap();
+                assert_eq!(budget.used(), 0);
+                if let Some(expected) = &expected {
+                    assert_eq!(&bytes, expected);
+                } else {
+                    expected = Some(bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_manifest_still_rejects_duplicates_and_missing_ancestors() {
+        for paths in [["a", "a"], ["a", "missing/child"], ["a", "a/child"]] {
+            let mut writer = ManifestEncoder::new(Vec::new(), 1, 3, ManifestOptions::default());
+            for path in paths {
+                writer
+                    .add_entry(Entry {
+                        path: path.into(),
+                        kind: EntryKind::File,
+                        mode: 420,
+                        uid: 0,
+                        gid: 0,
+                        mtime_ns: 0,
+                        extents: vec![],
+                        linkname: None,
+                        attributes: BTreeMap::new(),
+                    })
+                    .unwrap();
+            }
+            assert!(matches!(
+                writer.finish(vec![], BTreeMap::new()),
+                Err(Error::MalformedToc(_))
+            ));
+        }
+    }
 
     #[expect(
         clippy::cast_possible_truncation,

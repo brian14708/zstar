@@ -231,6 +231,7 @@ struct Objects {
     encoded: Bytes,
     calls: AtomicUsize,
 }
+
 #[async_trait::async_trait]
 impl ObjectResolver for Objects {
     async fn get_encoded(&self, _: [u8; 32], _: u64, _: u64) -> Result<Bytes> {
@@ -499,6 +500,7 @@ impl Drop for ReadDrop {
         self.0.notify_one();
     }
 }
+
 #[async_trait::async_trait]
 impl AsyncRangeReader for StalledSource {
     async fn size(&self) -> Result<u64> {
@@ -633,6 +635,7 @@ struct CountedSource {
     bytes: Bytes,
     calls: AtomicUsize,
 }
+
 #[async_trait::async_trait]
 impl AsyncRangeReader for CountedSource {
     async fn size(&self) -> Result<u64> {
@@ -701,4 +704,98 @@ async fn standalone_cursor_cache_never_mixes_archive_sessions() {
         cursor.read(&first, 0, 6).await.unwrap(),
         b"aaaaaa".as_slice()
     );
+}
+
+#[test]
+fn writer_construction_is_runtime_independent() {
+    let builder = Builder::new(Vec::new());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async move {
+        let bytes = builder.finish().await.unwrap();
+        Archive::from_bytes(bytes)
+            .await
+            .unwrap()
+            .verify(VerificationScope::Archive)
+            .await
+            .unwrap();
+    });
+}
+
+#[tokio::test]
+async fn fallible_writer_reports_invalid_options_before_returning() {
+    let result = Builder::try_with_options(
+        Vec::new(),
+        WriterOptions {
+            frame_size: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    let writer = Builder::try_new(Vec::new()).await.unwrap();
+    writer.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_chunks_accept_boxed_writers_and_reject_bad_sizes() {
+    struct Store;
+    #[async_trait::async_trait]
+    impl zstar::chunking::ObjectWriter for Store {
+        async fn put_chunk(&mut self, raw: Bytes) -> Result<zstar::Extent> {
+            tokio::task::yield_now().await;
+            Ok(zstar::Extent {
+                size: raw.len() as u64,
+                source: zstar::Source::Object(*zstar::Digest::sha256(&raw).as_bytes()),
+                encoded_size: zstar::encode_frame(&raw, 3)?.len() as u64,
+                offset: 0,
+            })
+        }
+    }
+    // Object writer futures remain Send.
+    let extents = tokio::spawn(async {
+        let mut store = Store;
+        let chunks = futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]);
+        zstar::chunking::external_chunks(chunks, 3, &mut store).await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(extents.len(), 1);
+
+    let mut store: Box<dyn zstar::chunking::ObjectWriter> = Box::new(Store);
+    let writer = store.as_mut();
+    let chunks = futures_util::stream::iter([
+        Ok(Bytes::from_static(b"abc")),
+        Ok(Bytes::from_static(b"def")),
+    ]);
+    let extents = zstar::chunking::external_chunks(chunks, 6, writer)
+        .await
+        .unwrap();
+    assert_eq!(extents.len(), 2);
+    let chunks = futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]);
+    assert!(
+        zstar::chunking::external_chunks(chunks, 2, writer)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn focused_metadata_options_enforce_index_limits() {
+    let options = WriterOptions::default().with_metadata(zstar::MetadataWriterOptions {
+        block_target: 512,
+        ..Default::default()
+    });
+    let mut builder = Builder::try_with_options(Vec::new(), options)
+        .await
+        .unwrap();
+    builder.append_bytes("a", b"a").await.unwrap();
+    builder.append_bytes("b", b"b").await.unwrap();
+    let bytes = builder.finish().await.unwrap();
+    let options = ReaderOptions::default().with_metadata(zstar::MetadataReaderOptions {
+        max_entries: 1,
+        ..Default::default()
+    });
+    let result = Archive::open_with_options(Arc::new(Bytes::from(bytes)), options).await;
+    assert!(matches!(result, Err(Error::Budget(_))));
 }

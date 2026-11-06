@@ -24,14 +24,17 @@ pub trait ObjectResolver: Send + Sync {
     /// `hint` is an advisory encoded size, not a decoded-size bound. Return
     /// [`Error::MissingObject`] if the object is unavailable.
     async fn get_encoded(&self, address: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes>;
-    /// Whether this resolver supports optimized explicit batch requests.
+    /// Reserved capability for explicit callers. Archive reads currently call
+    /// `get_encoded` and do not consult this flag.
     fn supports_batch(&self) -> bool {
         false
     }
     /// Actual stored frame length when cheaply known from resolver metadata.
+    /// This is advisory for explicit callers; Archive does not consult it.
     fn encoded_length(&self, _address: [u8; 32]) -> Option<u64> {
         None
     }
+    /// Convenience batch for explicit callers; Archive does not invoke it.
     async fn get_encoded_many(&self, requests: &[ObjectRequest]) -> Result<Vec<Bytes>> {
         let mut output = Vec::with_capacity(requests.len());
         for request in requests {
@@ -43,6 +46,7 @@ pub trait ObjectResolver: Send + Sync {
         Ok(output)
     }
 }
+
 /// One complete encoded object requested in an explicit resolver batch.
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectRequest {
@@ -61,6 +65,14 @@ pub struct ReaderOptions {
     pub verify_external: bool,
     /// External objects are resolved through this reader-wide policy.
     pub resolver: Option<Arc<dyn ObjectResolver>>,
+}
+impl ReaderOptions {
+    /// Sets only metadata/index/spool policy, preserving content configuration.
+    #[must_use]
+    pub fn with_metadata(mut self, options: crate::MetadataReaderOptions) -> Self {
+        options.apply(&mut self.manifest);
+        self
+    }
 }
 impl Default for ReaderOptions {
     fn default() -> Self {
@@ -1179,6 +1191,7 @@ mod tests {
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
+
     #[async_trait::async_trait]
     impl AsyncRangeReader for Source {
         async fn size(&self) -> Result<u64> {
@@ -1425,6 +1438,7 @@ mod tests {
         bytes: Bytes,
         calls: AtomicUsize,
     }
+
     #[async_trait::async_trait]
     impl ObjectResolver for Objects {
         async fn get_encoded(&self, _: [u8; 32], _: u64, _: u64) -> Result<Bytes> {

@@ -164,13 +164,20 @@ def test_cleanup_errors_preserve_primary_failure():
 
 @pytest.mark.parametrize("loaded", [False, True])
 def test_dropping_filesystem_releases_owned_source(loaded):
-    source = io.BytesIO(_native.pack_file("x", b"hello"))
+    closed = threading.Event()
+
+    class Source(io.BytesIO):
+        def close(self):
+            super().close()
+            closed.set()
+
+    source = Source(_native.pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo=source)
     if loaded:
         assert fs.info("x")["size"] == 5
     del fs
     gc.collect()
-    assert source.closed
+    assert closed.wait(5)
 
 
 def test_close_drains_admitted_loads_and_rejects_new_work(monkeypatch):

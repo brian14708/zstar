@@ -47,7 +47,7 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 	if !store.closed {
 		t.Fatal("decoded spool retained after entry indexing")
 	}
-	if _, err = reader.Verify(context.Background(), false); err != nil {
+	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 	if err = reader.Close(); err != nil {

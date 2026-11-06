@@ -31,43 +31,35 @@ defines options, reports, file metadata, and storage protocols. See the
 [archive interface guide](https://brian14708.github.io/zstar/guides/python/configuration/#raw-archive-interface).
 Metadata uses standard `tarfile.TarInfo` objects through `getinfo()` and `members()`;
 `names()` yields filenames. Writers accept `TarInfo` through `addfile()`.
-CBOR values, manifest tuples, and extent layouts are private implementation details.
-Underscored modules and methods are implementation details.
+Use `getmetadata()` and `root_extensions` for extension metadata.
+Manifest tuples, extent layouts, and underscored APIs are private.
 
-On failure, writers close owned files before removing unfinished output, including
-on Windows. Transactional fsspec outputs are discarded without committing them;
-caller-owned sinks passed to `ArchiveWriter` remain open.
+## Configuration
 
-## Performance
-
-Keep readers open to reuse metadata and batch related ranges. Filename and member
-iteration uses bounded native batches and avoids constructing Python extent or
-extension objects. Prefer `names()` when only filenames are needed. See
-[performance guidance](https://brian14708.github.io/zstar/guides/python/configuration/#performance).
-
-## Resource limits
+Keep readers open to reuse metadata and batch related ranges. Prefer `names()`
+when only filenames are needed. See
+[performance guidance](https://brian14708.github.io/zstar/guides/python/configuration/#performance)
+for member caching, iteration, and writer ordering.
 
 Opening retains the complete index in memory. See
 [resource limits](https://brian14708.github.io/zstar/guides/python/configuration/#resource-limits)
 for metadata, frame, and extent budgets.
 
-Member streams retain one decoded source within a 2 MiB cache. Configure
-`archive.open(name, cache_bytes=...)` or fsspec's `member_cache_bytes`; zero
-disables retention. Metadata projection reports omitted manifest extensions with
-`UserWarning`, so rewrites can detect metadata loss. Local fsspec downloads reject
-destination symlinks and require POSIX no-follow descriptor operations. They copy
-bytes and reject symlink members. Checksum mismatches report `integrity-failure`.
+See [SDK customization](https://brian14708.github.io/zstar/guides/sdk-customization/)
+for custom storage and chunking, ownership, cancellation, and extension-preserving
+rewrites. Use explicit `close()` / `aclose()` or context managers to wait for
+owned resources to close.
+
+## Validation and format
+
+Opening validates metadata; reads validate the sources and extents they use.
+Use `verify()` for full physical validation or `verify(external=True)` to also
+resolve external content. External SHA-256 checking is opt-in through
+`verify_external`; metadata hashes, frame checksums, and extent bounds are always
+checked. Checksum mismatches report `integrity-failure`.
 
 The [core specification](https://github.com/brian14708/zstar/blob/main/spec/draft/core.md)
 and [external-content extension](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md)
-define archive validation and external object semantics. The informative
+define the format and validation rules. The informative
 [CAS storage appendix](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md#appendix-cas-storage)
 explains object identity and storage encoding.
-
-The draft manifest header declares mandatory extensions in `requires`. Readers
-reject unsupported extensions and unknown unprefixed fields.
-
-External file pointer payloads use JSON with `"version": "zstar-pointer-v1"` and
-an ordered `chunks` array. This breaking draft change replaces line-based
-pointers; full archive validation rejects the old payloads. Standalone content
-references retain their deterministic CBOR encoding.

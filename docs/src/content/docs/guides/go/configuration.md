@@ -19,7 +19,9 @@ Zero-valued option fields select defaults. Storage budgets and spill factories
 can be configured independently for each operation. Pass the same `SpoolBudget`
 pointer to share a quota across owners.
 
-Put reader limits such as `MaxReadBytes` in `ManifestReaderOptions`. Put encoding
+Put content controls such as `MaxReadBytes` and `ConcurrentChunks` on
+`ReaderOptions`; nonzero values override the legacy nested manifest fields.
+Keep metadata/index/spool budgets in `ManifestReaderOptions`. Put encoding
 settings such as `CompressionLevel`, `RootExtensions`, and `BlockTarget` in
 `ManifestWriterOptions`.
 
@@ -35,8 +37,9 @@ physical content; `VerifyScope(ctx, zstar.VerifyExternalClosure)` also resolves
 external selections. `Verify(ctx, bool)` remains a compatibility shorthand.
 External SHA-256 checking defaults to disabled; opt in through
 `ReaderOptions.VerifyExternalHash`. Metadata hashes, frame checksums, and extent
-bounds are always checked, and reports identify unchecked external content. The index must fit `MaxRetainedEntryBytes`. Spooling metadata to disk
-does not reduce index memory.
+bounds are always checked, and reports identify unchecked external content.
+Checksum mismatches report `integrity-failure`. The index must fit
+`MaxRetainedEntryBytes`. Spooling metadata to disk does not reduce index memory.
 
 Writers accept arbitrary input order and sort the manifest. Optional `Limits`
 in reader/writer manifest options bound frame and window bytes,
@@ -46,10 +49,12 @@ are rejected before payload I/O.
 
 ## Member streams
 
-For repeated small sequential reads, use `Reader.OpenStream(ctx, path, cacheBytes)`.
+For sequential reads, use `Reader.OpenStreamWithOptions(ctx, path, options)`.
 The returned `Stream` implements `io.ReadSeekCloser` and also provides
-`ReadContext`. It retains at most one validated decoded source; zero selects a
-2 MiB cache budget including fixed stream/cache bookkeeping. Sources exceeding
+`ReadContext`. It retains at most one validated decoded source. Zero-valued
+`StreamOptions` select a 2 MiB cache including fixed bookkeeping;
+`StreamOptions{DisableCache: true}` disables retention. The legacy
+`OpenStream(ctx, path, cacheBytes)` keeps its zero-means-default convention. Sources exceeding
 the cache budget are decoded normally but not retained. Close the stream to
 release its cache, and keep the parent reader open while using it. The stream
 owns entry metadata outside the cache budget. `OpenFile` remains the concurrent
@@ -121,3 +126,6 @@ S3 operations after `BlobStore.Close` match `fs.ErrClosed`, truncated responses
 match `io.ErrUnexpectedEOF`, and cancellation preserves the context error.
 Response-body and encoder cleanup failures are returned alongside the primary
 operation error. Backend diagnostics remain redacted.
+
+See [SDK customization](/zstar/guides/sdk-customization/) for custom storage and
+chunkers, ownership, cancellation, zero-value semantics, and budget profiles.

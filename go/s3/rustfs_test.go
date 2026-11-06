@@ -99,7 +99,7 @@ func TestRustFSNativeArchiveObjectsAndPresignedRanges(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if _, err := reader.Verify(ctx, true); err != nil {
+	if _, err := reader.VerifyScope(ctx, zstar.VerifyExternalClosure); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := reader.Read(ctx, "inline", 1, 3); err != nil || string(got) != "ell" {

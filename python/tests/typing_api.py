@@ -19,13 +19,22 @@ from zstar import (
     ZstarError,
 )
 from zstar.types import (
+    AsyncBinaryWriter,
+    AsyncObjectResolver,
+    AsyncObjectWriter,
+    AsyncRangeSource,
+    AsyncReader,
     BinaryWriter,
+    ContentOptions,
+    EntryMetadata,
     ErrorCategory,
+    ExtensionValue,
     FileInfo,
     ObjectResolver,
     RangeSource,
     ReaderOptions,
     ReadReport,
+    ReadRequest,
     SeekableReader,
     SignedRequest,
     VerificationReport,
@@ -142,3 +151,21 @@ async def async_stream_protocols(
         await writer.addfile(StandardTarInfo("body"), body)
     await AsyncArchive.from_file(body)  # pyrefly: ignore[bad-argument-type]
     await AsyncArchive.from_file(sink)  # pyrefly: ignore[bad-argument-type]
+
+
+async def custom_async_storage(
+    source: "AsyncRangeSource",
+    resolver: "AsyncObjectResolver",
+    sink: "AsyncBinaryWriter",
+    body: "AsyncReader",
+    objects: "AsyncObjectWriter",
+    chunks: AsyncIterator[bytes],
+) -> None:
+    content: ContentOptions = {"resolver": resolver, "concurrent_chunks": 4}
+    async with await AsyncArchive.from_source(source, 1024, **content) as archive:
+        assert_type(await archive.getmetadata("hello"), EntryMetadata)
+        assert_type(archive.root_extensions, dict[str, ExtensionValue])
+        assert_type(await archive.read_many([ReadRequest("hello", 0, 1)]), list[bytes])
+    async with await AsyncArchiveWriter.from_file(sink) as writer:
+        await writer.addfile(StandardTarInfo("hello"), body, extensions={"x-owner": "app"})
+        await writer.add_external(StandardTarInfo("external"), chunks, objects)

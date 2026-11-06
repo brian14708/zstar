@@ -97,18 +97,14 @@ def _file_info(name: str, entry: TarInfo) -> FileInfo:
 
 
 class _AsyncFsspecSource:
-    """Exact async backend ranges bridged from native callback workers."""
+    """Exact backend ranges through the native async-source seam."""
 
     def __init__(self, backend: AbstractFileSystem, path: str, size: int):
         self.backend, self.path, self.size = backend, path, size
-        self.loop = asyncio.get_running_loop()
 
-    def read_range(self, offset: int, length: int) -> bytes:
+    async def read_range(self, offset: int, length: int) -> bytes:
         return cast(
-            bytes,
-            asyncio.run_coroutine_threadsafe(
-                self.backend._cat_file(self.path, start=offset, end=offset + length), self.loop
-            ).result(),
+            bytes, await self.backend._cat_file(self.path, start=offset, end=offset + length)
         )
 
 
@@ -707,12 +703,11 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         owner_loop = self._bound_loop or (self._loop if not self.asynchronous else None)
         if running_loop is not None and running_loop is owner_loop:
             running_loop.create_task(self._finalize())
-        elif not self.asynchronous:
-            self._aborting = True
-            with suppress(Exception):
-                self.close()
-        elif self._bound_loop is not None and self._bound_loop.is_running():
-            self._bound_loop.call_soon_threadsafe(lambda: asyncio.create_task(self._finalize()))
+        elif owner_loop is not None and owner_loop.is_running():
+            # GC can run while fsspec's sync facade holds an Event condition.
+            # Waiting here would stop that loop completing the enclosing call.
+            with suppress(RuntimeError):
+                owner_loop.call_soon_threadsafe(lambda: asyncio.create_task(self._finalize()))
         elif not isinstance(self.fo, (str, PathLike)):
             with suppress(Exception):
                 self.fo.close()

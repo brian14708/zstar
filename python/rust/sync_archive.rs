@@ -263,6 +263,11 @@ impl SyncArchive {
         size: u64,
         options: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Self> {
+        if crate::callback::AsyncCallback::is_async_method(py, &source, "read_range")? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "use AsyncArchive for async sources",
+            ));
+        }
         let options = reader::reader_options(py, options)?;
         Self::open(py, Session::from_python(source, size, options))
     }
@@ -284,7 +289,9 @@ impl SyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<(Py<pyo3::types::PyBytes>, Py<pyo3::types::PyDict>)> {
         let lease = self.reader()?;
-        let resolver = resolver.map(|resolver| external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| external::sync_binding(py, resolver))
+            .transpose()?;
         block_on(
             py,
             lease.read_with_report(path, offset, length, resolver.as_deref()),
@@ -305,7 +312,9 @@ impl SyncArchive {
     ) -> PyResult<Vec<Py<pyo3::types::PyBytes>>> {
         let requests = reader::batch_requests(requests)?;
         let lease = self.reader()?;
-        let resolver = resolver.map(|resolver| external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| external::sync_binding(py, resolver))
+            .transpose()?;
         block_on(py, lease.read_many(&requests, resolver.as_deref()))
     }
     #[getter]
@@ -353,7 +362,9 @@ impl SyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Py<pyo3::types::PyBytes>> {
         let lease = self.reader()?;
-        let resolver = resolver.map(|resolver| external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| external::sync_binding(py, resolver))
+            .transpose()?;
         block_on(py, lease.read(path, offset, length, resolver.as_deref()))
     }
 }

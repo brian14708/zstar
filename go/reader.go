@@ -9,8 +9,12 @@ import (
 // ReaderOptions controls bounded metadata/content storage and external hashes.
 // Metadata is always authenticated and archive data checksums are mandatory.
 type ReaderOptions struct {
-	Manifest ManifestReaderOptions
-	Resolver EncodedContentResolver
+	// ConcurrentChunks overrides Manifest.ConcurrentChunks when nonzero.
+	ConcurrentChunks int
+	// MaxReadBytes overrides Manifest.MaxReadBytes when nonzero.
+	MaxReadBytes uint64
+	Manifest     ManifestReaderOptions
+	Resolver     EncodedContentResolver
 	// VerifyExternalHash opts into SHA-256 verification of resolved objects.
 	// The default checks object availability, encoded bounds and decoded extent lengths.
 	VerifyExternalHash bool
@@ -45,6 +49,12 @@ func Open(ctx context.Context, source RangeReader) (*Reader, error) {
 // the source and resolver. Sources and resolvers must support
 // concurrent calls. ctx applies only to opening, not subsequent reads.
 func OpenWithOptions(ctx context.Context, source RangeReader, options ReaderOptions) (*Reader, error) {
+	if options.ConcurrentChunks != 0 {
+		options.Manifest.ConcurrentChunks = options.ConcurrentChunks
+	}
+	if options.MaxReadBytes != 0 {
+		options.Manifest.MaxReadBytes = options.MaxReadBytes
+	}
 	manifest, err := OpenManifest(ctx, source, options.Manifest)
 	if err != nil {
 		return nil, err
@@ -155,8 +165,10 @@ func (r *Reader) VerifyScope(ctx context.Context, scope VerificationScope) (Veri
 }
 
 // Verify is the compatibility shorthand for VerifyScope. It validates the
-// complete physical archive and, when externalClosure is true, every external extent. External object SHA-256 is
-// checked only when VerifyExternalHash is set; codec checksums and range checks always apply.
+// physical archive and, when externalClosure is true, every external extent.
+// SHA-256 follows VerifyExternalHash; codec checksums and bounds always apply.
+//
+// Deprecated: use VerifyScope with an explicit VerificationScope.
 func (r *Reader) Verify(ctx context.Context, externalClosure bool) (VerificationReport, error) {
 	scope := VerifyArchive
 	if externalClosure {

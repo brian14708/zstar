@@ -524,18 +524,18 @@ def test_wire_metadata_stays_private():
     for name in ("CborValue", "EntryFields", "EntryTuple", "ExtentTuple", "ManifestOptions"):
         assert not hasattr(types, name)
     for cls in (zstar.Archive, zstar.AsyncArchive):
-        for name in ("entry", "iter_entries", "root_extensions"):
+        for name in ("entry", "iter_entries"):
             assert not hasattr(cls, name)
     for cls in (ArchiveWriter, AsyncArchiveWriter):
         assert not hasattr(cls, "add_entry")
-    with pytest.raises(TypeError, match="root_extensions"):
-        ArchiveWriter(io.BytesIO(), root_extensions={})
+    with ArchiveWriter(io.BytesIO(), root_extensions={}):
+        pass
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
     # Exercise more than one native batch and multiple extents without fetching
-    # external objects. Extensions are authenticated but stay private.
+    # external objects. Ordinary iteration authenticates extensions without projecting them.
     output = io.BytesIO()
     extents = ((2, "sha256:" + "01" * 32, 10), (3, "sha256:" + "02" * 32, 12))
     with _native.EntryArchiveWriter(output) as writer:

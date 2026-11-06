@@ -144,7 +144,7 @@ func testPresignedGETAndPUT(ctx context.Context, t *testing.T, client *awss3.Cli
 			t.Error(err)
 		}
 	}()
-	if _, err := archive.Verify(ctx, false); err != nil {
+	if _, err := archive.VerifyScope(ctx, zstar.VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 	selected, err := archive.Read(ctx, "data", 4096, 12)

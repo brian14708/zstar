@@ -9,7 +9,9 @@ Use this guide to configure storage, ownership, and resource limits. Start with 
 
 `Builder::finish` finalizes the manifest and footer. File paths are relative,
 use `/` separators, and require explicit entries for ancestor directories.
-Add entries in any order; the writer sorts the manifest.
+Add entries in any order; the writer sorts the manifest. UTF-8 path order avoids
+an additional manifest sorting spool at finish; namespace validation still
+applies. Filesystem packing uses this path automatically.
 `ManifestOptions.limits` bounds frames, windows, metadata items,
 and extent counts. Zero disables each additional limit. Known-size inputs that
 cannot fit configured extent or metadata budgets are rejected before payload I/O.
@@ -95,3 +97,7 @@ cargo run --locked -p zstar --features fs --example local_range -- example.zstar
 The [format specification][spec] defines the wire rules and validation scopes.
 
 [spec]: /zstar/reference/spec/core/
+
+See [SDK customization](/zstar/guides/sdk-customization/) for focused
+`MetadataReaderOptions` / `MetadataWriterOptions`, fallible writer initialization,
+custom object writers and chunk streams, and ownership/cancellation contracts.

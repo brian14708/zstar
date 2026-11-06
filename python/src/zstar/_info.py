@@ -6,6 +6,7 @@ from tarfile import DIRTYPE, REGTYPE, SYMTYPE, TarInfo
 from typing import Literal
 
 from ._types import CborValue, EntryFields, EntryTuple, MemberMetadata
+from .types import EntryMetadata, ExtensionValue
 
 
 def _nanoseconds(value: int | float | str) -> int:
@@ -27,7 +28,7 @@ def _nanoseconds(value: int | float | str) -> int:
     return int(result)
 
 
-def _from_entry(entry: EntryTuple) -> TarInfo:
+def _from_entry(entry: EntryTuple, *, warn: bool = True) -> TarInfo:
     fields = entry[7] if len(entry) == 8 else {}
     linkname = fields.get("linkname", "")
     assert isinstance(linkname, str)
@@ -36,7 +37,7 @@ def _from_entry(entry: EntryTuple) -> TarInfo:
             *entry[:6],
             sum(extent[0] for extent in entry[6]),
             linkname,
-            bool(set(fields) - {"linkname"}),
+            warn and bool(set(fields) - {"linkname"}),
         )
     )
 
@@ -61,7 +62,7 @@ def _from_metadata(metadata: MemberMetadata) -> TarInfo:
     return info
 
 
-def _to_entry(info: TarInfo) -> EntryTuple:
+def _to_entry(info: TarInfo, *, extensions: dict[str, ExtensionValue] | None = None) -> EntryTuple:
     if not isinstance(info, TarInfo):
         raise TypeError("tarinfo must be a tarfile.TarInfo")
     kind: Literal[0, 2, 5]
@@ -85,4 +86,16 @@ def _to_entry(info: TarInfo) -> EntryTuple:
         _nanoseconds(info.pax_headers.get("mtime", info.mtime)),
         (),
     )
+    if extensions:
+        if any(not key.startswith("x-") for key in extensions):
+            raise ValueError("extension names must start with x-")
+        fields.update(extensions)
     return (*entry, fields) if fields else entry
+
+
+def _metadata(entry: EntryTuple) -> EntryMetadata:
+    fields = entry[7] if len(entry) == 8 else {}
+    return EntryMetadata(
+        _from_entry(entry, warn=False),
+        {key: value for key, value in fields.items() if key.startswith("x-")},
+    )

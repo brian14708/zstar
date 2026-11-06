@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
 
-use super::reader::{Lease, Session, reader_options};
+use super::reader::{Lease, Session, async_reader_options as reader_options};
 use super::request::FailureSlot;
 
 /// Async indexed archive over bytes, local sources, HTTP, or S3.
@@ -236,7 +236,8 @@ impl AsyncArchive {
         options: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = reader_options(py, options)?;
-        Self::open(py, Session::from_python(source, size, options))
+        let source = super::reader::python_source(py, source, size)?;
+        Self::open(py, Session::open(source, options, None))
     }
 
     #[staticmethod]
@@ -322,7 +323,9 @@ impl AsyncArchive {
     ) -> PyResult<Bound<'py, PyAny>> {
         let requests = super::reader::batch_requests(requests)?;
         let lease = self.lease()?;
-        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| super::external::binding(py, resolver))
+            .transpose()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
                 .run(lease.read_many(&requests, resolver.as_deref()))
@@ -347,7 +350,9 @@ impl AsyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| super::external::binding(py, resolver))
+            .transpose()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
                 .run(lease.read_with_report(&path, offset, length, resolver.as_deref()))
@@ -407,7 +412,9 @@ impl AsyncArchive {
         resolver: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
-        let resolver = resolver.map(|resolver| super::external::binding(py, resolver));
+        let resolver = resolver
+            .map(|resolver| super::external::binding(py, resolver))
+            .transpose()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
                 .run(lease.read(&path, offset, length, resolver.as_deref()))

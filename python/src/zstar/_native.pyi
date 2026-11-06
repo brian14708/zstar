@@ -1,4 +1,4 @@
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from os import PathLike
 from types import TracebackType
 from typing import Generic, TypedDict, TypeVar, Unpack
@@ -7,6 +7,9 @@ from typing_extensions import Buffer, Reader
 
 from ._types import CborValue, EntryTuple, MemberMetadata, NativeWriterOptions
 from .types import (
+    AsyncObjectResolver,
+    AsyncRangeSource,
+    AsyncReaderOptions,
     BinaryWriter,
     ErrorCategory,
     ObjectResolver,
@@ -114,16 +117,18 @@ class SyncEntries(Generic[_Item]):
 
 class AsyncArchive:
     @staticmethod
-    def from_bytes(data: Buffer, **options: Unpack[ReaderOptions]) -> Awaitable[AsyncArchive]: ...
-    @staticmethod
-    def from_source(
-        source: RangeSource, size: int, **options: Unpack[ReaderOptions]
+    def from_bytes(
+        data: Buffer, **options: Unpack[AsyncReaderOptions]
     ) -> Awaitable[AsyncArchive]: ...
     @staticmethod
-    def from_file(path: str, **options: Unpack[ReaderOptions]) -> Awaitable[AsyncArchive]: ...
+    def from_source(
+        source: RangeSource | AsyncRangeSource, size: int, **options: Unpack[AsyncReaderOptions]
+    ) -> Awaitable[AsyncArchive]: ...
+    @staticmethod
+    def from_file(path: str, **options: Unpack[AsyncReaderOptions]) -> Awaitable[AsyncArchive]: ...
     @staticmethod
     def from_fileobj(
-        fileobj: SeekableReader, **options: Unpack[ReaderOptions]
+        fileobj: SeekableReader, **options: Unpack[AsyncReaderOptions]
     ) -> Awaitable[AsyncArchive]: ...
     @staticmethod
     def from_url(
@@ -131,7 +136,7 @@ class AsyncArchive:
         *,
         headers: dict[str, str] | None = None,
         provider: RequestProvider | None = None,
-        **options: Unpack[ReaderOptions],
+        **options: Unpack[AsyncReaderOptions],
     ) -> Awaitable[AsyncArchive]: ...
     @staticmethod
     def from_s3(
@@ -145,7 +150,7 @@ class AsyncArchive:
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
         session_token: str | None = None,
-        **options: Unpack[ReaderOptions],
+        **options: Unpack[AsyncReaderOptions],
     ) -> Awaitable[AsyncArchive]: ...
     @property
     def closed(self) -> bool: ...
@@ -169,10 +174,13 @@ class AsyncArchive:
         offset: int = 0,
         length: int | None = None,
         *,
-        resolver: ObjectResolver | None = None,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> Awaitable[bytes]: ...
     def read_many(
-        self, requests: Sequence[tuple[str, int, int]], *, resolver: ObjectResolver | None = None
+        self,
+        requests: Sequence[tuple[str, int, int]],
+        *,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> Awaitable[list[bytes]]: ...
     def _open_member(self, path: str, cache_bytes: int) -> Awaitable[MemberCursor]: ...
     def _read_member(self, cursor: MemberCursor, size: int | None) -> Awaitable[bytes]: ...
@@ -181,7 +189,12 @@ class AsyncArchive:
         self, cursor: MemberCursor, offset: int, buffer: Buffer
     ) -> Awaitable[int]: ...
     def read_with_report(
-        self, path: str, offset: int, length: int | None, *, resolver: ObjectResolver | None = None
+        self,
+        path: str,
+        offset: int,
+        length: int | None,
+        *,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> Awaitable[tuple[bytes, ReadReport]]: ...
     def verify(self, *, external: bool = False) -> Awaitable[VerificationReport]: ...
     def close(self) -> Awaitable[None]: ...
@@ -267,6 +280,13 @@ class EntryArchiveWriter:
     @property
     def closed(self) -> bool: ...
     def add(self, entry: EntryTuple, body: Reader[bytes] | None = None, size: int = 0) -> None: ...
+    def _add_external(
+        self,
+        entry: EntryTuple,
+        chunks: Iterable[bytes],
+        size: int,
+        callback: Callable[[str, bytes, int], int],
+    ) -> None: ...
     def add_path(
         self,
         path: str | PathLike[str],

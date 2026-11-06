@@ -23,10 +23,23 @@ type Stream struct {
 	chunk      *manifestContentChunk
 }
 
-// OpenStream opens a regular member with a private decoded-source cache.
-// Zero cacheBytes selects 2 MiB, including fixed stream/cache bookkeeping.
-// Larger sources are decoded under the archive's frame budgets but not retained. ctx applies only to opening.
+// StreamOptions controls decoded-source retention independently of read budgets.
+// The zero value selects a 2 MiB cache; DisableCache explicitly disables it.
+type StreamOptions struct {
+	CacheBytes   uint64
+	DisableCache bool
+}
+
+// OpenStream opens a seekable member with the legacy cache-size convention.
+// Zero selects 2 MiB. Use OpenStreamWithOptions to disable caching explicitly.
 func (r *Reader) OpenStream(ctx context.Context, path string, cacheBytes uint64) (*Stream, error) {
+	return r.OpenStreamWithOptions(ctx, path, StreamOptions{CacheBytes: cacheBytes})
+}
+
+// OpenStreamWithOptions opens the recommended sequential member reader.
+// ctx applies only to opening; use ReadContext for per-read deadlines.
+// Larger decoded sources are validated but not retained in the cache.
+func (r *Reader) OpenStreamWithOptions(ctx context.Context, path string, options StreamOptions) (*Stream, error) {
 	f, err := r.OpenFile(ctx, path)
 	if err != nil {
 		return nil, err
@@ -34,7 +47,10 @@ func (r *Reader) OpenStream(ctx context.Context, path string, cacheBytes uint64)
 	if f.size > math.MaxInt64 {
 		return nil, rejected(CategoryResourceLimit, "stream size exceeds int64")
 	}
-	if cacheBytes == 0 {
+	cacheBytes := options.CacheBytes
+	if options.DisableCache {
+		cacheBytes = 0
+	} else if cacheBytes == 0 {
 		cacheBytes = 2 << 20
 	}
 	return &Stream{file: f, cacheBytes: cacheBytes}, nil

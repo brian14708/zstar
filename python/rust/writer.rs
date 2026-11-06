@@ -42,6 +42,8 @@ impl Read for Body {
 pub struct EntryArchiveWriter {
     inner: Gate<BlockingBuilder<Sink>>,
     failed: AtomicBool,
+    compression_level: i32,
+    limits: zstar::Limits,
 }
 impl EntryArchiveWriter {
     pub(crate) fn add_entry(
@@ -143,12 +145,13 @@ impl EntryArchiveWriter {
         workers: usize,
         root_extensions: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
+        let limits = super::reader::limits(limits)?;
         let writer = BlockingBuilder::with_options(
             Sink(output),
             frame_size,
             compression_level,
             ManifestOptions {
-                limits: super::reader::limits(limits)?,
+                limits,
                 memory_bytes,
                 block_target,
                 spool_budget: Arc::new(zstar::SpoolBudget::new(max_spool_bytes)),
@@ -170,6 +173,8 @@ impl EntryArchiveWriter {
         Ok(Self {
             inner: Gate::new(writer),
             failed: AtomicBool::new(false),
+            compression_level,
+            limits,
         })
     }
     #[pyo3(
@@ -188,6 +193,99 @@ impl EntryArchiveWriter {
     ) -> PyResult<()> {
         let entry = Entry::from_value(&from_py(entry, 0)?, u64::MAX).map_err(core_error)?;
         self.add_entry(py, entry, body, size)
+    }
+    /// Advanced thin writing; raw chunk boundaries are selected by the caller.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Own Python callback references throughout detached writer work."
+    )]
+    fn _add_external(
+        &self,
+        py: Python<'_>,
+        entry: &Bound<'_, PyAny>,
+        chunks: Py<PyAny>,
+        size: u64,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.inner.reject_reentry().map_err(core_error)?;
+        self.check_failed()?;
+        let mut entry = Entry::from_value(&from_py(entry, 0)?, u64::MAX).map_err(core_error)?;
+        if entry.kind != EntryKind::File || !entry.extents.is_empty() {
+            return Err(core_error(Error::Unsupported(
+                "external file requires file metadata",
+            )));
+        }
+        let result = self.inner.run(py, |writer| {
+            let iterator = Python::attach(|py| chunks.bind(py).try_iter().map(Bound::unbind))
+                .map_err(|e| Error::Io(py_io(e)))?;
+            let mut total = 0_u64;
+            loop {
+                let raw = Python::attach(|py| -> PyResult<Option<Vec<u8>>> {
+                    iterator
+                        .bind(py)
+                        .clone()
+                        .next()
+                        .transpose()?
+                        .map(|value| {
+                            let length = value.len()? as u64;
+                            if length == 0
+                                || self.limits.max_frame_decoded_bytes != 0
+                                    && length > self.limits.max_frame_decoded_bytes
+                            {
+                                return Err(core_error(Error::Budget("raw chunk size")));
+                            }
+                            crate::support::buffer_vec(py, &value)
+                        })
+                        .transpose()
+                })
+                .map_err(|e| Error::Io(py_io(e)))?;
+                let Some(raw) = raw else {
+                    break;
+                };
+                total = total.checked_add(raw.len() as u64).ok_or(Error::Range)?;
+                if total > size {
+                    return Err(Error::Range);
+                }
+                if self.limits.max_extents != 0
+                    && entry.extents.len() as u64 >= self.limits.max_extents
+                {
+                    return Err(Error::Budget("external extent count"));
+                }
+                let digest = *zstar::Digest::sha256(&raw).as_bytes();
+                let encoded = zstar::encode_frame(&raw, self.compression_level)?;
+                let encoded_size = Python::attach(|py| {
+                    callback
+                        .call1(
+                            py,
+                            (
+                                zstar::manifest::object_address(&digest),
+                                pyo3::types::PyBytes::new(py, &encoded),
+                                raw.len(),
+                            ),
+                        )
+                        .and_then(|value| value.extract::<u64>(py))
+                })
+                .map_err(|e| Error::Io(py_io(e)))?;
+                entry.extents.push(zstar::Extent {
+                    size: raw.len() as u64,
+                    source: zstar::Source::Object(digest),
+                    encoded_size,
+                    offset: 0,
+                });
+            }
+            if total != size {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "external file size mismatch",
+                )));
+            }
+            entry.validate(u64::MAX)?;
+            writer.add_metadata(entry)
+        });
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
     }
     #[expect(
         clippy::needless_pass_by_value,

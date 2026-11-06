@@ -36,6 +36,8 @@ collisions. Ownership is not restored; special mode bits require
 library's `zstar::fs` module documentation describes platform support and
 restoration behavior.
 
+## S3 storage
+
 `pack` outputs and `inspect`/`extract` inputs also accept `s3://bucket/key` URLs.
 The CLI uses the AWS credential chain and selected `AWS_PROFILE`. Remote
 inspection and extraction stream the archive to a temporary file first. Uploads
@@ -47,6 +49,8 @@ writes for this protection.
 Service endpoints configured in the selected AWS profile honor its
 `s3.addressing_style`: path-style endpoints keep their host unchanged;
 virtual-hosted endpoints include the bucket in the host.
+
+## External content
 
 External objects can be supplied to extraction with `--objects <directory>`.
 Their hashes are not checked by default; use `--verify-external-hash` to opt into
@@ -60,7 +64,6 @@ defines object extents, pointer payloads, and external verification. The informa
 [CAS storage appendix](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md#appendix-cas-storage)
 explains object identity and storage encoding.
 
-Thin archive members carry JSON content pointers using `zstar-pointer-v1`.
-Legacy line-based pointers fail full archive validation. The
+Thin archive members carry JSON content pointers using `zstar-pointer-v1`. The
 [catalog proposal](https://github.com/brian14708/zstar/blob/main/spec/draft/catalog.md)
 is a separate application format; the CLI does not resolve catalog views.

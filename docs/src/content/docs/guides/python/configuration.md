@@ -101,7 +101,9 @@ Objects are named `<lowercase sha256>.zst`. Files of 16 MiB or larger are split
 with FastCDC (2 MiB minimum, 8 MiB target, 16 MiB maximum). The external filesystem
 can use different storage or credentials and remains caller-owned. Zstar checks
 object availability and extent lengths; set `verify_external=True` to check
-SHA-256 too. Use low-level readers for custom `resolver=` implementations.
+SHA-256 too. Use low-level readers for custom `resolver=` implementations. Raw
+`ArchiveWriter.add_external` also accepts custom raw chunk iterables and object
+writers. See [SDK customization](/zstar/guides/sdk-customization/).
 
 A writer accepts `wb`/`wt` member streams, `mkdir`, `makedirs`, `pipe_file`, and
 `put(..., recursive=True)`. There is one active member at a time. Parent directories
@@ -124,10 +126,17 @@ For async backends, use their native async filesystem and pass `asynchronous=Tru
 Native compression and archive work run on Rust workers; backend stream operations are
 awaited on the owning event loop. `aiofiles` and `aiofile` objects are not required.
 
+On failure, writers close owned files before removing unfinished output, including
+on Windows. Transactional fsspec outputs are discarded without committing them;
+caller-owned sinks passed to `ArchiveWriter` remain open. Use explicit `close()` /
+`aclose()` or context managers to wait for owned resources to close; garbage
+collection cleanup is nonblocking and best effort.
+
 ## Raw archive interface
 
-Use `Archive.from_file`, `Archive.from_source`, or `Archive.from_url` for sync
-reads. For async reads, await the corresponding `AsyncArchive` factories.
+Use `Archive.from_file`, `Archive.from_source`, `Archive.from_bytes`, or
+`Archive.from_url` for sync reads. For async reads, await the corresponding
+`AsyncArchive` factories.
 Readers expose standard `tarfile.TarInfo` metadata. Lookup and file reads never
 follow symlinks. Opening a symlink as a member stream raises `tarfile.ExtractError`;
 use `read_link()` to inspect its exact stored target. The fsspec adapter likewise
@@ -149,12 +158,14 @@ Reader options include
 and storage protocol types live in `zstar.types`.
 
 Write file metadata with `ArchiveWriter.addfile(tarinfo, body)` or its async
-counterpart. Manifest tuples, CBOR values, extent references, and raw extension
-metadata are private implementation details. `getinfo()` and `members()` emit
+counterpart. Manifest tuples and extent references are private implementation
+details. Extension metadata is public through
+`getmetadata()` and `root_extensions`. `getinfo()` and `members()` emit
 `UserWarning` when their `TarInfo` projection omits entry or archive-level
 extensions, including when enumerating an empty archive. Rewriting that metadata
-loses those extensions; applications requiring a lossless rewrite can treat the
-warning as an error.
+loses those extensions. Use `getmetadata()` and pass its `extensions` to
+`addfile(..., extensions=...)`, and pass `root_extensions` when creating the writer,
+to preserve them. See [SDK customization](/zstar/guides/sdk-customization/).
 
 ```python
 from pathlib import Path
@@ -199,11 +210,19 @@ chain and is configured independently through `target_options` or `fs=`.
 
 ## Performance
 
+Writers accept entries in any order. UTF-8 path order avoids an additional
+native manifest sorting spool at close; namespace validation still applies.
+Native filesystem capture uses this path automatically.
+
 Keep the archive or filesystem open across reads to reuse parsed metadata. Use
 `read_many()` or fsspec's `cat_ranges()` to share work across related ranges.
 Direct archive reads do not retain decoded content. Member streams reuse one
 validated decoded source; configure `archive.open(name, cache_bytes=2 << 20)` or
 set `cache_bytes=0` to disable retention. The async interface uses the same option.
+
+Filename and member iteration uses bounded native batches without constructing
+Python extent or extension objects. Prefer `names()` when only filenames are
+needed.
 
 Both interfaces use Rust for decoding, validation, and compression. Direct path
 reads use native file I/O; fsspec and supplied Python streams add callbacks.

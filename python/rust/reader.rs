@@ -13,11 +13,10 @@ use std::{
     },
 };
 use tokio::sync::{Notify, watch};
-use zstar::ObjectResolver;
 
 use super::request::FailureSlot;
-use crate::support::{PyCause, core_error};
-use zstar::ReaderOptions;
+use crate::support::{PyCause, core_error, py_io};
+use zstar::{ObjectResolver, ReaderOptions};
 
 pub type Reader = zstar::Archive<dyn zstar::AsyncRangeReader>;
 
@@ -532,7 +531,9 @@ impl ReaderConfig {
         let options = ReaderOptions {
             concurrent_chunks,
             verify_external,
-            resolver: resolver.map(|r| super::external::binding(py, r)),
+            resolver: resolver
+                .map(|r| super::external::binding(py, r))
+                .transpose()?,
             manifest: zstar::ManifestOptions {
                 limits: self::limits(limits)?,
                 memory_bytes,
@@ -551,6 +552,24 @@ impl ReaderConfig {
 }
 
 pub fn reader_options(
+    py: Python<'_>,
+    options: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<ReaderOptions> {
+    if let Some(resolver) = options
+        .map(|o| o.get_item("resolver"))
+        .transpose()?
+        .flatten()
+        && !resolver.is_none()
+        && crate::callback::AsyncCallback::is_async_method(py, &resolver.unbind(), "get_encoded")?
+    {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "use AsyncArchive for async resolvers",
+        ));
+    }
+    async_reader_options(py, options)
+}
+
+pub fn async_reader_options(
     py: Python<'_>,
     options: Option<&Bound<'_, pyo3::types::PyDict>>,
 ) -> PyResult<ReaderOptions> {
@@ -640,6 +659,7 @@ struct PythonSource {
     object: Arc<Py<PyAny>>,
     size: u64,
     permits: Arc<tokio::sync::Semaphore>,
+    callback: Option<crate::callback::AsyncCallback>,
 }
 impl PythonSource {
     fn new(source: Py<PyAny>, size: u64) -> Self {
@@ -647,9 +667,11 @@ impl PythonSource {
             object: Arc::new(source),
             size,
             permits: Arc::new(tokio::sync::Semaphore::new(8)),
+            callback: None,
         }
     }
 }
+
 #[async_trait::async_trait]
 impl zstar::AsyncRangeReader for PythonSource {
     async fn size(&self) -> zstar::Result<u64> {
@@ -664,6 +686,28 @@ impl zstar::AsyncRangeReader for PythonSource {
                 .ok_or(zstar::Error::Range)?,
             self.size,
         )?;
+        if let Some(callback) = &self.callback {
+            let args = Python::attach(|py| {
+                (range.start, range.end - range.start)
+                    .into_pyobject(py)
+                    .map(Bound::unbind)
+            })
+            .map_err(|error| zstar::Error::Io(py_io(error)))?;
+            let value = callback
+                .call(args)
+                .await
+                .map_err(|error| zstar::Error::Io(py_io(error)))?;
+            let bytes = Python::attach(|py| -> PyResult<Vec<u8>> {
+                if value.bind(py).len()? as u64 != range.end - range.start {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "short range response",
+                    ));
+                }
+                value.extract(py)
+            })
+            .map_err(|error| zstar::Error::Io(py_io(error)))?;
+            return Ok(bytes::Bytes::from(bytes));
+        }
         let object = self.object.clone();
         let permit = self
             .permits
@@ -871,4 +915,15 @@ pub fn limits(options: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<zsta
         }
     }
     Ok(result)
+}
+
+pub fn python_source(
+    py: Python<'_>,
+    source: Py<PyAny>,
+    size: u64,
+) -> PyResult<Arc<dyn zstar::AsyncRangeReader>> {
+    let callback = crate::callback::AsyncCallback::detect(py, &source, "read_range")?;
+    let mut reader = PythonSource::new(source, size);
+    reader.callback = callback;
+    Ok(Arc::new(reader))
 }

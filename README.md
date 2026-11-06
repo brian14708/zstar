@@ -7,21 +7,12 @@ byte ranges without decompressing the entire archive. It combines independently
 compressed Zstandard frames with deterministic CBOR metadata. Archives can keep
 all content inline or reference external objects by SHA-256.
 
-The [draft specifications](spec/draft/README.md) are working drafts. The [core
-specification](spec/draft/core.md) defines archive framing, the manifest,
-validation, and implementation profiles. The standalone [external-content
-extension](spec/draft/external-content.md) defines thin archives and content
-references. Standard Zstandard and tar tools can decode the tar stream;
-resolving external content requires a Zstar reader.
+Standard Zstandard and tar tools can decode the tar stream; resolving external
+content requires a Zstar reader.
 
-External-file pointer payloads are JSON documents using `zstar-pointer-v1`;
-archive manifests and standalone content references use deterministic CBOR.
-The [catalog proposal](spec/draft/catalog.md) defines named JSON collections of
-CAS-stored archive layers with nesting and whiteout merging. Catalog operations
-are not yet implemented by the SDKs.
-
-The informative [CAS storage appendix](spec/draft/external-content.md#appendix-cas-storage) explains how object
-identity remains independent of compressed storage representations.
+The [draft specifications](spec/draft/README.md) define the core format and
+external-content extension. The separate catalog proposal describes named
+collections of archive layers; catalog operations are not yet implemented.
 
 ## Libraries and CLI
 
@@ -30,11 +21,10 @@ identity remains independent of compressed storage representations.
 | Rust library | [Reader, writer, and feature guide](crates/zstar/README.md) | `crates/zstar/` |
 | CLI | [Packing, inspection, and extraction](crates/zstar-cli/README.md) | `crates/zstar-cli/` |
 | Python SDK | [Sync, async, and fsspec APIs](python/README.md) | `python/` |
-| Go SDK | [Package and API documentation](go/) | `go/` |
+| Go SDK | [Package and API documentation](go/README.md) | `go/` |
 
-The Rust storage adapters are documented in the generated API documentation for
-`zstar::fs`, `zstar::http`, and `zstar::s3`. Shared conformance fixtures under
-`testdata/` exercise the SDKs against the same valid and invalid archives.
+The [SDK customization guide](https://brian14708.github.io/zstar/guides/sdk-customization/)
+describes custom storage, ownership, cancellation, and resource policies.
 
 ## Validation support
 
@@ -45,7 +35,7 @@ The Rust storage adapters are documented in the generated API documentation for
 | Full physical archive validation | `verify(Archive)` | `VerifyScope(VerifyArchive)` | `verify()` |
 | External closure validation | `verify(ExternalClosure)` | `VerifyScope(VerifyExternalClosure)` | `verify(external=True)` |
 | External SHA-256 opt-in | `verify_external` | `VerifyExternalHash` | `verify_external` |
-| Portable and thin writing | Yes | Yes | Portable raw writer; thin fsspec writer |
+| Portable and thin writing | Yes | Yes | Yes, raw and fsspec APIs |
 | Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
 
 External SHA-256 checking defaults to disabled. Metadata digests, frame
@@ -63,5 +53,11 @@ nix develop
 just
 ```
 
-See [justfile](justfile) for lint, test, integration, and packaging recipes,
-and [docs/README.md](docs/README.md) for documentation builds and previews.
+The [justfile](justfile) defines the check recipes. `just lint` and `just check`
+prepare an installed Python wheel before running Python checks. Shared fixtures
+under `testdata/` cover valid and invalid archives across SDKs.
+
+Run `just check-integration` for RustFS-backed S3 tests. It starts a disposable
+service on local port 9000, which must be available; the Nix shell supplies
+RustFS on Linux. Run `just package` from a clean Git tree to build release
+artifacts. See [docs/README.md](docs/README.md) for documentation builds and previews.

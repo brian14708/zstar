@@ -72,7 +72,7 @@ func TestWriterRoundTripAndReaderAt(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer testClose(t, archive)
-			if _, err := archive.Verify(context.Background(), false); err != nil {
+			if _, err := archive.VerifyScope(context.Background(), VerifyArchive); err != nil {
 				t.Fatal(err)
 			}
 			want := strings.Repeat("abcd", 1500)
@@ -340,7 +340,7 @@ func TestWriterAcceptsMoreThan65536InlineExtents(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{7}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if _, err = reader.Verify(context.Background(), false); err != nil {
+	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -381,7 +381,7 @@ func TestWriterLargeExternalEntryAndReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer testClose(t, result)
-	if _, err = result.Verify(context.Background(), false); err != nil {
+	if _, err = result.VerifyScope(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -428,7 +428,7 @@ func TestFrameSizesAreCallerPolicy(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{9}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if _, err = reader.Verify(context.Background(), false); err != nil {
+	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 	limits := Limits{MaxFrameDecodedBytes: 16 << 20}

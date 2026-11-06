@@ -14,8 +14,13 @@ from typing_extensions import Buffer
 
 from . import _native
 from ._file import ArchiveFile, AsyncArchiveFile
-from ._info import _from_metadata
+from ._info import _from_metadata, _metadata
 from .types import (
+    AsyncObjectResolver,
+    AsyncRangeSource,
+    AsyncReaderOptions,
+    EntryMetadata,
+    ExtensionValue,
     ObjectResolver,
     RangeSource,
     ReaderOptions,
@@ -55,6 +60,12 @@ class _Metadata(Generic[_Reader]):
             )
 
     @property
+    def root_extensions(self) -> dict[str, ExtensionValue]:
+        """Owned authenticated root extensions; pass to the output writer to preserve."""
+        self._check_open()
+        return self._reader.root_extensions
+
+    @property
     def _max_read_bytes(self) -> int:
         return self._reader.max_read_bytes
 
@@ -78,6 +89,19 @@ class Archive(_Metadata[_native.SyncArchive]):
     def __init__(self, data: Buffer, **options: Unpack[ReaderOptions]) -> None:
         """Open any bytes-like snapshot; the archive keeps one private copy."""
         self._reader = _native.SyncArchive.from_bytes(data, **options)
+
+    @classmethod
+    def from_bytes(cls, data: Buffer, **options: Unpack[ReaderOptions]) -> Self:
+        """Open a bytes-like snapshot, matching the other from_* factories."""
+        return cls(data, **options)
+
+    def getmetadata(self, name: str) -> EntryMetadata:
+        """Return owned metadata including all entry extensions, without projection loss."""
+        self._check_open()
+        entry = self._reader.entry(name)
+        if entry is None:
+            raise KeyError(name)
+        return _metadata(entry)
 
     def getinfo(self, name: str) -> TarInfo:
         """Return an owned TarInfo snapshot; raise KeyError for a missing name.
@@ -254,6 +278,14 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     def __init__(self) -> None:
         raise TypeError("use await AsyncArchive.from_file() or another from_* constructor")
 
+    async def getmetadata(self, name: str) -> EntryMetadata:
+        """Return owned metadata including all entry extensions."""
+        self._check_open()
+        entry = await self._reader.entry(name)
+        if entry is None:
+            raise KeyError(name)
+        return _metadata(entry)
+
     async def getinfo(self, name: str) -> TarInfo:
         """Return an owned TarInfo snapshot; raise KeyError for a missing name.
 
@@ -268,12 +300,15 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         return _from_metadata(metadata)
 
     @classmethod
-    async def from_bytes(cls, data: Buffer, **options: Unpack[ReaderOptions]) -> Self:
+    async def from_bytes(cls, data: Buffer, **options: Unpack[AsyncReaderOptions]) -> Self:
         return cls._wrap(await _native.AsyncArchive.from_bytes(data, **options))
 
     @classmethod
     async def from_source(
-        cls, source: RangeSource, size: int, **options: Unpack[ReaderOptions]
+        cls,
+        source: RangeSource | AsyncRangeSource,
+        size: int,
+        **options: Unpack[AsyncReaderOptions],
     ) -> Self:
         return cls._wrap(await _native.AsyncArchive.from_source(source, size, **options))
 
@@ -281,7 +316,7 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     async def from_file(
         cls,
         file: str | os.PathLike[str] | SeekableReader,
-        **options: Unpack[ReaderOptions],
+        **options: Unpack[AsyncReaderOptions],
     ) -> Self:
         """Open a local path asynchronously, or borrow a seekable binary file object."""
         if not isinstance(file, (str, os.PathLike)):
@@ -297,7 +332,7 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         *,
         headers: dict[str, str] | None = None,
         provider: RequestProvider | None = None,
-        **options: Unpack[ReaderOptions],
+        **options: Unpack[AsyncReaderOptions],
     ) -> Self:
         return cls._wrap(
             await _native.AsyncArchive.from_url(url, headers=headers, provider=provider, **options),
@@ -316,7 +351,7 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
         session_token: str | None = None,
-        **options: Unpack[ReaderOptions],
+        **options: Unpack[AsyncReaderOptions],
     ) -> Self:
         return cls._wrap(
             await _native.AsyncArchive.from_s3(
@@ -381,7 +416,7 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         offset: int = 0,
         length: int | None = None,
         *,
-        resolver: ObjectResolver | None = None,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> bytes:
         self._check_open()
         return await self._reader.read(name, offset, length, resolver=resolver)
@@ -398,7 +433,10 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         return await self._reader.read_link(name)
 
     async def read_many(
-        self, requests: Sequence[tuple[str, int, int]], *, resolver: ObjectResolver | None = None
+        self,
+        requests: Sequence[tuple[str, int, int]],
+        *,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> list[bytes]:
         self._check_open()
         return await self._reader.read_many(requests, resolver=resolver)
@@ -409,7 +447,7 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         offset: int = 0,
         length: int | None = None,
         *,
-        resolver: ObjectResolver | None = None,
+        resolver: ObjectResolver | AsyncObjectResolver | None = None,
     ) -> tuple[bytes, ReadReport]:
         self._check_open()
         return await self._reader.read_with_report(name, offset, length, resolver=resolver)

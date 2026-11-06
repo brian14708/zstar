@@ -16,11 +16,8 @@ struct CallbackWriter {
     level: i32,
 }
 
+#[async_trait::async_trait]
 impl zstar::chunking::ObjectWriter for CallbackWriter {
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "The implementation conforms to an async trait boundary."
-    )]
     async fn put_chunk(&mut self, raw: bytes::Bytes) -> zstar::Result<zstar::Extent> {
         let digest = *zstar::Digest::sha256(&raw).as_bytes();
         let encoded = zstar::encode_frame(&raw, self.level)?;
@@ -134,8 +131,20 @@ impl AsyncRead for Body {
         Poll::Ready(Ok(()))
     }
 }
-pub fn binding(_py: Python<'_>, object: Py<PyAny>) -> Arc<dyn zstar::ObjectResolver> {
-    Arc::new(PythonResolver(Arc::new(object)))
+pub fn sync_binding(py: Python<'_>, object: Py<PyAny>) -> PyResult<Arc<dyn zstar::ObjectResolver>> {
+    if crate::callback::AsyncCallback::is_async_method(py, &object, "get_encoded")? {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "use AsyncArchive for async resolvers",
+        ));
+    }
+    binding(py, object)
+}
+pub fn binding(py: Python<'_>, object: Py<PyAny>) -> PyResult<Arc<dyn zstar::ObjectResolver>> {
+    let callback = crate::callback::AsyncCallback::detect(py, &object, "get_encoded")?;
+    Ok(Arc::new(PythonResolver {
+        object: Arc::new(object),
+        callback,
+    }))
 }
 
 /// Shared callback validation for blocking manifest and async indexed readers.
@@ -158,28 +167,34 @@ pub fn resolve_encoded(
         }
         value.extract(py)
     })
-    .map_err(|error| {
-        Python::attach(|py| {
-            if error.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
-                zstar::Error::MissingObject(digest)
-            } else if error.is_instance_of::<ZstarError>(py)
-                && error
-                    .value(py)
-                    .getattr("category")
-                    .and_then(|c| c.extract::<String>())
-                    .ok()
-                    .as_deref()
-                    == Some("resource-limit")
-            {
-                zstar::Error::Budget("encoded resolver output size")
-            } else {
-                zstar::Error::Io(PyCause::io("Python encoded-object resolver failed", error))
-            }
-        })
+    .map_err(|error| resolver_error(error, digest))
+}
+
+fn resolver_error(error: PyErr, digest: [u8; 32]) -> zstar::Error {
+    Python::attach(|py| {
+        if error.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
+            zstar::Error::MissingObject(digest)
+        } else if error.is_instance_of::<ZstarError>(py)
+            && error
+                .value(py)
+                .getattr("category")
+                .and_then(|c| c.extract::<String>())
+                .ok()
+                .as_deref()
+                == Some("resource-limit")
+        {
+            zstar::Error::Budget("encoded resolver output size")
+        } else {
+            zstar::Error::Io(PyCause::io("Python encoded-object resolver failed", error))
+        }
     })
 }
 
-struct PythonResolver(Arc<Py<PyAny>>);
+struct PythonResolver {
+    object: Arc<Py<PyAny>>,
+    callback: Option<crate::callback::AsyncCallback>,
+}
+
 #[async_trait::async_trait]
 impl zstar::ObjectResolver for PythonResolver {
     #[expect(
@@ -192,7 +207,28 @@ impl zstar::ObjectResolver for PythonResolver {
         hint: u64,
         max_bytes: u64,
     ) -> zstar::Result<bytes::Bytes> {
-        let object = self.0.clone();
+        if let Some(callback) = &self.callback {
+            let args = Python::attach(|py| {
+                (zstar::manifest::object_address(&digest), hint, max_bytes)
+                    .into_pyobject(py)
+                    .map(Bound::unbind)
+            })
+            .map_err(|e| resolver_error(e, digest))?;
+            let value = callback
+                .call(args)
+                .await
+                .map_err(|e| resolver_error(e, digest))?;
+            return Python::attach(|py| -> PyResult<Bytes> {
+                if value.bind(py).len()? as u64 > max_bytes {
+                    return Err(core_error(zstar::Error::Budget(
+                        "encoded resolver output size",
+                    )));
+                }
+                value.extract::<Vec<u8>>(py).map(Bytes::from)
+            })
+            .map_err(|e| resolver_error(e, digest));
+        }
+        let object = self.object.clone();
         // A cancelled await cannot interrupt Python code already running.
         // Retain a global callback permit until that code actually completes.
         static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =

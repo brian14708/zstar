@@ -1,24 +1,41 @@
 """Structural interfaces for custom storage and typed reader options."""
 
+from __future__ import annotations
+
 from collections.abc import Awaitable, Callable
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from dataclasses import dataclass
+from tarfile import TarInfo
+from typing import Literal, NamedTuple, NotRequired, TypeAlias, TypedDict
 
 from typing_extensions import Protocol, Reader, Writer
 
 __all__ = [
+    "AsyncBinaryWriter",
+    "AsyncObjectResolver",
+    "AsyncObjectWriter",
+    "AsyncRangeSource",
+    "AsyncReader",
+    "AsyncReaderOptions",
     "BinaryWriter",
+    "ContentOptions",
+    "EntryMetadata",
     "ErrorCategory",
+    "ExtensionValue",
     "FileInfo",
     "Limits",
+    "MetadataOptions",
     "ObjectResolver",
+    "ObjectWriter",
     "ProgressCallback",
     "RangeSource",
     "ReadReport",
+    "ReadRequest",
     "ReaderOptions",
     "RequestProvider",
     "SeekableReader",
     "SignedRequest",
     "SpillStore",
+    "SpoolOptions",
     "VerificationReport",
     "WriterOptions",
 ]
@@ -59,13 +76,24 @@ class BinaryWriter(Writer[bytes], Protocol):
 
 
 class RangeSource(Protocol):
-    """Immutable, concurrently readable byte-range source."""
+    """Borrowed immutable source; calls may run concurrently on worker threads.
+
+    Return exactly length bytes for a valid offset/length range, or raise an
+    exception. Do not share an unprotected seek cursor or reenter this archive.
+    The archive never closes the source. Blocking calls cannot be interrupted.
+    """
 
     def read_range(self, offset: int, length: int, /) -> bytes: ...
 
 
 class ObjectResolver(Protocol):
-    """Resolve a complete encoded external object by its digest address."""
+    """Borrowed, concurrently callable resolver of complete encoded objects.
+
+    address is sha256: followed by 64 lowercase hex digits. hint is advisory;
+    enforce max_bytes against actual bytes before unbounded buffering. Raise
+    FileNotFoundError for missing objects. Do not reenter the calling archive.
+    The archive decodes and applies its hash policy; it never closes the resolver.
+    """
 
     def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
 
@@ -111,6 +139,7 @@ class WriterOptions(TypedDict, total=False):
 
     limits: Limits | None
     workers: int
+    root_extensions: dict[str, ExtensionValue] | None
     frame_size: int
     compression_level: int
     memory_bytes: int
@@ -119,7 +148,7 @@ class WriterOptions(TypedDict, total=False):
     create_spill_store: Callable[[], SpillStore] | None
 
 
-class ReaderOptions(TypedDict, total=False):
+class _ReaderBudgets(TypedDict, total=False):
     """Reader budgets, concurrency, and external content resolution."""
 
     limits: Limits | None
@@ -134,7 +163,18 @@ class ReaderOptions(TypedDict, total=False):
 
     concurrent_chunks: int
     verify_external: bool
+
+
+class ReaderOptions(_ReaderBudgets, total=False):
+    """Synchronous reader budgets and borrowed synchronous resolver."""
+
     resolver: ObjectResolver | None
+
+
+class AsyncReaderOptions(_ReaderBudgets, total=False):
+    """Async reader budgets with synchronous or coroutine-based resolution."""
+
+    resolver: ObjectResolver | AsyncObjectResolver | None
 
 
 class ReadReport(TypedDict):
@@ -169,3 +209,109 @@ class FileInfo(TypedDict):
     name: str
     size: int
     type: Literal["file", "directory", "link"]
+
+
+ExtensionValue: TypeAlias = (
+    bool
+    | int
+    | str
+    | bytes
+    | list["ExtensionValue"]
+    | tuple["ExtensionValue", ...]
+    | dict[str, "ExtensionValue"]
+)
+"""Restricted metadata values: no floats, nulls, tags, or non-string map keys."""
+
+
+class ReadRequest(NamedTuple):
+    """One member request using offset and length, not an end position."""
+
+    path: str
+    offset: int
+    length: int
+
+
+class AsyncRangeSource(Protocol):
+    """Borrowed async source; exact offset/length reads on the opening event loop.
+
+    The loop must stay running for the archive lifetime. Calls may overlap;
+    cancellation cancels pending coroutine work. Keep the source immutable.
+    """
+
+    async def read_range(self, offset: int, length: int, /) -> bytes: ...
+
+
+class AsyncObjectResolver(Protocol):
+    """Async counterpart of ObjectResolver, using the opening event loop."""
+
+    async def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
+
+
+class AsyncReader(Protocol):
+    """Borrowed async body. Return at most size bytes; b'' indicates EOF."""
+
+    async def read(self, size: int, /) -> bytes: ...
+
+
+class AsyncBinaryWriter(Protocol):
+    """Borrowed async sink. Writes return a byte count; flush does not close it."""
+
+    async def write(self, data: bytes, /) -> int: ...
+    async def flush(self) -> None: ...
+
+
+class ObjectWriter(Protocol):
+    """Store one complete encoded external object; return its stored byte length.
+
+    The SDK computes the address and compresses raw bytes. A deduplicating store
+    may retain another valid representation of the same raw bytes. Returned
+    lengths must be positive. Objects uploaded before a failure may remain;
+    publication/retention belongs to the caller. The SDK never closes this store.
+    """
+
+    def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int: ...
+
+
+class AsyncObjectWriter(Protocol):
+    """Async counterpart of ObjectWriter, on the writer's event loop."""
+
+    async def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int: ...
+
+
+class ContentOptions(TypedDict, total=False):
+    """Reusable content policy; expand with **options into reader factories."""
+
+    limits: Limits | None
+    concurrent_chunks: int
+    max_read_bytes: int
+    verify_external: bool
+    resolver: ObjectResolver | AsyncObjectResolver | None
+
+
+class MetadataOptions(TypedDict, total=False):
+    """Reusable metadata/index policy; independent of content memory."""
+
+    max_encoded_bytes: int
+    max_decoded_bytes: int
+    max_retained_entry_bytes: int
+    max_entries: int
+
+
+class SpoolOptions(TypedDict, total=False):
+    """Reusable temporary-storage policy; does not bound index memory."""
+
+    memory_bytes: int
+    max_spool_bytes: int
+    create_spill_store: Callable[[], SpillStore] | None
+
+
+@dataclass
+class EntryMetadata:
+    """Owned tar metadata plus Zstar entry extensions for lossless rewrites.
+
+    Pass info and extensions to writer.addfile(). Extent packing is regenerated;
+    root extensions are separate and passed when constructing the output writer.
+    """
+
+    info: TarInfo
+    extensions: dict[str, ExtensionValue]

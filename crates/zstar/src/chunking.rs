@@ -160,11 +160,13 @@ impl Chunker {
 
 /// Storage is independent of boundary selection and physical packing.
 #[cfg(feature = "async")]
+#[async_trait::async_trait]
 pub trait ObjectWriter: Send {
-    fn put_chunk(
-        &mut self,
-        raw: bytes::Bytes,
-    ) -> impl std::future::Future<Output = Result<crate::Extent>> + Send;
+    /// Stores one raw chunk, returning its immutable content identity and extent.
+    ///
+    /// # Errors
+    /// Returns storage, encoding, or resource-budget failures.
+    async fn put_chunk(&mut self, raw: bytes::Bytes) -> Result<crate::Extent>;
 }
 
 #[expect(
@@ -178,14 +180,43 @@ pub async fn external_file<R: tokio::io::AsyncRead + Unpin>(
     input: R,
     size: u64,
     strategy: Chunking,
-    writer: &mut impl ObjectWriter,
+    writer: &mut (impl ObjectWriter + ?Sized),
 ) -> Result<Vec<crate::Extent>> {
     use tokio::io::AsyncReadExt;
-    let mut chunker = Chunker::new(strategy)?;
-    let mut input = input.take(size.checked_add(1).ok_or(Error::Range)?);
+    let chunker = Chunker::new(strategy)?;
+    let input = input.take(size.checked_add(1).ok_or(Error::Range)?);
+    let chunks =
+        futures_util::stream::try_unfold((chunker, input), |(mut chunker, mut input)| async move {
+            Ok(chunker
+                .next_async(&mut input)
+                .await?
+                .map(|raw| (raw, (chunker, input))))
+        });
+    external_chunks(Box::pin(chunks), size, writer).await
+}
+
+/// Externalize caller-selected nonempty raw chunks without a built-in chunker.
+///
+/// Empty files use an empty stream. The declared size and each returned object
+/// identity are checked. Uploaded objects may remain after errors or cancellation;
+/// publication and retention are the caller's responsibility.
+///
+/// # Errors
+/// Returns source/storage failures, size mismatches, or invalid object extents.
+#[cfg(feature = "async")]
+pub async fn external_chunks(
+    mut chunks: impl futures_util::Stream<Item = Result<bytes::Bytes>> + Unpin,
+    size: u64,
+    writer: &mut (impl ObjectWriter + ?Sized),
+) -> Result<Vec<crate::Extent>> {
+    use futures_util::StreamExt;
     let mut total = 0_u64;
     let mut extents = Vec::new();
-    while let Some(raw) = chunker.next_async(&mut input).await? {
+    while let Some(raw) = chunks.next().await {
+        let raw = raw?;
+        if raw.is_empty() {
+            return Err(Error::Unsupported("external chunks must be nonempty"));
+        }
         total = total.checked_add(raw.len() as u64).ok_or(Error::Range)?;
         if total > size {
             return Err(Error::Budget("external file size"));

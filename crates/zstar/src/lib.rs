@@ -18,6 +18,8 @@ pub mod s3;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::ops::Range;
 use thiserror::Error;
+/// Internal support for bindings and CLI operations. This module is public for
+/// workspace consumers and is not part of the supported SDK interface.
 #[doc(hidden)]
 pub mod backend;
 #[cfg(any(feature = "fs", all(test, feature = "disk")))]
@@ -26,7 +28,9 @@ mod cbor;
 pub mod chunking;
 mod decoded_body;
 mod limits;
+mod options;
 pub use limits::Limits;
+pub use options::{MetadataReaderOptions, MetadataWriterOptions, SpoolOptions};
 pub mod manifest;
 mod manifest_io;
 pub use manifest::{Entry, EntryKind, Extent, Source};

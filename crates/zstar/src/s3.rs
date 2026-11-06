@@ -589,6 +589,7 @@ impl S3BlobStore {
         })
     }
 }
+#[async_trait::async_trait]
 impl crate::chunking::ObjectWriter for S3BlobStore {
     async fn put_chunk(&mut self, raw: Bytes) -> Result<Extent> {
         self.put(raw).await

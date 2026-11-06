@@ -1,6 +1,7 @@
 //! Python adapters for native archive readers, writers, and storage.
 use pyo3::prelude::*;
 mod async_archive;
+mod callback;
 mod external;
 mod fs;
 mod manifest;

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"iter"
 	"math/bits"
 )
 
@@ -155,33 +156,57 @@ func ExternalizeFile(ctx context.Context, input io.Reader, size uint64, options 
 	if err != nil {
 		return nil, err
 	}
+	chunks := func(yield func([]byte, error) bool) {
+		for {
+			raw, err := chunker.Next(ctx)
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if !yield(raw, err) || err != nil {
+				return
+			}
+		}
+	}
+	return ExternalizeChunks(ctx, chunks, size, writer)
+}
+
+// ExternalizeChunks stores caller-selected nonempty raw chunks, checks the
+// declared size and validates object identity. Empty files use an empty sequence.
+// Uploaded objects may remain after failure; retention belongs to the caller.
+func ExternalizeChunks(ctx context.Context, chunks iter.Seq2[[]byte, error], size uint64, writer ChunkObjectWriter) ([]Extent, error) {
+	if chunks == nil || writer == nil {
+		return nil, rejected(CategoryUnsupportedOperation, "chunks and object writer required")
+	}
 	var total uint64
 	extents := []Extent{}
-	for {
-		raw, err := chunker.Next(ctx)
-		if errors.Is(err, io.EOF) {
-			break
-		}
+	for raw, err := range chunks {
 		if err != nil {
 			return nil, err
 		}
-		total += uint64(len(raw))
-		if total > size {
-			return nil, rejected(CategoryResourceLimit, "external file size or reference bytes")
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+		if len(raw) == 0 || uint64(len(raw)) > size-total {
+			return nil, rejected(CategoryResourceLimit, "external chunk size")
+		}
+		total += uint64(len(raw))
+		expectedDigest := sha256.Sum256(raw)
 		extent, err := writer.Put(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
 		address, external := extent.Source.ContentAddress()
 		digest, digestErr := ParseContentAddress(address)
-		if !external || digestErr != nil || digest != sha256.Sum256(raw) || extent.Offset != 0 || extent.Size != uint64(len(raw)) {
+		if !external || digestErr != nil || digest != expectedDigest || extent.Offset != 0 || extent.Size != uint64(len(raw)) {
 			return nil, rejected(CategoryMalformedExternalContent, "object writer changed chunk identity")
 		}
 		if err := extent.validate(0); err != nil {
 			return nil, err
 		}
 		extents = append(extents, extent)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if total != size {
 		return nil, io.ErrUnexpectedEOF
