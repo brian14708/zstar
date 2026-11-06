@@ -326,7 +326,7 @@ type ManifestReaderOptions struct {
 	MaxReadBytes                                  uint64
 	// MaxRetainedEntryBytes bounds the estimated heap retained by parsed
 	// entry metadata, including spare entry-slice capacity (default 1 GiB). Exceeding it, or MaxEntries,
-	// fails OpenManifest with a CategoryResourceLimit error.
+	// fails openManifest with a CategoryResourceLimit error.
 	MaxRetainedEntryBytes uint64
 	// MaxEntries bounds the number of entries; zero means no separate count cap.
 	MaxEntries uint64
@@ -622,7 +622,7 @@ func (s *manifestSpool) close() error {
 // Manifest authenticates and validates the complete sequence before exposing entries.
 // Manifest exposes low-level metadata and content operations with per-call policy.
 // Prefer Reader for an archive with one fixed resolver and verification policy.
-type Manifest struct {
+type manifest struct {
 	mu             sync.Mutex
 	closed         bool
 	spool          manifestSpool
@@ -636,11 +636,11 @@ type Manifest struct {
 	content        *manifestContentState
 }
 
-// OpenManifest authenticates and validates metadata using the supplied budgets.
+// openManifest authenticates and validates metadata using the supplied budgets.
 // The caller owns the immutable source, which must support concurrent reads.
 // The opening context is used only during open; subsequent operations supply
 // their own contexts. Close releases SDK storage without closing the source.
-func OpenManifest(ctx context.Context, source RangeReader, config ManifestReaderOptions) (result *Manifest, err error) {
+func openManifest(ctx context.Context, source RangeReader, config ManifestReaderOptions) (result *manifest, err error) {
 	if source == nil {
 		return nil, errors.New("zstar: nil source")
 	}
@@ -700,7 +700,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 	if footer.ManifestEncodedSize > options.MaxEncodedBytes || footer.ManifestDecodedSize > options.MaxDecodedBytes {
 		return nil, rejected(CategoryResourceLimit, "manifest size")
 	}
-	m := &Manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: footer.ManifestOffset, source: source, maxRead: options.MaxReadBytes, readAhead: options.ReadAheadBytes}
+	m := &manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: footer.ManifestOffset, source: source, maxRead: options.MaxReadBytes, readAhead: options.ReadAheadBytes}
 	m.content = newManifestContentState(options, source)
 	defer func() {
 		if err != nil {
@@ -878,7 +878,7 @@ func OpenManifest(ctx context.Context, source RangeReader, config ManifestReader
 
 // Close cancels content loads and releases retained metadata and SDK storage.
 // It leaves the caller-owned source and resolver open.
-func (m *Manifest) Close() error {
+func (m *manifest) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
@@ -890,7 +890,7 @@ func (m *Manifest) Close() error {
 // Entry returns owned metadata for path. Missing paths return an error
 // matching fs.ErrNotExist; invalid paths match fs.ErrInvalid. Errors include
 // the path in an *fs.PathError. Symlinks are never followed.
-func (m *Manifest) Entry(path string) (*Entry, error) {
+func (m *manifest) Entry(path string) (*Entry, error) {
 	entry, err := m.entrySnapshot(path)
 	if err != nil {
 		return nil, err
@@ -902,7 +902,7 @@ func (m *Manifest) Entry(path string) (*Entry, error) {
 // Metadata is immutable after open. Internal reads can copy the entry header
 // without cloning extents and attributes that never escape to the caller.
 // Copying the header avoids retaining the complete entries slice after Close.
-func (m *Manifest) entrySnapshot(path string) (Entry, error) {
+func (m *manifest) entrySnapshot(path string) (Entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -934,7 +934,7 @@ func cloneEntry(entry Entry) Entry {
 	return entry
 }
 
-func (m *Manifest) entryRank(path string) (*Entry, uint64, error) {
+func (m *manifest) entryRank(path string) (*Entry, uint64, error) {
 	if m.closed {
 		return nil, 0, fs.ErrClosed
 	}
@@ -951,7 +951,7 @@ func (m *Manifest) entryRank(path string) (*Entry, uint64, error) {
 
 // VisitEntries invokes callbacks without holding the metadata lock. It retains
 // at most one bounded batch and permits callbacks to read from this manifest.
-func (m *Manifest) VisitEntries(visit func(Entry) error) error {
+func (m *manifest) VisitEntries(visit func(Entry) error) error {
 	if visit == nil {
 		return errors.New("zstar: nil entry visitor")
 	}
@@ -977,7 +977,7 @@ type EncodedContentResolver interface {
 // Read reads an exact logical member range using the supplied resolver/hash
 // policy. The returned buffer is caller-owned and bounded by MaxReadBytes.
 // Missing paths match fs.ErrNotExist; symlinks are never followed.
-func (m *Manifest) Read(ctx context.Context, path string, offset, size uint64, resolver EncodedContentResolver, verifyExternal bool) ([]byte, error) {
+func (m *manifest) Read(ctx context.Context, path string, offset, size uint64, resolver EncodedContentResolver, verifyExternal bool) ([]byte, error) {
 	out, err := m.ReadMany(ctx, []ReadRequest{{path, offset, size}}, resolver, verifyExternal)
 	if err != nil {
 		return nil, pathError("read", path, err)
@@ -988,7 +988,7 @@ func (m *Manifest) Read(ctx context.Context, path string, offset, size uint64, r
 func (e Entry) String() string { return fmt.Sprintf("%s (%d)", e.Path, e.Type) }
 
 // RootExtensions returns owned application metadata from the authenticated root.
-func (m *Manifest) RootExtensions() Extensions {
+func (m *manifest) RootExtensions() Extensions {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return cloneExtensions(m.rootExtensions)

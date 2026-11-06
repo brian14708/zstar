@@ -9,6 +9,7 @@ require (
 	github.com/aws/smithy-go v1.28.7
 	github.com/fxamacker/cbor/v2 v2.10.0
 	github.com/klauspost/compress v1.20.3
+	golang.org/x/exp/collection v0.0.0-20261106192419-47ce03d25ef0
 )
 
 require (

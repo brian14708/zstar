@@ -5,19 +5,12 @@ title: "Advanced archive creation with Python"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../python/examples/tutorial_file.py?raw";
 
-Use `ArchiveWriter` and `Archive` directly to create an archive, read byte
-ranges, and verify its contents. Start with the
-[fsspec tutorial](/zstar/tutorials/python/first-archive/) for standard filesystem
-operations. The direct interface also supports `tarfile.TarInfo` metadata through
-`addfile()` and custom storage protocols; see the
-[archive interface guide](/zstar/guides/python/configuration/#raw-archive-interface).
+Use `ArchiveWriter` and `Archive` to create, read, and verify an archive.
+For filesystem operations, start with the
+[fsspec tutorial](/zstar/tutorials/python/first-archive/).
 
-This example creates a small text file inside `example.zstar`, reads it back,
-and checks the archive for errors.
-
-The example creates the text for you, so you do not need any input files.
-`example.txt` is the file inside the archive; `example.zstar` is the archive
-saved in your current directory. Running the example again replaces it.
+The example generates `example.txt` inside `example.zstar` in your current
+directory. Running it again replaces the archive.
 
 ## Set up
 
@@ -33,19 +26,15 @@ metadata. uv installs them in an isolated environment automatically.
 
 ## Write the archive
 
-`ArchiveWriter.from_file()` opens the archive for writing. `write_bytes()` adds
-a file named `example.txt` with the text `Hello from Zstar` and a newline.
-Leaving the `with` block finishes writing the archive and closes it.
+`write_bytes()` adds a member. Leaving the `with` block finalizes and closes
+the archive.
 
 <Example source={source} lang="python" region="create" />
 
 ## Read a file and a byte range
 
-Reopen the archive with `Archive.from_file()`. `read()` returns all the bytes
-of `example.txt`. `read_range()` returns bytes from the start position up to,
-but not including, the end position: `0, 5` selects `Hello`.
-
-The assertions check that both reads return the expected text.
+`read()` returns the whole member. `read_range()` uses a half-open range:
+start 0 and end 5 return `Hello`.
 
 <Example source={source} lang="python" region="read" />
 
@@ -74,7 +63,7 @@ Archive verified
 </details>
 
 [View the source](https://github.com/brian14708/zstar/blob/main/python/examples/tutorial_file.py).
-If you have cloned the Zstar repository, run this from its root directory:
+From the repository root, run:
 
 ```sh
 uv run python/examples/tutorial_file.py

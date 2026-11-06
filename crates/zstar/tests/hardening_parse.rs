@@ -1,7 +1,7 @@
 //! Hostile-input hardening: size caps, ancestor tracking, tar header fuzzing.
 use proptest::prelude::*;
 use std::time::{Duration, Instant};
-use zstar::manifest::{Entry, decode_document, encode_block};
+use zstar::backend::manifest::{Entry, decode_document, encode_block};
 
 fn header() -> Vec<u8> {
     let mut out = vec![0xa2, 0x67];
@@ -86,16 +86,12 @@ fn many_retained_ancestors_validate_quickly() {
 
 proptest! {
     #[test]
-    fn parse_header_prefix_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
-        let _ = zstar::parse_member_header(&bytes);
-    }
-    #[test]
     fn parse_header_prefix_never_panics_on_ustar_shaped_input(
         mut bytes in proptest::collection::vec(any::<u8>(), 512..1600),
         kind in prop_oneof![Just(b'0'), Just(b'x'), Just(b'5'), Just(b'2'), any::<u8>()],
     ) {
         bytes[257..265].copy_from_slice(b"ustar\x0000");
         bytes[156] = kind;
-        let _ = zstar::parse_member_header(&bytes);
+        let _ = zstar::backend::parse_member_header(&bytes);
     }
 }

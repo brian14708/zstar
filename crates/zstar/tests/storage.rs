@@ -42,7 +42,7 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
     };
     let encoded = blobs.get_encoded(digest, 1, 17 << 20).await.unwrap();
     assert_eq!(encoded.len() as u64, extent.encoded_size);
-    assert_eq!(zstar::decode_frame(&encoded, 4).unwrap(), b"aaaa");
+    assert_eq!(zstar::backend::decode_frame(&encoded, 4).unwrap(), b"aaaa");
     assert!(matches!(
         blobs.get_encoded(digest, extent.encoded_size, 1).await,
         Err(Error::Budget(_))
@@ -71,7 +71,7 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
     store
         .put(
             &blobs.object_path(digest),
-            Bytes::from(zstar::encode_frame(b"xxxx", 3).unwrap()).into(),
+            Bytes::from(zstar::backend::encode_frame(b"xxxx", 3).unwrap()).into(),
         )
         .await
         .unwrap();

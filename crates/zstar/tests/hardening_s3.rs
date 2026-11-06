@@ -131,9 +131,9 @@ async fn concurrent_creation_preserves_winning_encoding_and_size_hint() {
     });
     let blobs = blobs(store.clone());
     let raw = Bytes::from_static(b"same bytes");
-    let digest = *zstar::Digest::sha256(&raw).as_bytes();
+    let digest = *zstar::backend::Digest::sha256(&raw).as_bytes();
     let path = blobs.object_path(digest);
-    let alternate = Bytes::from(zstar::encode_frame(&raw, 19).unwrap());
+    let alternate = Bytes::from(zstar::backend::encode_frame(&raw, 19).unwrap());
     store
         .inner
         .put(&path, alternate.clone().into())
@@ -223,7 +223,7 @@ async fn put_rejects_invalid_existing_object_without_overwriting() {
     let store = Arc::new(InMemory::new());
     let blobs = blobs(store.clone());
     let raw = Bytes::from_static(b"same bytes");
-    let digest = *zstar::Digest::sha256(&raw).as_bytes();
+    let digest = *zstar::backend::Digest::sha256(&raw).as_bytes();
     let path = blobs.object_path(digest);
     store.put(&path, Bytes::new().into()).await.unwrap();
     assert!(matches!(blobs.put(raw).await, Err(Error::Budget(_))));
@@ -244,7 +244,7 @@ async fn blob_put_skips_upload_when_content_addressed_object_exists() {
     };
     let path = blobs.object_path(digest);
     // Distinguishable-but-equivalent stored bytes prove no overwrite happens.
-    let alt = zstar::encode_frame(b"same bytes", 19).unwrap();
+    let alt = zstar::backend::encode_frame(b"same bytes", 19).unwrap();
     store
         .put(&path, Bytes::from(alt.clone()).into())
         .await
@@ -270,7 +270,7 @@ async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
     let bytes = Bytes::from_static(include_bytes!(
         "../../../testdata/entry-manifest/inline.zstar"
     ));
-    let footer = zstar::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
+    let footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
     let good = archive_attributes(&footer, bytes.len() as u64).unwrap();
     for (position, version, expected) in [
         (None, None, 2),
@@ -385,7 +385,7 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
     let result = zstar::Archive::open_with_options(
         source,
         zstar::ReaderOptions {
-            manifest: zstar::ManifestOptions {
+            metadata: zstar::MetadataReaderOptions {
                 max_encoded_bytes: 1,
                 ..Default::default()
             },

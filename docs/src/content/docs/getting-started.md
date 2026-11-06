@@ -3,10 +3,8 @@ title: Getting started
 description: Generate your first archive, read it, and try S3.
 ---
 
-Start by creating a local archive: a compressed file that holds other files.
-Choose your language below to write `example.zstar`, read a file from it, and
-check it for errors. Each example creates its own sample text, so you do not
-need any input files.
+Choose your language to create an archive and read files from it.
+Each example generates its own sample data.
 
 | SDK | Start here | Then try |
 | --- | --- | --- |

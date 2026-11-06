@@ -13,14 +13,14 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// EntryArchiveWriter is the low-level encoder accepting manifest Entry values.
+// entryArchiveWriter is the low-level encoder accepting manifest Entry values.
 // Prefer NewWriter with Header for ordinary archive creation.
 // It emits checksummed data frames and a deterministic manifest
 // sequence in bounded compressed segments.
 // Input paths may arrive in arbitrary order; tar follows insertion order. Metadata and transient frame
 // records spill to disk; no complete entry or frame table is kept in memory.
 // Close finalizes the archive and releases spools, but does not close output.
-type EntryArchiveWriter struct {
+type entryArchiveWriter struct {
 	output                io.Writer
 	codec                 *zstd.Encoder
 	workers               *frameWorkers
@@ -34,10 +34,10 @@ type EntryArchiveWriter struct {
 	closed                bool
 }
 
-// NewEntryArchiveWriter creates a bounded archive encoder. Options select data
+// newEntryArchiveWriter creates a bounded archive encoder. Options select data
 // compression, ordered workers and manifest storage. The caller owns output;
 // Close finalizes the archive, joins workers and reports cleanup errors.
-func NewEntryArchiveWriter(output io.Writer, config WriterOptions) (*EntryArchiveWriter, error) {
+func newEntryArchiveWriter(output io.Writer, config WriterOptions) (*entryArchiveWriter, error) {
 	frameSize := config.FrameSize
 	if output == nil {
 		return nil, errors.New("zstar: nil destination")
@@ -59,7 +59,7 @@ func NewEntryArchiveWriter(output io.Writer, config WriterOptions) (*EntryArchiv
 		return nil, err
 	}
 	options.RootExtensions = cloneExtensions(options.RootExtensions)
-	w := &EntryArchiveWriter{output: output, options: options, target: frameSize, pending: make([]byte, 0, frameSize), frames: manifestSpool{options: options}, records: manifestSpool{options: options}}
+	w := &entryArchiveWriter{output: output, options: options, target: frameSize, pending: make([]byte, 0, frameSize), frames: manifestSpool{options: options}, records: manifestSpool{options: options}}
 	if config.Workers != 0 {
 		workers, err := newFrameWorkers(config.Workers, frameSize, config.CompressionLevel)
 		if err != nil {
@@ -76,7 +76,7 @@ func NewEntryArchiveWriter(output io.Writer, config WriterOptions) (*EntryArchiv
 	return w, nil
 }
 
-func (w *EntryArchiveWriter) flush() error {
+func (w *entryArchiveWriter) flush() error {
 	if len(w.pending) == 0 {
 		return nil
 	}
@@ -104,7 +104,7 @@ func (w *EntryArchiveWriter) flush() error {
 	return nil
 }
 
-func (w *EntryArchiveWriter) emitFrame(decoded int, encoded []byte) error {
+func (w *entryArchiveWriter) emitFrame(decoded int, encoded []byte) error {
 	if err := w.options.Limits.frame(encoded); err != nil {
 		return err
 	}
@@ -126,7 +126,7 @@ func (w *EntryArchiveWriter) emitFrame(decoded int, encoded []byte) error {
 	return nil
 }
 
-func (w *EntryArchiveWriter) append(data []byte) error {
+func (w *entryArchiveWriter) append(data []byte) error {
 	if uint64(len(data)) > math.MaxUint64-w.raw {
 		return rejected(CategoryResourceLimit, "decoded archive overflow")
 	}
@@ -149,7 +149,7 @@ func (w *EntryArchiveWriter) append(data []byte) error {
 // generated from its extents. Non-files also require physicalSize zero.
 // Invalid arguments are rejected without side effects and do not poison the
 // writer; I/O, body-read and budget failures after output begins are sticky.
-func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize uint64, body io.Reader) (err error) {
+func (w *entryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize uint64, body io.Reader) (err error) {
 	if w.closed {
 		return errors.New("zstar: writer closed")
 	}
@@ -185,7 +185,7 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 		if physicalSize != 0 || body != nil {
 			return errors.New("zstar: external entry body must be omitted")
 		}
-		pointer, e := EncodeContentPointer(entry.Extents)
+		pointer, e := encodeContentPointer(entry.Extents)
 		if e != nil {
 			return e
 		}
@@ -200,18 +200,11 @@ func (w *EntryArchiveWriter) Add(ctx context.Context, entry Entry, physicalSize 
 	if physicalSize != 0 && body == nil {
 		return errors.New("zstar: missing file body")
 	}
-	kind := KindFile
-	if entry.Type == TypeSymlink {
-		kind = KindSymlink
-	}
-	if entry.Type == TypeDirectory {
-		kind = KindDirectory
-	}
 	target := ""
 	if entry.Linkname != nil {
 		target = *entry.Linkname
 	}
-	header, err := memberHeader(Header{Path: entry.Path, Kind: kind, Mode: entry.Mode, UID: entry.UID, GID: entry.GID, MtimeNS: entry.MtimeNS, Size: physicalSize, Target: target})
+	header, err := memberHeader(Header{Path: entry.Path, Type: entry.Type, Mode: entry.Mode, UID: entry.UID, GID: entry.GID, MtimeNS: entry.MtimeNS, Size: physicalSize, Target: target})
 	if err != nil {
 		return err
 	}
@@ -306,7 +299,7 @@ func pathAncestors(path string) []string {
 
 // Close finalizes the archive and releases temporary storage. It never closes
 // the destination. Earlier Add failures remain sticky.
-func (w *EntryArchiveWriter) Close() (err error) {
+func (w *entryArchiveWriter) Close() (err error) {
 	if w.closed {
 		return w.err
 	}
@@ -331,7 +324,7 @@ func (w *EntryArchiveWriter) Close() (err error) {
 	return w.err
 }
 
-func (w *EntryArchiveWriter) finish() (err error) {
+func (w *entryArchiveWriter) finish() (err error) {
 	if err := w.append(make([]byte, 1024)); err != nil {
 		return err
 	}
@@ -346,7 +339,7 @@ func (w *EntryArchiveWriter) finish() (err error) {
 			}
 		}
 	}
-	metadata, err := NewManifestWriter(w.output, w.encoded, w.options.writerOptions())
+	metadata, err := newManifestWriter(w.output, w.encoded, w.options.writerOptions())
 	if err != nil {
 		return err
 	}

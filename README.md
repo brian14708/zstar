@@ -2,17 +2,17 @@
 
 **Compressed archives. Direct access.**
 
-Zstar is an indexed `.tar.zst` archive format for reading individual files and
-byte ranges without decompressing the entire archive. It combines independently
-compressed Zstandard frames with deterministic CBOR metadata. Archives can keep
-all content inline or reference external objects by SHA-256.
+Zstar specifies an indexed `.tar.zst` archive format for reading individual
+files and byte ranges without decompressing the entire archive. The
+[core specification](spec/draft/core.md) defines self-contained archives with
+independent Zstandard frames and deterministic CBOR metadata. Standard
+Zstandard and tar tools can decode their contents.
 
-Standard Zstandard and tar tools can decode the tar stream; resolving external
-content requires a Zstar reader.
-
-The [draft specifications](spec/draft/README.md) define the core format and
-external-content extension. The separate catalog proposal describes named
-collections of archive layers; catalog operations are not yet implemented.
+Optional extensions build on the core format. The
+[external-content extension](spec/draft/external-content.md) adds references to
+external objects identified by SHA-256. The separate
+[catalog proposal](spec/draft/catalog.md) organizes archives into collections.
+See the [draft specifications](spec/draft/README.md) for scope and status.
 
 ## Libraries and CLI
 
@@ -26,16 +26,17 @@ collections of archive layers; catalog operations are not yet implemented.
 The [SDK customization guide](https://brian14708.github.io/zstar/guides/sdk-customization/)
 describes custom storage, ownership, cancellation, and resource policies.
 
-## Validation support
+## SDK capabilities
+
+Rust, Go, and Python implement the core archive format and the optional
+external-content extension. They validate metadata on open and selected sources
+and extents during reads.
 
 | Operation | Rust | Go | Python |
 | --- | --- | --- | --- |
-| Metadata validation on open | Yes | Yes | Yes |
-| Selective source and extent validation | Yes | Yes | Yes |
-| Full physical archive validation | `verify(Archive)` | `VerifyScope(VerifyArchive)` | `verify()` |
-| External closure validation | `verify(ExternalClosure)` | `VerifyScope(VerifyExternalClosure)` | `verify(external=True)` |
+| Full physical archive validation | `verify(Archive)` | `Verify(VerifyArchive)` | `verify()` |
+| External closure validation | `verify(ExternalClosure)` | `Verify(VerifyExternalClosure)` | `verify(external=True)` |
 | External SHA-256 opt-in | `verify_external` | `VerifyExternalHash` | `verify_external` |
-| Portable and thin writing | Yes | Yes | Yes, raw and fsspec APIs |
 | Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
 
 External SHA-256 checking defaults to disabled. Metadata digests, frame

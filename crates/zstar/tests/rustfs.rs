@@ -8,8 +8,9 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use zstar::backend::BlockingBuilder;
 use zstar::http::{HttpRangeSource, ReqwestTransport};
+use zstar::s3::object_store::buffered::BufWriter;
 use zstar::s3::{
-    AmazonS3, AmazonS3Builder, BufWriter, Path, S3BlobStore, S3RangeSource, S3RequestProvider,
+    AmazonS3, AmazonS3Builder, Path, S3BlobStore, S3RangeSource, S3RequestProvider,
     object_store::{ObjectStore, ObjectStoreExt, signer::Signer},
 };
 use zstar::{Archive, AsyncRangeReader, Entry, ReaderOptions, Source};
@@ -68,10 +69,17 @@ async fn native_s3_presigned_ranges_objects_and_multipart() {
         .get_encoded(digest, whole.encoded_size, 17 << 20)
         .await
         .unwrap();
-    assert_eq!(zstar::decode_frame(&encoded, object.len()).unwrap(), object);
-    let mut writer =
-        BlockingBuilder::with_options(Vec::new(), 1024, 3, zstar::ManifestOptions::default())
-            .unwrap();
+    assert_eq!(
+        zstar::backend::decode_frame(&encoded, object.len()).unwrap(),
+        object
+    );
+    let mut writer = BlockingBuilder::with_options(
+        Vec::new(),
+        1024,
+        3,
+        zstar::backend::ManifestOptions::default(),
+    )
+    .unwrap();
     writer
         .add_file(Entry::file("inline"), 12, &mut b"hello RustFS".as_slice())
         .unwrap();

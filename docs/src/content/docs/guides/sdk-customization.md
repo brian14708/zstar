@@ -2,16 +2,15 @@
 title: SDK customization
 ---
 
-Storage is replaceable; archive encoding and validation remain shared format
-behavior. Implement a storage interface to add a database, object store, cache,
-tracing wrapper, or credential policy. No plugin registration is needed.
+Implement a storage interface to add a database, object store, cache,
+tracing wrapper, or credential policy.
 
 ## Choose an interface
 
 | Task | Rust | Go | Python |
 | --- | --- | --- | --- |
 | Ordinary archive reads | `Archive` | `Reader` | `Archive` / `AsyncArchive` |
-| Sequential member reads | `open_file`, `AsyncRead` / `AsyncSeek` | `OpenStreamWithOptions`, `io.Reader` / `io.Seeker` | `open`, `RawIOBase` / async member stream |
+| Sequential member reads | `open_file`, `AsyncRead` / `AsyncSeek` | `OpenStream`, `io.Reader` / `io.Seeker` | `open`, `RawIOBase` / async member stream |
 | Concurrent positional reads | `open_cursor`, `FileCursor` | `OpenFile`, `ReadAtContext` | `read_range`, `read_many` |
 | Standard filesystem consumers | Filesystem helpers | `Reader` implements `fs.FS` | `ZstarFileSystem` implements fsspec |
 | Custom archive storage | `AsyncRangeReader` | `RangeReader`; `ReaderAtSource` adapts `io.ReaderAt` | `RangeSource` / `AsyncRangeSource`; `from_source` |
@@ -20,11 +19,6 @@ tracing wrapper, or credential policy. No plugin registration is needed.
 | Custom external object output | `chunking::ObjectWriter` | `ChunkObjectWriter` | `ObjectWriter` / `AsyncObjectWriter` |
 | Custom chunk boundaries | `chunking::external_chunks` | `ExternalizeChunks` | `add_external` with raw chunk iterable |
 | Temporary metadata storage | `SpillFactory` / `SpillStore` | `CreateSpillStore` | `create_spill_store` |
-
-Rust/Go manifest, extent, and spool primitives are advanced interfaces. Ordinary
-applications should start with the archive interfaces above. Rust's doc-hidden
-`backend` module supports workspace bindings and the CLI; it is not a supported
-SDK interface. Python underscored modules and native tuples remain private.
 
 ## Adapter contracts
 
@@ -52,9 +46,7 @@ content into hash-verified content merely because the address matches.
 
 Archive `read_many` / Go `ReadMany` groups repeated sources and bounds concurrency.
 Resolvers can implement caching, retries, and instrumentation around individual
-requests. Rust's legacy resolver batch/length methods are available to explicit
-callers; the archive reader does not consult them. They are not a performance
-promise, and other SDKs do not require corresponding unused hooks.
+requests.
 
 ## Ownership and cancellation
 
@@ -104,53 +96,54 @@ The caller owns publication, multipart completion, and retention.
 
 ## Language-specific configuration
 
-Rust separates focused metadata settings from content policy while retaining the
-legacy `ManifestOptions` representation for compatibility:
+Use Rust's focused metadata options for reader and writer settings:
 
 ```rust
-let reader = zstar::ReaderOptions::default()
-    .with_metadata(zstar::MetadataReaderOptions {
+let reader = zstar::ReaderOptions {
+    metadata: zstar::MetadataReaderOptions {
         max_entries: 100_000,
         ..Default::default()
-    });
-let writer = zstar::WriterOptions::default()
-    .with_metadata(zstar::MetadataWriterOptions::default());
+    },
+    ..Default::default()
+};
+let writer = zstar::WriterOptions::default();
 // Initialize with: Builder::try_with_options(sink, writer).await?
 ```
 
 Both focused types contain `SpoolOptions`. Reader-only fields cannot be passed
-through `MetadataWriterOptions`. Direct `manifest` fields remain available for
-advanced callers. Implement Rust async storage and transport traits with
+through `MetadataWriterOptions`. Both outer option types store these directly
+in `metadata`; content limits live in `limits` and `ReaderOptions.max_read_bytes`.
+Implement Rust async storage and transport traits with
 `#[async_trait::async_trait]` on each implementation. The traits support runtime
 selection directly through `Arc<dyn AsyncRangeReader>`, `Arc<dyn ObjectResolver>`,
 `Arc<dyn HttpTransport>`, and `Arc<dyn RequestProvider>`. External writers can use
 `Box<dyn ObjectWriter>` and pass `writer.as_mut()` to chunking helpers. Futures
 are boxed and `Send`; dropping them cancels pending work.
 
-Go content controls belong on `ReaderOptions`:
+Go content controls belong in `ReaderOptions.Manifest`:
 
 ```go
-options := zstar.ReaderOptions{ConcurrentChunks: 4, MaxReadBytes: 8 << 20}
+options := zstar.ReaderOptions{
+    Manifest: zstar.ManifestReaderOptions{ConcurrentChunks: 4, MaxReadBytes: 8 << 20},
+}
 streamOptions := zstar.StreamOptions{DisableCache: true}
 ```
 
-Nonzero top-level controls override the legacy nested `Manifest` fields.
-`OpenStreamWithOptions` is the ordinary sequential interface; `OpenFile` is for
-random access. Use `VerifyScope` with `VerifyArchive` or `VerifyExternalClosure`;
-`Verify(ctx, bool)` is retained for compatibility.
+`OpenStream` is the ordinary sequential interface; `OpenFile` is for
+random access. Use `Verify` with `VerifyArchive` or `VerifyExternalClosure`.
 
 Python distinguishes synchronous `ReaderOptions` from `AsyncReaderOptions`;
 synchronous readers reject coroutine-based sources/resolvers before scheduling
-work. Python also offers `ContentOptions`, `MetadataOptions`, and `SpoolOptions` TypedDicts
-for reusable groups; expand them as keyword arguments into factories. Existing
-flat keywords continue to work. `Archive.from_bytes` mirrors the async factory.
+work. Use these TypedDicts for reusable option dictionaries and expand them into
+factories with `**options`.
+
 Use named requests to distinguish lengths from end positions:
 
 ```python
 from zstar.types import ReadRequest
 
 requests = [ReadRequest(path="data.bin", offset=10, length=20)]
-# archive.read_many(requests); legacy three-tuples also work.
+# archive.read_many(requests)
 ```
 
 Rust member ranges are half-open `start..end`. Go ranges and Python source/batch
@@ -181,7 +174,7 @@ chunks, store, extensions=...)`. `chunks` yields nonempty raw bytes totaling
 compresses chunks, and invokes `store.put_encoded(address, encoded, raw_size)`.
 The store returns a positive stored encoded length, including when reusing an
 equivalent existing representation. Async writers also accept async chunk
-iterables and async object writers. No native tuples are required.
+iterables and async object writers.
 
 ## Transport and credentials
 
@@ -212,7 +205,7 @@ normal credential-provider behavior.
 | Metadata encoded/decoded budgets | 4 GiB each | Rust/Python allow zero bytes; Go selects default |
 | Metadata in-memory spool threshold | 8 MiB | Rust/Python spill immediately; Go selects default |
 | Spool quota | 4 GiB | An explicit zero-byte quota disallows retention; Go nil selects default |
-| Member decoded-source cache | 2 MiB | Rust/Python disable; legacy Go size argument selects default |
+| Member decoded-source cache | 2 MiB | Rust/Python disable; Go selects default |
 | Compression workers | Serial | Serial |
 
 Go `StreamOptions.DisableCache` explicitly disables caching. Rust/Python member
@@ -230,7 +223,3 @@ number of encoded/decoded sources and codec workspaces, all member caches, and
 all caller-retained results. There is no single aggregate process-memory cap;
 multiple open readers multiply their reader-local budgets. Limit reader count,
 concurrency, source size, returned buffers, and cache sizes together.
-
-Fixed Zstandard encoding, mandatory validation, unknown-required-extension
-rejection, and source immutability remain format guarantees. `x-*` fields carry
-application metadata and do not register executable extensions.

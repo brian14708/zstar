@@ -57,7 +57,7 @@ impl MemberCursor {
             zstar::EntryKind::File => (),
         }
         let cursor = reader
-            .cursor_from_entry(entry)
+            .open_cursor(path)
             .await
             .map_err(crate::support::core_error)?
             .with_cache_bytes(cache_bytes);
@@ -534,17 +534,19 @@ impl ReaderConfig {
             resolver: resolver
                 .map(|r| super::external::binding(py, r))
                 .transpose()?,
-            manifest: zstar::ManifestOptions {
-                limits: self::limits(limits)?,
-                memory_bytes,
+            limits: self::limits(limits)?,
+            max_read_bytes,
+            metadata: zstar::MetadataReaderOptions {
+                spool: zstar::SpoolOptions {
+                    memory_bytes,
+                    budget: Arc::new(zstar::SpoolBudget::new(max_spool_bytes)),
+                    create_store: super::manifest::spill_factory(py, create_spill_store)?,
+                    ..Default::default()
+                },
                 max_encoded_bytes,
                 max_decoded_bytes,
-                max_read_bytes,
                 max_retained_entry_bytes,
                 max_entries,
-                spool_budget: Arc::new(zstar::SpoolBudget::new(max_spool_bytes)),
-                create_spill_store: super::manifest::spill_factory(py, create_spill_store)?,
-                ..Default::default()
             },
         };
         Ok(Self { inner: options })
@@ -597,7 +599,7 @@ pub fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo
         report
             .external_objects_sha256_checked
             .iter()
-            .map(zstar::manifest::object_address)
+            .map(zstar::backend::manifest::object_address)
             .collect::<Vec<_>>(),
     )?;
     result.set_item(
@@ -605,51 +607,7 @@ pub fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo
         report
             .external_objects_unchecked
             .iter()
-            .map(zstar::manifest::object_address)
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(result.unbind())
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Ownership matches the public API or asynchronous boundary."
-)]
-pub fn verification_dict(
-    py: Python<'_>,
-    report: zstar::VerificationReport,
-) -> PyResult<Py<pyo3::types::PyDict>> {
-    let result = pyo3::types::PyDict::new(py);
-    for field in [
-        "metadata_validated",
-        "full_archive_verified",
-        "tar_members_verified",
-        "pointer_text_verified",
-        "data_checksums_checked",
-    ] {
-        result.set_item(field, true)?;
-    }
-    result.set_item(
-        "external_closure_validated",
-        report.scope == zstar::VerificationScope::ExternalClosure,
-    )?;
-    result.set_item("tar_members", report.tar_members)?;
-    result.set_item("pointer_members", report.pointer_members)?;
-    result.set_item("data_frames", report.data_frames)?;
-    result.set_item(
-        "external_objects_sha256_checked",
-        report
-            .external_objects_sha256_checked
-            .iter()
-            .map(zstar::manifest::object_address)
-            .collect::<Vec<_>>(),
-    )?;
-    result.set_item(
-        "external_objects_unchecked",
-        report
-            .external_objects_unchecked
-            .iter()
-            .map(zstar::manifest::object_address)
+            .map(zstar::backend::manifest::object_address)
             .collect::<Vec<_>>(),
     )?;
     Ok(result.unbind())
@@ -678,7 +636,7 @@ impl zstar::AsyncRangeReader for PythonSource {
         Ok(self.size)
     }
     async fn read_range(&self, range: std::ops::Range<u64>) -> zstar::Result<bytes::Bytes> {
-        zstar::checked_range(
+        zstar::backend::checked_range(
             range.start,
             range
                 .end
@@ -796,14 +754,13 @@ impl State {
                 .collect()
         }))
     }
-    pub async fn verify(&self, external: bool) -> PyResult<Py<pyo3::types::PyDict>> {
+    pub async fn verify(&self, external: bool) -> PyResult<()> {
         let scope = if external {
             zstar::VerificationScope::ExternalClosure
         } else {
             zstar::VerificationScope::Archive
         };
-        let report = self.reader.verify(scope).await.map_err(core_error)?;
-        Python::attach(|py| verification_dict(py, report))
+        self.reader.verify(scope).await.map_err(core_error)
     }
     pub async fn read_link(&self, path: &str) -> PyResult<String> {
         self.reader.read_link(path).await.map_err(core_error)
@@ -814,7 +771,7 @@ impl State {
 /// pending and buffered metadata never keep the archive source alive.
 pub struct EntryIterator {
     prefix: Option<String>,
-    checkpoint: Option<zstar::EntryCursor>,
+    checkpoint: Option<zstar::backend::EntryCursor>,
     exhausted: bool,
     buffer: std::collections::VecDeque<Py<PyAny>>,
     projection: MetadataProjection,

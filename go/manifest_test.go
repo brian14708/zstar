@@ -17,7 +17,7 @@ import (
 func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 	var output bytes.Buffer
 	output.Write(make([]byte, 1000))
-	writer, err := NewManifestWriter(&output, 1000, ManifestWriterOptions{MemoryBytes: 64})
+	writer, err := newManifestWriter(&output, 1000, ManifestWriterOptions{MemoryBytes: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &failingCloseSpill{}
-	manifest, err := OpenManifest(context.Background(), memoryRange(output.Bytes()), ManifestReaderOptions{
+	manifest, err := openManifest(context.Background(), memoryRange(output.Bytes()), ManifestReaderOptions{
 		MemoryBytes:      64,
 		CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	})
@@ -56,7 +56,7 @@ func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 	}
 	bad := bytes.Clone(output.Bytes())
 	bad[len(bad)-1] ^= 1
-	if _, err = OpenManifest(context.Background(), memoryRange(bad), ManifestReaderOptions{}); err == nil {
+	if _, err = openManifest(context.Background(), memoryRange(bad), ManifestReaderOptions{}); err == nil {
 		t.Fatal("bad manifest hash accepted")
 	}
 }
@@ -70,7 +70,7 @@ func TestRootExtensionNestingAtWireDepth(t *testing.T) {
 			}
 			var output bytes.Buffer
 			output.WriteByte(0)
-			writer, err := NewManifestWriter(&output, 1, ManifestWriterOptions{
+			writer, err := newManifestWriter(&output, 1, ManifestWriterOptions{
 				RootExtensions: Extensions{"x-depth": value},
 			})
 			if depth == 64 {
@@ -89,7 +89,7 @@ func TestRootExtensionNestingAtWireDepth(t *testing.T) {
 			if err = writer.Close(); err != nil {
 				t.Fatal(err)
 			}
-			manifest, err := OpenManifest(context.Background(), memoryRange(output.Bytes()), ManifestReaderOptions{})
+			manifest, err := openManifest(context.Background(), memoryRange(output.Bytes()), ManifestReaderOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -101,7 +101,7 @@ func TestRootExtensionNestingAtWireDepth(t *testing.T) {
 func TestManifestEntryOwnershipAndCursor(t *testing.T) {
 	var out bytes.Buffer
 	out.Write(make([]byte, 1000))
-	w, err := NewManifestWriter(&out, 1000, ManifestWriterOptions{BlockTarget: 512})
+	w, err := newManifestWriter(&out, 1000, ManifestWriterOptions{BlockTarget: 512})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestManifestEntryOwnershipAndCursor(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestManifestEntryOwnershipAndCursor(t *testing.T) {
 func TestManifestArchiveEncoderSharesAndSplitsFrames(t *testing.T) {
 	ctx := context.Background()
 	var out bytes.Buffer
-	writer, err := NewEntryArchiveWriter(&out, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
+	writer, err := newEntryArchiveWriter(&out, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestManifestArchiveEncoderSharesAndSplitsFrames(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	result, err := OpenManifest(ctx, memoryRange(out.Bytes()), ManifestReaderOptions{})
+	result, err := openManifest(ctx, memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,16 +211,19 @@ func TestManifestContentReferences(t *testing.T) {
 	if err != nil || len(extents) != 1 || extents[0] != values[0] {
 		t.Fatalf("reference: %v", err)
 	}
-	pointer, err := EncodeContentPointer(values)
+	pointer, err := encodeContentPointer(values)
 	if err != nil {
 		t.Fatal(err)
 	}
-	extents, err = DecodeContentPointer(pointer)
+	extents, err = decodeContentPointer(pointer, math.MaxInt)
 	if err != nil || len(extents) != 1 || extents[0] != values[0] {
 		t.Fatalf("pointer: %v", err)
 	}
-	if _, err := DecodeContentPointer(bytes.Replace(pointer, []byte(`"offset":9`), []byte(`"offset":0`), 1)); err == nil {
-		t.Fatal("explicit default accepted")
+	for _, offset := range []string{"0", "null", "-1", "9.0", "9e0", `"9"`} {
+		invalid := bytes.Replace(pointer, []byte(`"offset":9`), []byte(`"offset":`+offset), 1)
+		if _, err := decodeContentPointer(invalid, math.MaxInt); ErrorCategory(err) != CategoryMalformedPointer {
+			t.Fatalf("offset %s: %v", offset, err)
+		}
 	}
 }
 
@@ -247,10 +250,10 @@ func TestContentReferenceAndPointerSizeBounds(t *testing.T) {
 			if _, err := DecodeContentReference(reference); (err == nil) != valid {
 				t.Fatalf("decode reference: %v", err)
 			}
-			if _, err := EncodeContentPointer(extents); (err == nil) != valid {
+			if _, err := encodeContentPointer(extents); (err == nil) != valid {
 				t.Fatalf("encode pointer: %v", err)
 			}
-			if _, err := DecodeContentPointer(pointer); (err == nil) != valid {
+			if _, err := decodeContentPointer(pointer, math.MaxInt); (err == nil) != valid {
 				t.Fatalf("decode pointer: %v", err)
 			}
 			if _, err := decodeContentPointer(pointer, 1); err == nil {
@@ -295,7 +298,7 @@ func TestManifestAdjacentExtentsReuseObjectAndCheckEveryRange(t *testing.T) {
 	address := fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
 	var out bytes.Buffer
 	out.Write(make([]byte, 1000))
-	writer, err := NewManifestWriter(&out, 1000, ManifestWriterOptions{})
+	writer, err := newManifestWriter(&out, 1000, ManifestWriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +318,7 @@ func TestManifestAdjacentExtentsReuseObjectAndCheckEveryRange(t *testing.T) {
 	if err = writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,14 +342,14 @@ func TestSequenceHeaderLargerThanSegment(t *testing.T) {
 	var out bytes.Buffer
 	out.WriteByte(0)
 	padding := bytes.Repeat([]byte{7}, (16<<20)+1)
-	w, err := NewManifestWriter(&out, 1, ManifestWriterOptions{RootExtensions: Extensions{"x-large": padding}})
+	w, err := newManifestWriter(&out, 1, ManifestWriterOptions{RootExtensions: Extensions{"x-large": padding}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +369,7 @@ func TestSortingReleasesSpillsAfterSuccessAndFailure(t *testing.T) {
 			budget := NewSpoolBudget(limit)
 			stores := []*failingCloseSpill{}
 			var out bytes.Buffer
-			w, err := NewManifestWriter(&out, 1, ManifestWriterOptions{
+			w, err := newManifestWriter(&out, 1, ManifestWriterOptions{
 				MemoryBytes: 1, SpoolBudget: budget,
 				CreateSpillStore: func() (ManifestSpillStore, error) {
 					s := &failingCloseSpill{}

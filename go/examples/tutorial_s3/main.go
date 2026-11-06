@@ -10,7 +10,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	zstar "github.com/brian14708/zstar/go"
@@ -40,7 +39,7 @@ func run(ctx context.Context) (result error) {
 		),
 	}
 	if endpoint := os.Getenv("ZSTAR_S3_ENDPOINT"); endpoint != "" {
-		options.BaseEndpoint = aws.String(endpoint)
+		options.BaseEndpoint = new(endpoint)
 		options.UsePathStyle = true
 	}
 	client := awss3.New(options)
@@ -60,7 +59,7 @@ func run(ctx context.Context) (result error) {
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		_, err := client.DeleteObject(cleanup, &awss3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+		_, err := client.DeleteObject(cleanup, &awss3.DeleteObjectInput{Bucket: new(bucket), Key: new(key)})
 		result = errors.Join(result, err)
 		if err == nil {
 			fmt.Println("Deleted S3 object")

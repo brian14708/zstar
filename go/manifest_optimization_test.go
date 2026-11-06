@@ -90,7 +90,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	var out bytes.Buffer
 	rootBytes := []byte{7}
 	attributes := Extensions{"x-bytes": []byte{7}}
-	w, err := NewEntryArchiveWriter(&out, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1}})
+	w, err := newEntryArchiveWriter(&out, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{RootExtensions: Extensions{"x-bytes": rootBytes}, CompressionLevel: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,12 +102,12 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer testClose(t, m)
-	if _, err = m.ValidateArchive(context.Background()); err != nil {
+	if err = m.ValidateArchive(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	root := m.RootExtensions()
@@ -125,7 +125,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	// The low-level manifest writer also snapshots caller data before flushing.
 	out.Reset()
 	out.Write(make([]byte, 1000))
-	metadata, err := NewManifestWriter(&out, 1000, ManifestWriterOptions{})
+	metadata, err := newManifestWriter(&out, 1000, ManifestWriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 	if err = metadata.Close(); err != nil {
 		t.Fatal(err)
 	}
-	next, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	next, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,10 +177,10 @@ func TestDirectManifestTupleIntegerBoundaries(t *testing.T) {
 	}
 }
 
-func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
+func TestManifestPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 	ctx := context.Background()
 	var output bytes.Buffer
-	w, err := NewEntryArchiveWriter(&output, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
+	w, err := newEntryArchiveWriter(&output, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,35 +191,27 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer testClose(t, m)
-	var streamed bytes.Buffer
-	if _, err = m.VisitPayloads(ctx, func(e Entry, b []byte) error {
-		// A callback may read metadata and owns the entry it receives.
-		if _, err := m.Entry(e.Path); err != nil {
-			return err
-		}
-		streamed.Write(b)
-		return nil
-	}); err != nil || !bytes.Equal(streamed.Bytes(), body) {
-		t.Fatalf("streaming: %v", err)
+	if err := m.ValidateArchive(ctx); err != nil {
+		t.Fatalf("physical validation: %v", err)
 	}
 	// Build tar manually in arbitrary order; empty members make duplicates
 	// impossible to detect through inline mapping alone.
 	for _, paths := range [][]string{{"b", "a"}, {"b", "b"}} {
 		var raw, archive bytes.Buffer
 		for _, path := range paths {
-			header, err := memberHeader(Header{Path: path, Kind: "file", Mode: 420})
+			header, err := memberHeader(Header{Path: path, Type: TypeFile, Mode: 420})
 			if err != nil {
 				t.Fatal(err)
 			}
 			raw.Write(header)
 		}
 		raw.Write(make([]byte, 1024))
-		codec, err := NewEntryArchiveWriter(&archive, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{}})
+		codec, err := newEntryArchiveWriter(&archive, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -232,7 +224,7 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 		testClose(t, codec.codec)
 		checkCleanup(t, codec.frames.close())
 		checkCleanup(t, codec.records.close())
-		metadata, err := NewManifestWriter(&archive, codec.encoded, ManifestWriterOptions{})
+		metadata, err := newManifestWriter(&archive, codec.encoded, ManifestWriterOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,11 +236,11 @@ func TestManifestStreamingPayloadMappingsAndUnorderedCoverage(t *testing.T) {
 		if err = metadata.Close(); err != nil {
 			t.Fatal(err)
 		}
-		m, err := OpenManifest(ctx, memoryRange(archive.Bytes()), ManifestReaderOptions{MemoryBytes: 1})
+		m, err := openManifest(ctx, memoryRange(archive.Bytes()), ManifestReaderOptions{MemoryBytes: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = m.ValidateArchive(ctx)
+		err = m.ValidateArchive(ctx)
 		testClose(t, m)
 		if (err == nil) != (paths[1] == "a") {
 			t.Fatalf("coverage %v: %v", paths, err)

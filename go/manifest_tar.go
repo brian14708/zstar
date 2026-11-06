@@ -8,24 +8,13 @@ import (
 	"strings"
 )
 
-// ArchiveReport describes full physical validation, independently of
-// external closure. Counts keep reports bounded for archives with many entries.
-type ArchiveReport struct {
-	MetadataAuthenticated bool   `json:"metadata_authenticated"`
-	MetadataValidated     bool   `json:"metadata_validated"`
-	FullArchiveValidated  bool   `json:"full_archive_validated"`
-	DataFramesChecked     uint64 `json:"data_frames_checked"`
-	TarMembersChecked     uint64 `json:"tar_members_checked"`
-	PointerMembersChecked uint64 `json:"pointer_members_checked"`
-}
-
 type manifestTarCursor struct {
-	limits                         Limits
-	decoder                        frameDecoder
-	input                          manifestRangeStream
-	raw                            []byte
-	at                             int
-	frameOffset, frameSize, frames uint64
+	limits                 Limits
+	decoder                frameDecoder
+	input                  manifestRangeStream
+	raw                    []byte
+	at                     int
+	frameOffset, frameSize uint64
 }
 
 // Scan a single frame using its block lengths, without a permanent frame table.
@@ -96,7 +85,6 @@ func (c *manifestTarCursor) nextFrame() error {
 	}
 	c.raw, c.at = raw, 0
 	c.frameSize = uint64(len(encoded))
-	c.frames++
 	return nil
 }
 
@@ -259,25 +247,10 @@ func sameEffectiveMetadata(a, b Entry) bool {
 // ValidateArchive checks metadata and all physical frames, effective headers,
 // inline mappings, pointers, padding and end markers. It fetches no external
 // objects and makes no external-closure claim.
-func (m *Manifest) ValidateArchive(ctx context.Context) (ArchiveReport, error) {
-	return m.VisitPayloads(ctx, nil)
-}
-
-// VisitPayloads validates while streaming physical file payloads. External
-// payloads are pointer JSON. Empty regular files produce one empty callback;
-// directories and symlinks produce none. Bytes are borrowed until callback
-// return. Output is provisional until this method succeeds. Callbacks may read
-// metadata/content through m, but must not close it during validation. Entry
-// metadata is isolated from validation state and reused for each member chunk.
-func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) error) (report ArchiveReport, err error) {
+func (m *manifest) ValidateArchive(ctx context.Context) (err error) {
 	if err = m.checkOpen(ctx); err != nil {
-		return report, err
+		return err
 	}
-	defer func() {
-		if err != nil {
-			report = ArchiveReport{}
-		}
-	}()
 	c := manifestTarCursor{limits: m.spool.options.Limits, decoder: frameDecoder{limits: m.spool.options.Limits}, input: manifestRangeStream{ctx: ctx, source: m.source, end: m.start, category: CategoryMalformedFrame, readAhead: m.readAhead}}
 	defer c.decoder.close()
 	cursor := m.Cursor()
@@ -288,26 +261,26 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 	for {
 		first, e := c.take(512)
 		if e != nil {
-			return report, e
+			return e
 		}
 		if allZero(first) {
 			if e = c.zero(512); e != nil {
-				return report, e
+				return e
 			}
 			if c.at != len(c.raw) || c.input.at != c.input.end {
-				return report, badTar("trailing decoded data or frames")
+				return badTar("trailing decoded data or frames")
 			}
 			break
 		}
 		header, e := c.header(first)
 		if e != nil {
-			return report, e
+			return e
 		}
 		var entry *Entry
 		if ordered {
 			batch, e := cursor.Next(1)
 			if e != nil {
-				return report, e
+				return e
 			}
 			if len(batch) == 1 && batch[0].Path == header.entry.Path {
 				entry = &batch[0]
@@ -322,13 +295,13 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 					buffer = binary.LittleEndian.AppendUint64(buffer, rank)
 					if len(buffer) == cap(buffer) {
 						if e = observed.append(buffer); e != nil {
-							return report, e
+							return e
 						}
 						buffer = buffer[:0]
 					}
 				}
 				if e = observed.append(buffer); e != nil {
-					return report, e
+					return e
 				}
 				ordered = false
 			}
@@ -337,59 +310,49 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 			entry, rank, e = m.entryRank(header.entry.Path)
 			m.mu.Unlock()
 			if e != nil {
-				return report, e
+				return e
 			}
 			if entry == nil {
-				return report, tarMismatch("unindexed member")
+				return tarMismatch("unindexed member")
 			}
 			if e = observed.append(binary.LittleEndian.AppendUint64(nil, rank)); e != nil {
-				return report, e
+				return e
 			}
 		}
 		if !sameEffectiveMetadata(*entry, header.entry) {
-			return report, tarMismatch("member metadata")
+			return tarMismatch("member metadata")
 		}
 		if count >= m.count {
-			return report, tarMismatch("extra physical member")
+			return tarMismatch("extra physical member")
 		}
 		count++
-		var visitorEntry Entry
-		if visit != nil {
-			visitorEntry = cloneEntry(*entry)
-		}
 		if entry.External() {
 			if err = checkLimit(header.size, c.limits.MaxPointerBytes, "pointer size"); err != nil {
-				return report, err
+				return err
 			}
 			pointer, e := c.take(header.size)
 			if e != nil {
-				return report, e
+				return e
 			}
 			extents, e := decodeContentPointer(pointer, len(entry.Extents))
 			if e != nil {
-				return report, e
+				return e
 			}
 			if len(extents) != len(entry.Extents) {
-				return report, tarMismatch("pointer recipe")
+				return tarMismatch("pointer recipe")
 			}
 			for i := range extents {
 				if extents[i] != entry.Extents[i] {
-					return report, tarMismatch("pointer recipe")
+					return tarMismatch("pointer recipe")
 				}
 			}
-			if visit != nil {
-				if e = visit(visitorEntry, pointer); e != nil {
-					return report, e
-				}
-			}
-			report.PointerMembersChecked++
 		} else {
 			size, e := entry.Size()
 			if e != nil {
-				return report, e
+				return e
 			}
 			if size != header.size {
-				return report, tarMismatch("inline payload size")
+				return tarMismatch("inline payload size")
 			}
 			extentIndex := 0
 			var extentAt uint64
@@ -412,36 +375,26 @@ func (m *Manifest) VisitPayloads(ctx context.Context, visit func(Entry, []byte) 
 						extentAt = 0
 					}
 				}
-				if visit != nil {
-					return visit(visitorEntry, b)
-				}
 				return nil
 			})
 			if e != nil {
-				return report, e
+				return e
 			}
 			if extentIndex != len(entry.Extents) || extentAt != 0 {
-				return report, tarMismatch("inline extent coverage")
-			}
-			if size == 0 && entry.Type == TypeFile && visit != nil {
-				if e = visit(visitorEntry, []byte{}); e != nil {
-					return report, e
-				}
+				return tarMismatch("inline extent coverage")
 			}
 		}
 		if e = c.zero((512 - header.size%512) % 512); e != nil {
-			return report, e
+			return e
 		}
 	}
 	if count != m.count {
-		return report, tarMismatch("missing physical member")
+		return tarMismatch("missing physical member")
 	}
 	if !ordered {
 		if err = validateObservedRanks(ctx, &observed, count); err != nil {
-			return report, err
+			return err
 		}
 	}
-	report.MetadataAuthenticated, report.MetadataValidated, report.FullArchiveValidated = true, true, true
-	report.DataFramesChecked, report.TarMembersChecked = c.frames, count
-	return report, nil
+	return nil
 }

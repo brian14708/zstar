@@ -91,7 +91,7 @@ pub fn s3_archive_metadata(
     let source_size = view.len()? as u64;
     let tail = view.get_item(PySlice::new(py, -80, isize::MAX, 1))?;
     let footer = crate::support::buffer_vec(py, &tail)?;
-    let footer = zstar::parse_footer(&footer).map_err(crate::support::core_error)?;
+    let footer = zstar::backend::parse_footer(&footer).map_err(crate::support::core_error)?;
     let attributes =
         zstar::s3::archive_attributes(&footer, source_size).map_err(crate::support::core_error)?;
     Ok(attributes

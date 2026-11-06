@@ -122,7 +122,7 @@ async fn presigned_get_opens_archive_without_head_and_reloads_content() {
 
 #[tokio::test]
 async fn http_encoded_object_resolver_fetches_bounded_complete_object() {
-    let encoded = zstar::encode_frame(b"external object bytes", 3).unwrap();
+    let encoded = zstar::backend::encode_frame(b"external object bytes", 3).unwrap();
     let body = encoded.clone();
     let server = server(move |request| ranged(request, &body)).await;
     let url = server.url.clone();

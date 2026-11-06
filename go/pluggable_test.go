@@ -16,12 +16,12 @@ func (pluggableObjectWriter) Put(_ context.Context, raw []byte) (Extent, error) 
 
 func TestPluggableStreamOptionsAndContentBudgets(t *testing.T) {
 	ctx := context.Background()
-	reader, err := OpenWithOptions(ctx, memoryRange(buildTestArchive(t, 1024)), ReaderOptions{ConcurrentChunks: 1, MaxReadBytes: 1})
+	reader, err := OpenWithOptions(ctx, memoryRange(buildTestArchive(t, 1024)), ReaderOptions{Manifest: ManifestReaderOptions{ConcurrentChunks: 1, MaxReadBytes: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer testClose(t, reader)
-	stream, err := reader.OpenStreamWithOptions(ctx, "nested/data", StreamOptions{DisableCache: true})
+	stream, err := reader.OpenStream(ctx, "nested/data", StreamOptions{DisableCache: true})
 	if err != nil {
 		t.Fatal(err)
 	}

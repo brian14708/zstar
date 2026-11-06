@@ -136,14 +136,12 @@ impl FileSelection {
     }
 }
 
-/// Low-level random-access selection retaining caller-supplied metadata.
+/// Authenticated random-access member selection created by [`Archive::open_cursor`].
 ///
-/// [`FileCursor::new`] does not authenticate its entry against an archive;
-/// prefer [`Archive::open_cursor`] for authenticated member cursors.
 /// The caller supplies the live archive for each operation. Positional reads
 /// borrow the cursor immutably and can run concurrently.
 pub struct FileCursor {
-    pub(crate) owner: Option<std::sync::Weak<crate::ManifestReader>>,
+    owner: Weak<crate::ManifestReader>,
     selection: FileSelection,
 }
 impl FileCursor {
@@ -163,16 +161,12 @@ impl FileCursor {
         self.selection.size
     }
 
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    pub fn new(entry: Entry) -> Result<Self> {
+    pub(crate) fn new(entry: Entry, owner: Weak<crate::ManifestReader>) -> Result<Self> {
         if entry.kind != EntryKind::File {
             return Err(Error::Unsupported("entry is not a file"));
         }
         Ok(Self {
-            owner: None,
+            owner,
             selection: FileSelection::new(entry)?,
         })
     }
@@ -189,11 +183,7 @@ impl FileCursor {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        if self
-            .owner
-            .as_ref()
-            .is_some_and(|owner| !archive.owns_cursor(owner))
-        {
+        if !archive.owns_cursor(&self.owner) {
             return Err(Error::Unsupported("cursor belongs to another archive"));
         }
         self.selection.read(archive, offset, length).await
@@ -242,11 +232,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     #[must_use]
     pub const fn size(&self) -> u64 {
         self.selection.size
-    }
-    /// Returns the entry kind.
-    #[must_use]
-    pub const fn kind(&self) -> EntryKind {
-        self.selection.entry.kind
     }
     /// Borrows the entry's immutable metadata and extents.
     #[must_use]

@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+use zstar::Error;
 use zstar::backend::{BlockingArchive, EncodedObjectResolver};
-use zstar::{EntryCursor, Error, ManifestOptions, RangeReader};
+use zstar::backend::{EntryCursor, ManifestOptions, RangeReader};
 
 pub fn from_py(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Value> {
     if depth > 64 {
@@ -145,7 +146,7 @@ impl RangeReader for Source {
     }
     fn read_range(&mut self, range: std::ops::Range<u64>) -> zstar::Result<Vec<u8>> {
         let length = range.end.checked_sub(range.start).ok_or(Error::Range)?;
-        zstar::checked_range(range.start, length, self.size)?;
+        zstar::backend::checked_range(range.start, length, self.size)?;
         Python::attach(|py| {
             let value = self
                 .object
@@ -360,14 +361,17 @@ impl ManifestEntries {
 
 #[pyfunction]
 fn decode_manifest_block(py: Python<'_>, raw: &[u8]) -> PyResult<Py<PyAny>> {
-    to_py(py, &zstar::manifest::decode_block(raw).map_err(core_error)?)
+    to_py(
+        py,
+        &zstar::backend::manifest::decode_block(raw).map_err(core_error)?,
+    )
 }
 #[pyfunction]
 fn encode_manifest_block<'py>(
     py: Python<'py>,
     value: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let bytes = zstar::manifest::encode_block(&from_py(value, 0)?).map_err(core_error)?;
+    let bytes = zstar::backend::manifest::encode_block(&from_py(value, 0)?).map_err(core_error)?;
     Ok(PyBytes::new(py, &bytes))
 }
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

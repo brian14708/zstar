@@ -28,3 +28,5 @@ github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTf
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+golang.org/x/exp/collection v0.0.0-20261106192419-47ce03d25ef0 h1:8VF3qXOvqJaeVCGuCuAXyTI1M8ZbUJliFcVR12dM6FE=
+golang.org/x/exp/collection v0.0.0-20261106192419-47ce03d25ef0/go.mod h1:JOMgjUl5/A9LbUOEF12f5utg8jWbczWnPeiysNI5QWw=

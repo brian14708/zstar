@@ -30,16 +30,10 @@ type StreamOptions struct {
 	DisableCache bool
 }
 
-// OpenStream opens a seekable member with the legacy cache-size convention.
-// Zero selects 2 MiB. Use OpenStreamWithOptions to disable caching explicitly.
-func (r *Reader) OpenStream(ctx context.Context, path string, cacheBytes uint64) (*Stream, error) {
-	return r.OpenStreamWithOptions(ctx, path, StreamOptions{CacheBytes: cacheBytes})
-}
-
-// OpenStreamWithOptions opens the recommended sequential member reader.
+// OpenStream opens the recommended sequential member reader.
 // ctx applies only to opening; use ReadContext for per-read deadlines.
 // Larger decoded sources are validated but not retained in the cache.
-func (r *Reader) OpenStreamWithOptions(ctx context.Context, path string, options StreamOptions) (*Stream, error) {
+func (r *Reader) OpenStream(ctx context.Context, path string, options StreamOptions) (*Stream, error) {
 	f, err := r.OpenFile(ctx, path)
 	if err != nil {
 		return nil, err

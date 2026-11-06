@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -14,11 +15,12 @@ import (
 const defaultEncoderWindow = 16 << 20
 
 // Header supplies effective tar metadata and an inline physical size. External
-// files supply Extents with Size zero and no body. Kind defaults to file.
+// files supply Extents with Size zero and no body. Type defaults to TypeFile.
 type Header struct {
-	Extensions     Extensions
-	Path           string
-	Kind           Kind
+	Extensions Extensions
+	Path       string
+	// Type uses the same member kinds as Entry.Type; zero is TypeFile.
+	Type           EntryType
 	Mode, UID, GID uint64
 	MtimeNS        int64
 	Size           uint64
@@ -44,12 +46,12 @@ type WriterOptions struct {
 // and bounded, spooled entry metadata.
 // Paths may arrive in any order with explicit ancestor directories. Close never
 // closes the destination. Methods are not concurrent; failures are sticky.
-type Writer struct{ engine *EntryArchiveWriter }
+type Writer struct{ engine *entryArchiveWriter }
 
 // NewWriter creates an archive encoder. The caller owns output and must call
 // Close to finalize metadata and release temporary storage.
 func NewWriter(output io.Writer, options WriterOptions) (*Writer, error) {
-	engine, err := NewEntryArchiveWriter(output, options)
+	engine, err := newEntryArchiveWriter(output, options)
 	if err != nil {
 		return nil, err
 	}
@@ -68,23 +70,16 @@ func (w *Writer) Add(ctx context.Context, header Header, body io.Reader) error {
 	if w.engine.err != nil {
 		return w.engine.err
 	}
-	kind := header.Kind
-	if kind == "" {
-		kind = KindFile
-	}
-	entry := Entry{Path: header.Path, Mode: header.Mode, UID: header.UID, GID: header.GID, MtimeNS: header.MtimeNS, Extents: header.Extents, Attributes: header.Extensions}
-	switch kind {
-	case KindFile:
-	case KindDirectory:
-		entry.Type = TypeDirectory
-	case KindSymlink:
-		entry.Type = TypeSymlink
+	entry := Entry{Path: header.Path, Type: header.Type, Mode: header.Mode, UID: header.UID, GID: header.GID, MtimeNS: header.MtimeNS, Extents: header.Extents, Attributes: header.Extensions}
+	switch header.Type {
+	case TypeFile, TypeDirectory:
+	case TypeSymlink:
 		target := header.Target
 		entry.Linkname = &target
 	default:
 		return errors.New("zstar: unsupported member kind")
 	}
-	if kind != KindSymlink && header.Target != "" {
+	if header.Type != TypeSymlink && header.Target != "" {
 		return errors.New("zstar: target on nonsymlink")
 	}
 	return w.engine.Add(ctx, entry, header.Size, body)
@@ -126,13 +121,13 @@ func writeBuffer(destination io.Writer, data []byte) (int, error) {
 func memberHeader(h Header) ([]byte, error) {
 	path := h.Path
 	kind := byte('0')
-	switch h.Kind {
-	case KindDirectory:
+	switch h.Type {
+	case TypeDirectory:
 		path += "/"
 		kind = '5'
-	case KindSymlink:
+	case TypeSymlink:
 		kind = '2'
-	case KindFile, "":
+	case TypeFile:
 	}
 	pax := map[string]string{}
 	tarPath, target := path, h.Target
@@ -181,11 +176,7 @@ func memberHeader(h Header) ([]byte, error) {
 	if len(pax) == 0 {
 		return header, nil
 	}
-	keys := make([]string, 0, len(pax))
-	for key := range pax {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(pax))
 	var payload strings.Builder
 	for _, key := range keys {
 		body := key + "=" + pax[key] + "\n"

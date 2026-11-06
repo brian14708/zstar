@@ -215,7 +215,7 @@ func ExternalizeChunks(ctx context.Context, chunks iter.Seq2[[]byte, error], siz
 		if _, err := EncodeContentReference(extents); err != nil {
 			return nil, err
 		}
-		if _, err := EncodeContentPointer(extents); err != nil {
+		if _, err := encodeContentPointer(extents); err != nil {
 			return nil, err
 		}
 	}

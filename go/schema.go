@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"golang.org/x/exp/collection/set"
 )
 
 func validValue(value any) error {
@@ -37,19 +39,19 @@ func schemaMap(value any, required, optional []string) (map[any]any, error) {
 	if !ok {
 		return nil, errors.New("zstar: expected map")
 	}
-	allowed := make(map[string]bool)
+	allowed := set.Of[string]()
 	for _, key := range required {
-		allowed[key] = true
+		allowed.Insert(key)
 		if _, ok := m[key]; !ok {
 			return nil, fmt.Errorf("zstar: missing field %q", key)
 		}
 	}
 	for _, key := range optional {
-		allowed[key] = true
+		allowed.Insert(key)
 	}
 	for key := range m {
 		s, ok := key.(string)
-		if !ok || (!allowed[s] && !strings.HasPrefix(s, "x-")) {
+		if !ok || (!allowed.Contains(s) && !strings.HasPrefix(s, "x-")) {
 			return nil, fmt.Errorf("zstar: unknown field %q", key)
 		}
 	}

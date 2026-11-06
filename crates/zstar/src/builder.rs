@@ -70,6 +70,12 @@ impl Header {
 }
 
 /// Compression, metadata, and storage options for a [`Builder`].
+///
+/// Reader-only metadata settings are unavailable on writers:
+/// ```compile_fail
+/// let options = zstar::WriterOptions::default();
+/// let _ = options.metadata.max_entries;
+/// ```
 #[derive(Clone, Debug)]
 pub struct WriterOptions {
     /// Decoded data-frame target: at least 512 bytes, subject to manifest limits.
@@ -78,17 +84,21 @@ pub struct WriterOptions {
     pub compression_level: i32,
     /// Compression worker count, from 0 (serial) to 16.
     pub workers: usize,
-    /// Metadata encoding and storage limits.
-    pub manifest: ManifestOptions,
+    /// Metadata encoding and temporary storage policy.
+    pub metadata: crate::MetadataWriterOptions,
+    /// Per-source frame/window and entry/extent/pointer limits. Zero disables each limit.
+    pub limits: crate::Limits,
     /// Archive-level `x-*` CBOR values.
     pub root_extensions: Extensions,
 }
 impl WriterOptions {
-    /// Sets writer metadata/spool policy without exposing reader-only options.
-    #[must_use]
-    pub fn with_metadata(mut self, options: crate::MetadataWriterOptions) -> Self {
-        options.apply(&mut self.manifest);
-        self
+    fn manifest_options(&self) -> ManifestOptions {
+        let mut options = ManifestOptions {
+            limits: self.limits,
+            ..Default::default()
+        };
+        self.metadata.clone().apply(&mut options);
+        options
     }
 }
 impl Default for WriterOptions {
@@ -97,7 +107,8 @@ impl Default for WriterOptions {
             frame_size: 1 << 20,
             compression_level: 3,
             workers: 0,
-            manifest: ManifestOptions::default(),
+            metadata: crate::MetadataWriterOptions::default(),
+            limits: crate::Limits::default(),
             root_extensions: Extensions::default(),
         }
     }
@@ -249,7 +260,7 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
                     Sink(send.clone()),
                     options.frame_size,
                     options.compression_level,
-                    options.manifest,
+                    options.manifest_options(),
                 )
                 .and_then(|writer| writer.with_workers(options.workers))
                 .and_then(|writer| writer.with_root_extensions(options.root_extensions));
@@ -282,6 +293,17 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
     /// Turn the generic "worker vanished" symptoms into the worker's actual
     /// failure (for example a panic payload), when it can be recovered.
     async fn explain(&mut self, error: Error) -> Error {
+        // Early worker rejection closes the input channel before the feed task
+        // sees its result. Drain output so scheduling cannot hide that rejection
+        // behind a generic body-channel error, or strand the worker's sender.
+        let error = if matches!(error, Error::Unsupported("archive body closed")) {
+            match Self::drain(self.sink.as_mut().unwrap(), self.output.as_mut().unwrap()).await {
+                Err(cause) => cause,
+                Ok(()) => error,
+            }
+        } else {
+            error
+        };
         if !matches!(
             error,
             Error::Unsupported("archive writer stopped" | "archive body closed")

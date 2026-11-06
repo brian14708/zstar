@@ -19,14 +19,14 @@ struct CallbackWriter {
 #[async_trait::async_trait]
 impl zstar::chunking::ObjectWriter for CallbackWriter {
     async fn put_chunk(&mut self, raw: bytes::Bytes) -> zstar::Result<zstar::Extent> {
-        let digest = *zstar::Digest::sha256(&raw).as_bytes();
-        let encoded = zstar::encode_frame(&raw, self.level)?;
+        let digest = *zstar::backend::Digest::sha256(&raw).as_bytes();
+        let encoded = zstar::backend::encode_frame(&raw, self.level)?;
         let encoded_size = Python::attach(|py| {
             self.callback
                 .call1(
                     py,
                     (
-                        zstar::manifest::object_address(&digest),
+                        zstar::backend::manifest::object_address(&digest),
                         PyBytes::new(py, &encoded),
                         raw.len(),
                     ),
@@ -158,7 +158,11 @@ pub fn resolve_encoded(
         let value = object.call_method1(
             py,
             "get_encoded",
-            (zstar::manifest::object_address(&digest), hint, max_bytes),
+            (
+                zstar::backend::manifest::object_address(&digest),
+                hint,
+                max_bytes,
+            ),
         )?;
         if value.bind(py).len()? as u64 > max_bytes {
             return Err(core_error(zstar::Error::Budget(
@@ -209,7 +213,11 @@ impl zstar::ObjectResolver for PythonResolver {
     ) -> zstar::Result<bytes::Bytes> {
         if let Some(callback) = &self.callback {
             let args = Python::attach(|py| {
-                (zstar::manifest::object_address(&digest), hint, max_bytes)
+                (
+                    zstar::backend::manifest::object_address(&digest),
+                    hint,
+                    max_bytes,
+                )
                     .into_pyobject(py)
                     .map(Bound::unbind)
             })

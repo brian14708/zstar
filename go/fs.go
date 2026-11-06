@@ -7,7 +7,7 @@ import (
 	"io/fs"
 	"math"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -127,9 +127,7 @@ func (r *Reader) Open(name string) (fs.File, error) {
 		}
 		handle.prefix = prefix
 		r.manifest.mu.Lock()
-		handle.next = sort.Search(len(r.manifest.entries), func(i int) bool {
-			return r.manifest.entries[i].Path >= prefix
-		})
+		handle.next, _ = slices.BinarySearchFunc(r.manifest.entries, prefix, compareEntryPath)
 		r.manifest.mu.Unlock()
 	}
 	return handle, nil
@@ -308,9 +306,8 @@ func (f *archiveFile) ReadDir(n int) ([]fs.DirEntry, error) {
 			// Descendants occupy one contiguous lexicographic range. The byte
 			// after '/' is '0', giving the first key beyond this subtree.
 			end := entry.Path[:len(f.prefix)+slash] + "0"
-			f.next += sort.Search(len(m.entries)-f.next, func(i int) bool {
-				return m.entries[f.next+i].Path >= end
-			})
+			skip, _ := slices.BinarySearchFunc(m.entries[f.next:], end, compareEntryPath)
+			f.next += skip
 			continue
 		}
 		info, err := entry.FileInfo()

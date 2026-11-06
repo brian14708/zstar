@@ -2,19 +2,12 @@
 
 **Status:** working draft.
 
-Zstar is an indexed tar stream in independent Zstandard frames. This
-specification defines the core wire format, validation, and implementation
-profiles. Core archives keep file content in archive data frames. The
-[external-content extension](external-content.md) defines thin archives,
-JSON content-pointer payloads, standalone CBOR content references, and
-reconstruction. It retains footer profile
-and manifest version 1. The informative [CAS storage appendix](external-content.md#appendix-cas-storage)
-explains object identity and storage representations.
-
-The [catalog proposal](catalog.md) describes a separate JSON document naming
-collections of archived layers. Catalog JSON is not an archive manifest or a
-required core extension. Ordinary archive readers do not interpret catalogs or
-apply whiteouts; `.wh.*` members remain ordinary files outside catalog operations.
+This specification defines Zstar's self-contained indexed archive format: a tar
+stream in independent Zstandard frames, with deterministic CBOR metadata.
+It covers the core wire format, validation, and implementation profiles.
+Core archives contain all file content. Optional extensions build on this
+format, such as [external content](external-content.md) for external-object
+references and reconstruction.
 
 [Wire format](#wire-format) · [Validation](#validation-and-failures) ·
 [Profiles](#implementation-profiles) · [Security](#security-considerations) ·
@@ -407,10 +400,7 @@ Implementations using bounded integers MUST detect and report counter overflow.
 ### Extensions and versions
 
 Footer profile and manifest versions are both exactly 1. Reject other versions.
-Extensions define their own version markers. The numeric CBOR manifest version
-does not change when an application document uses a string version marker:
-physical JSON pointers use `"zstar-pointer-v1"`, and the catalog proposal uses
-`"zstar-catalog-v1"`.
+Extensions define their own version markers.
 
 Core maps accept extension fields only in the manifest header and entry
 attributes, where the CDDL permits them. Required features may extend other
@@ -638,8 +628,6 @@ This CDDL defines the CBOR structures. The preceding sections define
 deterministic encoding, namespace rules, and cross-field invariants.
 
 ```cddl
-; Normative entry-oriented v1 structure. See core.md for deterministic encoding,
-; bounded nesting, sorted namespace and required-feature agreement.
 ; A CBOR sequence group: emit these items consecutively, without an array.
 manifest = (manifest-header, * entry)
 manifest-header = {
@@ -692,8 +680,7 @@ This ABNF defines required-feature names and PAX decimal fields. The preceding
 sections define numeric and size bounds.
 
 ```abnf
-; Normative RFC 5234 / RFC 7405 grammar. Input is consumed in its entirety.
-; Numeric value bounds and size rules are defined in core.md.
+; Input is consumed in its entirety.
 ; SP, LF and DIGIT are RFC 5234 core rules.
 ; A complete required-feature is additionally limited to 1..128 ASCII bytes.
 required-feature = lower *(alnum / separator alnum)

@@ -42,7 +42,7 @@ func buildEntriesArchive(t *testing.T, n int, opts ManifestWriterOptions) []byte
 	t.Helper()
 	var out bytes.Buffer
 	out.WriteByte(0)
-	w, err := NewManifestWriter(&out, 1, opts)
+	w, err := newManifestWriter(&out, 1, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,17 +64,17 @@ func TestManifestEntryBudgets(t *testing.T) {
 		"count": {MaxEntries: 10},
 		"bytes": {MaxRetainedEntryBytes: 1000},
 	} {
-		_, err := OpenManifest(context.Background(), memoryRange(data), o)
+		_, err := openManifest(context.Background(), memoryRange(data), o)
 		if ErrorCategory(err) != CategoryResourceLimit {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 50})
+	m, err := openManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
 	testClose(t, m)
-	_, err = OpenManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 1})
+	_, err = openManifest(context.Background(), memoryRange(data), ManifestReaderOptions{MaxEntries: 1})
 	if _, ok := errors.AsType[*FormatError](err); !ok {
 		t.Fatal("not a FormatError")
 	}

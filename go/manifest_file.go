@@ -12,7 +12,7 @@ import (
 // borrows its manifest, which must remain open. ReadAt supports concurrent calls;
 // WriteTo streams complete selected extents without a whole-file allocation.
 type File struct {
-	manifest       *Manifest
+	manifest       *manifest
 	entry          *Entry
 	resolver       EncodedContentResolver
 	verifyExternal bool
@@ -23,7 +23,7 @@ type File struct {
 // OpenFile returns a concurrent random-access view of a regular member.
 // The manifest must remain open. ctx applies only to opening; use
 // ReadAtContext and WriteToContext to bound later I/O.
-func (m *Manifest) OpenFile(ctx context.Context, path string, resolver EncodedContentResolver, verifyExternal bool) (*File, error) {
+func (m *manifest) OpenFile(ctx context.Context, path string, resolver EncodedContentResolver, verifyExternal bool) (*File, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -38,7 +38,7 @@ func (m *Manifest) OpenFile(ctx context.Context, path string, resolver EncodedCo
 }
 
 // entry is already an owned regular-file snapshot; keep it private to the view.
-func (m *Manifest) openEntryFile(entry *Entry, resolver EncodedContentResolver, verifyExternal bool) (*File, error) {
+func (m *manifest) openEntryFile(entry *Entry, resolver EncodedContentResolver, verifyExternal bool) (*File, error) {
 	size, err := entry.Size()
 	if err != nil {
 		return nil, err
@@ -148,24 +148,14 @@ func (f *File) WriteToContext(ctx context.Context, output io.Writer) (written in
 	return written, nil
 }
 
-// VerificationReport describes physical archive and optional external closure
-// validation, including whether external object hashes were checked.
-type VerificationReport struct {
-	ArchiveReport
-	ExternalClosureValidated     bool `json:"external_closure_validated"`
-	ExternalObjectsSHA256Checked bool `json:"external_objects_sha256_checked"`
-	ExternalObjectsUnchecked     bool `json:"external_objects_unchecked"`
-}
-
 // Verify checks full physical validity and optionally every external selected
 // range. verifyExternal controls object hashing; checksums and range/resource
 // checks always apply. No reconstructed whole-file hash is computed.
-func (m *Manifest) Verify(ctx context.Context, resolver EncodedContentResolver, verifyExternal, externalClosure bool) (VerificationReport, error) {
-	physical, err := m.ValidateArchive(ctx)
+func (m *manifest) Verify(ctx context.Context, resolver EncodedContentResolver, verifyExternal, externalClosure bool) error {
+	err := m.ValidateArchive(ctx)
 	if err != nil {
-		return VerificationReport{}, err
+		return err
 	}
-	report := VerificationReport{ArchiveReport: physical}
 	if externalClosure {
 		err = m.VisitEntries(func(entry Entry) error {
 			if err := ctx.Err(); err != nil {
@@ -189,20 +179,14 @@ func (m *Manifest) Verify(ctx context.Context, resolver EncodedContentResolver, 
 				if _, err := chunk.selection(extent); err != nil {
 					return err
 				}
-				if chunk.verified {
-					report.ExternalObjectsSHA256Checked = true
-				} else {
-					report.ExternalObjectsUnchecked = true
-				}
 			}
 			return nil
 		})
 		if err != nil {
-			return VerificationReport{}, err
+			return err
 		}
-		report.ExternalClosureValidated = true
 	}
-	return report, nil
+	return nil
 }
 
 func (f *File) readAtSerial(ctx context.Context, output []byte, first int, offset, size uint64) (int, error) {

@@ -35,7 +35,7 @@ def test_write_text_seek_directories_and_round_trip(tmp_path):
         assert fs.cat_file("nested/data.txt") == "h\u00e9llo".encode()
         assert fs.cat_file("seek.bin") == b"hallo"
     with zstar.Archive.from_file(archive) as reader:
-        assert reader.verify()["full_archive_verified"]
+        assert reader.verify() is None
         assert list(reader.names()) == ["empty", "nested", "nested/data.txt", "seek.bin"]
 
 
@@ -570,7 +570,7 @@ def test_shared_writer_serializes_parallel_known_size_members(tmp_path):
     with zstar.Archive.from_file(path) as archive:
         for index in range(12):
             assert archive.read(f"dir{index % 3}/file{index}") == bytes([index]) * 2000
-        assert archive.verify()["full_archive_verified"]
+        assert archive.verify() is None
 
 
 def test_member_emission_and_spool_cleanup_errors_are_preserved(tmp_path, monkeypatch):

@@ -51,10 +51,10 @@ func categorized(category string, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	var depth *cbor.MaxNestedLevelError
-	var array *cbor.MaxArrayElementsError
-	var pairs *cbor.MaxMapPairsError
-	if errors.As(err, &depth) || errors.As(err, &array) || errors.As(err, &pairs) {
+	_, depth := errors.AsType[*cbor.MaxNestedLevelError](err)
+	_, array := errors.AsType[*cbor.MaxArrayElementsError](err)
+	_, pairs := errors.AsType[*cbor.MaxMapPairsError](err)
+	if depth || array || pairs {
 		category = CategoryResourceLimit
 	}
 	return &FormatError{category, err}

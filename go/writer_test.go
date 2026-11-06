@@ -22,13 +22,13 @@ func TestWriterRejectsEmptySymlinkTargetBeforeOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = writer.Add(context.Background(), Header{Path: "link", Kind: KindSymlink}, nil); ErrorCategory(err) != CategoryMalformedTOC {
+	if err = writer.Add(context.Background(), Header{Path: "link", Type: TypeSymlink}, nil); ErrorCategory(err) != CategoryMalformedTOC {
 		t.Fatal(err)
 	}
 	if output.Len() != 0 {
 		t.Fatal("invalid target emitted output")
 	}
-	if err = writer.Add(context.Background(), Header{Path: "link", Kind: KindSymlink, Target: "../target"}, nil); err != nil {
+	if err = writer.Add(context.Background(), Header{Path: "link", Type: TypeSymlink, Target: "../target"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	testClose(t, writer)
@@ -46,8 +46,8 @@ func buildTestArchive(t *testing.T, target int) []byte {
 		body   string
 	}{
 		{Header{Path: "empty", Mode: 0o644}, ""},
-		{Header{Path: "link", Kind: "symlink", Mode: 0o777, Target: "../nested//data"}, ""},
-		{Header{Path: "nested", Kind: "directory", Mode: 0o755}, ""},
+		{Header{Path: "link", Type: TypeSymlink, Mode: 0o777, Target: "../nested//data"}, ""},
+		{Header{Path: "nested", Type: TypeDirectory, Mode: 0o755}, ""},
 		{Header{Path: "nested/data", Mode: 0o640, Size: 6000}, strings.Repeat("abcd", 1500)},
 	} {
 		if err = writer.Add(context.Background(), member.header, testMemberBody(member.header, member.body)); err != nil {
@@ -72,7 +72,7 @@ func TestWriterRoundTripAndReaderAt(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer testClose(t, archive)
-			if _, err := archive.VerifyScope(context.Background(), VerifyArchive); err != nil {
+			if err := archive.Verify(context.Background(), VerifyArchive); err != nil {
 				t.Fatal(err)
 			}
 			want := strings.Repeat("abcd", 1500)
@@ -138,7 +138,7 @@ func TestWriterPAXWithStandardTarReader(t *testing.T) {
 	}
 	path := "目录-" + strings.Repeat("é", 60)
 	headers := []Header{
-		{Path: "long-link", Kind: "symlink", Mode: 0o777, Target: strings.Repeat("../", 80)},
+		{Path: "long-link", Type: TypeSymlink, Mode: 0o777, Target: strings.Repeat("../", 80)},
 		{Path: path, Mode: 0o600, UID: 1 << 40, GID: 1 << 41, MtimeNS: -1, Size: 3},
 	}
 	for _, header := range headers {
@@ -178,7 +178,7 @@ func TestWriterPAXWithStandardTarReader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want.Kind != "symlink" && string(body) != "xyz" {
+		if want.Type != TypeSymlink && string(body) != "xyz" {
 			t.Fatalf("tar body: %q", body)
 		}
 	}
@@ -278,7 +278,7 @@ func TestConcurrentReaderAtAndBudget(t *testing.T) {
 }
 
 func testMemberBody(header Header, body string) io.Reader {
-	if header.Kind == "directory" || header.Kind == "symlink" {
+	if header.Type == TypeDirectory || header.Type == TypeSymlink {
 		return nil
 	}
 	return strings.NewReader(body)
@@ -292,12 +292,12 @@ func TestWriterArgumentErrorsAreNotSticky(t *testing.T) {
 		header Header
 		body   io.Reader
 	}{
-		{Header{Path: "dir", Kind: "directory"}, strings.NewReader("body")},
-		{Header{Path: "dir", Kind: "directory", Size: 4}, strings.NewReader("body")},
-		{Header{Path: "x", Kind: "bogus"}, nil},
+		{Header{Path: "dir", Type: TypeDirectory}, strings.NewReader("body")},
+		{Header{Path: "dir", Type: TypeDirectory, Size: 4}, strings.NewReader("body")},
+		{Header{Path: "x", Type: EntryType(255)}, nil},
 		{Header{Path: "x", Target: "t"}, nil},
 		{Header{Path: "../x"}, nil},
-		{Header{Path: "l", Kind: "symlink", Target: "bad\xff"}, nil},
+		{Header{Path: "l", Type: TypeSymlink, Target: "bad\xff"}, nil},
 	}
 	for i, c := range bad {
 		if err := writer.Add(ctx, c.header, c.body); err == nil {
@@ -340,7 +340,7 @@ func TestWriterAcceptsMoreThan65536InlineExtents(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{7}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
+	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -381,7 +381,7 @@ func TestWriterLargeExternalEntryAndReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer testClose(t, result)
-	if _, err = result.VerifyScope(context.Background(), VerifyArchive); err != nil {
+	if err = result.Verify(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -428,7 +428,7 @@ func TestFrameSizesAreCallerPolicy(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{9}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
+	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 	limits := Limits{MaxFrameDecodedBytes: 16 << 20}

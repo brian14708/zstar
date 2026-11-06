@@ -25,7 +25,7 @@ use std::{num::NonZeroUsize, ops::Range, sync::Arc};
 use tokio::sync::{OnceCell, Semaphore};
 
 pub use object_store;
-pub use object_store::{aws::AmazonS3, buffered::BufWriter, path::Path};
+pub use object_store::{aws::AmazonS3, path::Path};
 
 /// Explicit S3 configuration for the core adapter.
 ///

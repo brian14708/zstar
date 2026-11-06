@@ -1,4 +1,6 @@
+import io
 import os
+import tarfile
 
 import pytest
 import zstar
@@ -70,7 +72,7 @@ def test_external_hash_policy_keeps_codec_validation(
         if operation == "materialize":
             encoded = _native.materialize(thin_data, objects=objects, verify_external=verify)
             with zstar.Archive(encoded) as archive:
-                assert archive.verify()["full_archive_verified"]
+                assert archive.verify() is None
                 return archive.read("hello.txt")
         destination = tmp_path / "destination"
         _native.extract(thin_data, destination, objects=objects, verify_external=verify)
@@ -134,3 +136,15 @@ def test_default_capture_normalizes_metadata_and_is_reproducible(tmp_path):
         assert metadata.st_mode & 0o7777 == mode
         assert metadata.st_mtime_ns == 0
     assert first != _native.pack_directory(source, preserve_metadata=True)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix restoration")
+def test_extract_returns_metadata_omissions(tmp_path):
+    output = io.BytesIO()
+    info = tarfile.TarInfo("file")
+    info.uid, info.gid, info.mode = 12345, 12345, 0o4644
+    with zstar.ArchiveWriter(output) as writer:
+        writer.addfile(info)
+    report = _native.extract(output.getvalue(), tmp_path / "out")
+    assert not report["lossless"]
+    assert {item["field"] for item in report["omitted"]} == {"ownership", "special-mode-bits"}

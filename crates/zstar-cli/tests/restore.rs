@@ -6,9 +6,9 @@ use std::{
     path::Path,
     process::{Command, Output},
 };
-use zstar::SliceReader;
+use zstar::backend::SliceReader;
+use zstar::backend::manifest::{Entry, EntryKind};
 use zstar::backend::{BlockingArchive, BlockingBuilder};
-use zstar::manifest::{Entry, EntryKind};
 
 fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
     Entry {
@@ -360,8 +360,11 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
         String::from_utf8_lossy(&result.stderr)
     );
     let bytes = fs::read(output).unwrap();
-    let mut archive =
-        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
+    let mut archive = BlockingArchive::open(
+        SliceReader::new(&bytes),
+        zstar::backend::ManifestOptions::default(),
+    )
+    .unwrap();
     archive.validate().unwrap();
     let link = archive.entry("link").unwrap().unwrap();
     assert_eq!(link.linkname.as_deref(), Some("/missing/.././target"));
@@ -386,7 +389,7 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
     use std::io::{Seek, SeekFrom, Write};
     let temp = tempfile::tempdir().unwrap();
     let bytes = BlockingBuilder::new(Vec::new()).unwrap().finish().unwrap();
-    let mut footer = zstar::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
+    let mut footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
     let old_start = footer.toc_offset;
     footer.toc_offset = (2 << 30) + old_start;
     let input = temp.path().join("large.zstar");
@@ -395,7 +398,8 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
     file.seek(SeekFrom::Start(footer.toc_offset)).unwrap();
     file.write_all(&bytes[old_start as usize..bytes.len() - 80])
         .unwrap();
-    file.write_all(&zstar::encode_footer(&footer)).unwrap();
+    file.write_all(&zstar::backend::encode_footer(&footer))
+        .unwrap();
     let inspection = run(&[Path::new("inspect"), &input]);
     assert!(
         inspection.status.success(),
@@ -405,7 +409,7 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
     assert!(String::from_utf8_lossy(&inspection.stdout).contains("entries=0"));
     let mut archive = BlockingArchive::open(
         zstar::fs::LocalFileSource::open(&input).unwrap(),
-        zstar::ManifestOptions::default(),
+        zstar::backend::ManifestOptions::default(),
     )
     .unwrap();
     assert!(archive.validate().is_err());
@@ -441,8 +445,11 @@ fn capture_controls_and_destination_handle_limits_are_local_policies() {
         String::from_utf8_lossy(&packed.stderr)
     );
     let bytes = fs::read(&archive).unwrap();
-    let mut parsed =
-        BlockingArchive::open(SliceReader::new(&bytes), zstar::ManifestOptions::default()).unwrap();
+    let mut parsed = BlockingArchive::open(
+        SliceReader::new(&bytes),
+        zstar::backend::ManifestOptions::default(),
+    )
+    .unwrap();
     parsed.validate().unwrap();
     let limited = root.path().join("limited");
     let result = run(&[

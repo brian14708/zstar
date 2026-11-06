@@ -70,10 +70,10 @@ func (s *manifestRangeStream) appendTo(out []byte, size uint64) ([]byte, error) 
 	return out, nil
 }
 
-// ManifestCursor returns owned entries from the validated document.
-type ManifestCursor struct {
+// manifestCursor returns owned entries from the validated document.
+type manifestCursor struct {
 	mu       sync.Mutex
-	manifest *Manifest
+	manifest *manifest
 	entry    int
 	end      int
 	prefix   string
@@ -82,19 +82,19 @@ type ManifestCursor struct {
 }
 
 // Cursor creates an independent bounded cursor over sorted owned entries.
-func (m *Manifest) Cursor() *ManifestCursor { return &ManifestCursor{manifest: m} }
+func (m *manifest) Cursor() *manifestCursor { return &manifestCursor{manifest: m} }
 
 // CursorPrefix visits paths beginning with the literal UTF-8 byte prefix.
 // Use "dir/" for descendants of a directory, or "" for all entries.
 // It seeks by binary search and does not scan unrelated entries.
-func (m *Manifest) CursorPrefix(prefix string) *ManifestCursor {
-	return &ManifestCursor{manifest: m, prefix: prefix}
+func (m *manifest) CursorPrefix(prefix string) *manifestCursor {
+	return &manifestCursor{manifest: m, prefix: prefix}
 }
 
 // Entries yields owned metadata in path order, filtered by a literal prefix.
 // Empty prefix selects all entries. Iteration holds no lock across yield,
 // retains at most one metadata batch, and stops after the first error.
-func (m *Manifest) Entries(prefix string) iter.Seq2[Entry, error] {
+func (m *manifest) Entries(prefix string) iter.Seq2[Entry, error] {
 	return func(yield func(Entry, error) bool) {
 		cursor := m.CursorPrefix(prefix)
 		defer cursor.Close()
@@ -118,7 +118,7 @@ func (m *Manifest) Entries(prefix string) iter.Seq2[Entry, error] {
 
 // Next returns up to limit owned entries; limit must be in [1, 4096].
 // An empty result with no error signals exhaustion. Calls are serialized.
-func (c *ManifestCursor) Next(limit int) ([]Entry, error) {
+func (c *manifestCursor) Next(limit int) ([]Entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if limit < 1 || limit > 4096 {
@@ -150,7 +150,7 @@ func (c *ManifestCursor) Next(limit int) ([]Entry, error) {
 }
 
 // Close invalidates this cursor without closing the manifest.
-func (c *ManifestCursor) Close() {
+func (c *manifestCursor) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.err = rejected(CategoryUnsupportedOperation, "closed manifest cursor")

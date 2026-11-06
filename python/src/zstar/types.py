@@ -17,13 +17,12 @@ __all__ = [
     "AsyncReader",
     "AsyncReaderOptions",
     "BinaryWriter",
-    "ContentOptions",
     "EntryMetadata",
     "ErrorCategory",
     "ExtensionValue",
     "FileInfo",
+    "FileSystemReaderOptions",
     "Limits",
-    "MetadataOptions",
     "ObjectResolver",
     "ObjectWriter",
     "ProgressCallback",
@@ -35,8 +34,6 @@ __all__ = [
     "SeekableReader",
     "SignedRequest",
     "SpillStore",
-    "SpoolOptions",
-    "VerificationReport",
     "WriterOptions",
 ]
 
@@ -149,7 +146,7 @@ class WriterOptions(TypedDict, total=False):
 
 
 class _ReaderBudgets(TypedDict, total=False):
-    """Reader budgets, concurrency, and external content resolution."""
+    """Reader budgets and concurrency shared by raw and filesystem APIs."""
 
     limits: Limits | None
     memory_bytes: int
@@ -162,18 +159,23 @@ class _ReaderBudgets(TypedDict, total=False):
     create_spill_store: Callable[[], SpillStore] | None
 
     concurrent_chunks: int
-    verify_external: bool
+
+
+class FileSystemReaderOptions(_ReaderBudgets, total=False):
+    """Filesystem reader budgets; use external= and verify_external= for object policy."""
 
 
 class ReaderOptions(_ReaderBudgets, total=False):
     """Synchronous reader budgets and borrowed synchronous resolver."""
 
+    verify_external: bool
     resolver: ObjectResolver | None
 
 
 class AsyncReaderOptions(_ReaderBudgets, total=False):
     """Async reader budgets with synchronous or coroutine-based resolution."""
 
+    verify_external: bool
     resolver: ObjectResolver | AsyncObjectResolver | None
 
 
@@ -183,22 +185,6 @@ class ReadReport(TypedDict):
     metadata_authenticated: bool
     full_archive_validated: bool
     data_frames_checked: list[int]
-    external_objects_sha256_checked: list[str]
-    external_objects_unchecked: list[str]
-
-
-class VerificationReport(TypedDict):
-    """Validation results and content counts returned by archive verification."""
-
-    metadata_validated: bool
-    full_archive_verified: bool
-    tar_members_verified: bool
-    pointer_text_verified: bool
-    data_checksums_checked: bool
-    external_closure_validated: bool
-    tar_members: int
-    pointer_members: int
-    data_frames: int
     external_objects_sha256_checked: list[str]
     external_objects_unchecked: list[str]
 
@@ -276,33 +262,6 @@ class AsyncObjectWriter(Protocol):
     """Async counterpart of ObjectWriter, on the writer's event loop."""
 
     async def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int: ...
-
-
-class ContentOptions(TypedDict, total=False):
-    """Reusable content policy; expand with **options into reader factories."""
-
-    limits: Limits | None
-    concurrent_chunks: int
-    max_read_bytes: int
-    verify_external: bool
-    resolver: ObjectResolver | AsyncObjectResolver | None
-
-
-class MetadataOptions(TypedDict, total=False):
-    """Reusable metadata/index policy; independent of content memory."""
-
-    max_encoded_bytes: int
-    max_decoded_bytes: int
-    max_retained_entry_bytes: int
-    max_entries: int
-
-
-class SpoolOptions(TypedDict, total=False):
-    """Reusable temporary-storage policy; does not bound index memory."""
-
-    memory_bytes: int
-    max_spool_bytes: int
-    create_spill_store: Callable[[], SpillStore] | None
 
 
 @dataclass

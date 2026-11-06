@@ -21,7 +21,7 @@ func TestValidateArchiveRejectsPointerBeyondAddressSpace(t *testing.T) {
 func testValidateArchiveRejectsHugePointer(t *testing.T, size uint64) {
 	t.Helper()
 	ctx := context.Background()
-	header, err := memberHeader(Header{Path: "pointer", Kind: "file", Mode: 420, Size: size})
+	header, err := memberHeader(Header{Path: "pointer", Type: TypeFile, Mode: 420, Size: size})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func testValidateArchiveRejectsHugePointer(t *testing.T, size uint64) {
 	defer testClose(t, encoder)
 	var output bytes.Buffer
 	output.Write(encoder.EncodeAll(header, nil))
-	writer, err := NewManifestWriter(&output, uint64(output.Len()), ManifestWriterOptions{})
+	writer, err := newManifestWriter(&output, uint64(output.Len()), ManifestWriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func testValidateArchiveRejectsHugePointer(t *testing.T, size uint64) {
 	if err = writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := OpenManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
+	manifest, err := openManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func testValidateArchiveRejectsHugePointer(t *testing.T, size uint64) {
 	if size > uint64(^uint(0)>>1) {
 		want = CategoryResourceLimit
 	}
-	if _, err = manifest.ValidateArchive(ctx); ErrorCategory(err) != want {
+	if err = manifest.ValidateArchive(ctx); ErrorCategory(err) != want {
 		t.Fatalf("oversized pointer: %v", err)
 	}
 }
@@ -101,7 +101,7 @@ func parseTestHeader(raw []byte) (effectiveManifestHeader, error) {
 }
 
 func TestPAXHeadersValidateEvenOverriddenFields(t *testing.T) {
-	headers, err := memberHeader(Header{Path: "long-" + strings.Repeat("a", 110), Kind: "file", UID: 1 << 40, GID: 1 << 41, MtimeNS: -1, Mode: 420, Size: 3})
+	headers, err := memberHeader(Header{Path: "long-" + strings.Repeat("a", 110), Type: TypeFile, UID: 1 << 40, GID: 1 << 41, MtimeNS: -1, Mode: 420, Size: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestPAXHeadersValidateEvenOverriddenFields(t *testing.T) {
 }
 
 func TestUstarPrefixAndExactDirectoryName(t *testing.T) {
-	raw, err := memberHeader(Header{Path: "dir/file", Kind: "file", Mode: 420})
+	raw, err := memberHeader(Header{Path: "dir/file", Type: TypeFile, Mode: 420})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestUstarPrefixAndExactDirectoryName(t *testing.T) {
 	if err != nil || header.entry.Path != "dir/file" {
 		t.Fatal(err)
 	}
-	raw, err = memberHeader(Header{Path: "dir", Kind: "directory", Mode: 493})
+	raw, err = memberHeader(Header{Path: "dir", Type: TypeDirectory, Mode: 493})
 	if err != nil {
 		t.Fatal(err)
 	}

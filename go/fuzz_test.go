@@ -28,7 +28,7 @@ func FuzzIndexedArchive(f *testing.F) {
 			return
 		}
 		defer testClose(t, reader)
-		cursor := reader.Cursor()
+		cursor := reader.manifest.Cursor()
 		defer cursor.Close()
 		entries, err := cursor.Next(8)
 		if err == nil {
@@ -39,7 +39,7 @@ func FuzzIndexedArchive(f *testing.F) {
 				}
 			}
 		}
-		_, _ = reader.VerifyScope(ctx, VerifyArchive) //nolint:errcheck // Malformed inputs may fail; this campaign checks bounded execution and panics.
+		_ = reader.Verify(ctx, VerifyArchive) //nolint:errcheck // Malformed inputs may fail; this campaign checks bounded execution and panics.
 	})
 }
 

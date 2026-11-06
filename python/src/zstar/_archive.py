@@ -27,7 +27,6 @@ from .types import (
     ReadReport,
     RequestProvider,
     SeekableReader,
-    VerificationReport,
 )
 
 
@@ -252,9 +251,13 @@ class Archive(_Metadata[_native.SyncArchive]):
         self._check_open()
         return self._reader.read_with_report(name, offset, length, resolver=resolver)
 
-    def verify(self, *, external: bool = False) -> VerificationReport:
+    def verify(self, *, external: bool = False) -> None:
+        """Raise on invalid archives; optionally resolve all external selections.
+
+        External object hashing follows ``verify_external``.
+        """
         self._check_open()
-        return self._reader.verify(external=external)
+        self._reader.verify(external=external)
 
     def close(self) -> None:
         self._reader.close()
@@ -452,9 +455,13 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         self._check_open()
         return await self._reader.read_with_report(name, offset, length, resolver=resolver)
 
-    async def verify(self, *, external: bool = False) -> VerificationReport:
+    async def verify(self, *, external: bool = False) -> None:
+        """Raise on invalid archives; optionally resolve all external selections.
+
+        External object hashing follows ``verify_external``.
+        """
         self._check_open()
-        return await self._reader.verify(external=external)
+        await self._reader.verify(external=external)
 
     async def close(self) -> None:
         await self._reader.close()

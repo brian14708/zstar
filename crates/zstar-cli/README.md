@@ -59,11 +59,5 @@ The [archive specification][spec] defines validation scopes.
 
 [spec]: https://github.com/brian14708/zstar/blob/main/spec/draft/core.md
 
-The [external-content extension](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md)
-defines object extents, pointer payloads, and external verification. The informative
-[CAS storage appendix](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md#appendix-cas-storage)
-explains object identity and storage encoding.
-
-Thin archive members carry JSON content pointers using `zstar-pointer-v1`. The
-[catalog proposal](https://github.com/brian14708/zstar/blob/main/spec/draft/catalog.md)
-is a separate application format; the CLI does not resolve catalog views.
+See the [external-content extension](https://github.com/brian14708/zstar/blob/main/spec/draft/external-content.md)
+for object references and verification rules.

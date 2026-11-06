@@ -1,6 +1,6 @@
 """Static API checks against the installed wheel; these functions are not executed.
 
-Pyrefly's unused-ignore check ensures the rejected calls stay rejected.
+Checker-specific unused-ignore checks ensure rejected calls stay rejected.
 """
 
 from collections.abc import AsyncIterator, Iterator
@@ -24,12 +24,13 @@ from zstar.types import (
     AsyncObjectWriter,
     AsyncRangeSource,
     AsyncReader,
+    AsyncReaderOptions,
     BinaryWriter,
-    ContentOptions,
     EntryMetadata,
     ErrorCategory,
     ExtensionValue,
     FileInfo,
+    FileSystemReaderOptions,
     ObjectResolver,
     RangeSource,
     ReaderOptions,
@@ -37,7 +38,6 @@ from zstar.types import (
     ReadRequest,
     SeekableReader,
     SignedRequest,
-    VerificationReport,
 )
 
 
@@ -59,14 +59,14 @@ def synchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(archive.read("hello"), bytes)
         assert_type(archive.read_many([("hello", 0, 1)]), list[bytes])
         assert_type(archive.read_with_report("hello"), tuple[bytes, ReadReport])
-        assert_type(archive.verify(), VerificationReport)
+        assert_type(archive.verify(), None)
         member = archive.open(StandardTarInfo("hello"))
         with member as file:
             assert_type(file.read(), bytes)
             assert_type(file.readinto(bytearray(4)), int)
             assert_type(file.iter_chunks(), Iterator[bytes])
-        archive.read("hello", offset="zero")  # pyrefly: ignore[bad-argument-type]
-    Archive(b"", unknown_option=True)  # pyrefly: ignore[unexpected-keyword]
+        archive.read("hello", offset="zero")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
+    Archive(b"", unknown_option=True)  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # pyrefly: ignore[unexpected-keyword]
     with ArchiveWriter(BytesIO(), create_spill_store=BytesIO) as writer:
         writer.addfile(StandardTarInfo("empty"))
         writer.add(Path("input"))
@@ -91,7 +91,7 @@ async def asynchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(await archive.read("hello"), bytes)
         assert_type(await archive.read_many([("hello", 0, 1)]), list[bytes])
         assert_type(await archive.read_with_report("hello"), tuple[bytes, ReadReport])
-        assert_type(await archive.verify(), VerificationReport)
+        assert_type(await archive.verify(), None)
         async with archive.open("hello") as file:
             assert_type(await file.read(), bytes)
             assert_type(await file.readinto(memoryview(bytearray(4))), int)
@@ -102,7 +102,7 @@ async def asynchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         await AsyncArchive.from_s3("bucket", "archive.zstar", region="us-east-1", anon=True),
         AsyncArchive,
     )
-    await AsyncArchive.from_url(provider=lambda method, refresh: b"")  # pyrefly: ignore[bad-argument-type]
+    await AsyncArchive.from_url(provider=lambda method, refresh: b"")  # type: ignore[arg-type, return-value]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
 
 
 def metadata(error: ZstarError) -> None:
@@ -112,7 +112,15 @@ def metadata(error: ZstarError) -> None:
 def filesystem() -> None:
     from zstar import ZstarFileSystem
 
-    fs = ZstarFileSystem(fo=Path("archive.zstar"), target_options={"auto_mkdir": False})
+    options: FileSystemReaderOptions = {"max_read_bytes": 8 << 20}
+    fs = ZstarFileSystem(
+        fo=Path("archive.zstar"),
+        reader_options=options,
+        verify_external=True,
+        target_options={"auto_mkdir": False},
+    )
+    ZstarFileSystem(fo="archive.zstar", reader_options={"verify_external": False})  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
+    ZstarFileSystem(fo="archive.zstar", reader_options={"resolver": None})  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
     assert_type(fs.modified("hello"), datetime)
     fs.close()
 
@@ -135,8 +143,8 @@ def stream_protocols(body: Reader[bytes], source: SeekableReader, sink: BinaryWr
     assert_type(Archive.from_file(source), Archive)
     with ArchiveWriter(sink) as writer:
         writer.addfile(StandardTarInfo("body"), body)
-    Archive.from_file(body)  # pyrefly: ignore[bad-argument-type]
-    Archive.from_file(sink)  # pyrefly: ignore[bad-argument-type]
+    Archive.from_file(body)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
+    Archive.from_file(sink)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
     with Archive.from_file(source) as archive:
         member: Reader[bytes] = archive.open("body")
         assert_type(member.read(), bytes)
@@ -149,8 +157,8 @@ async def async_stream_protocols(
         assert_type(archive, AsyncArchive)
     async with await AsyncArchiveWriter.from_file(sink) as writer:
         await writer.addfile(StandardTarInfo("body"), body)
-    await AsyncArchive.from_file(body)  # pyrefly: ignore[bad-argument-type]
-    await AsyncArchive.from_file(sink)  # pyrefly: ignore[bad-argument-type]
+    await AsyncArchive.from_file(body)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
+    await AsyncArchive.from_file(sink)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
 
 
 async def custom_async_storage(
@@ -161,7 +169,7 @@ async def custom_async_storage(
     objects: "AsyncObjectWriter",
     chunks: AsyncIterator[bytes],
 ) -> None:
-    content: ContentOptions = {"resolver": resolver, "concurrent_chunks": 4}
+    content: AsyncReaderOptions = {"resolver": resolver, "concurrent_chunks": 4}
     async with await AsyncArchive.from_source(source, 1024, **content) as archive:
         assert_type(await archive.getmetadata("hello"), EntryMetadata)
         assert_type(archive.root_extensions, dict[str, ExtensionValue])

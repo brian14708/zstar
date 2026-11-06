@@ -36,7 +36,7 @@ export default defineConfig({
         }),
       ],
       logo: { src: './public/logo.svg', alt: '' },
-      description: 'Indexed tar.zst archives with random-access readers and writers.',
+      description: 'A core specification for indexed tar.zst archives, with optional extensions.',
       customCss: ['./src/styles/typography.css', './src/styles/theme.css'],
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/brian14708/zstar' }],
       expressiveCode: { shiki: { langAlias: { cddl: 'text', abnf: 'text' } } },

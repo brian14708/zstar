@@ -101,7 +101,7 @@ func (s *Source) Size(ctx context.Context) (int64, error) {
 	if s.client == nil {
 		return 0, errors.New("zstar s3: nil client")
 	}
-	meta, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.key)})
+	meta, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: new(s.bucket), Key: new(s.key)})
 	if err != nil {
 		return 0, redacted(err)
 	}
@@ -151,7 +151,7 @@ func (s *Source) ReadRange(ctx context.Context, offset, length int64) (data []by
 	if length > s.maxRange || uint64(length) >= uint64(math.MaxInt) {
 		return nil, errors.New("zstar s3: local range budget")
 	}
-	result, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.key), Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)), IfMatch: s.etag, VersionId: s.version})
+	result, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: new(s.bucket), Key: new(s.key), Range: new(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)), IfMatch: s.etag, VersionId: s.version})
 	if err != nil {
 		return nil, redacted(err)
 	}
@@ -290,7 +290,7 @@ func (b *BlobStore) GetEncoded(ctx context.Context, digest [32]byte, _, maxBytes
 	// A single unranged GET replaces HEAD+GET. The object is content-addressed
 	// and verified by the caller, so no version pinning is needed. The declared
 	// length is checked before any body bytes are read.
-	result, err := b.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(b.key(digest))})
+	result, err := b.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: new(b.bucket), Key: new(b.key(digest))})
 	if err != nil {
 		return nil, objectError(redacted(err))
 	}
@@ -330,7 +330,7 @@ func (b *BlobStore) Put(ctx context.Context, raw []byte) (extent zstar.Extent, e
 	digest := sha256.Sum256(raw)
 	key := b.key(digest)
 	if b.checkExists {
-		meta, err := b.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key)})
+		meta, err := b.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: new(b.bucket), Key: new(key)})
 		if err == nil {
 			if meta == nil || meta.ContentLength == nil || *meta.ContentLength <= 0 {
 				return zstar.Extent{}, errors.New("zstar s3: invalid existing object size")
@@ -359,7 +359,7 @@ func (b *BlobStore) Put(ctx context.Context, raw []byte) (extent zstar.Extent, e
 	if err = ctx.Err(); err != nil {
 		return zstar.Extent{}, err
 	}
-	_, err = b.client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key), Body: bytes.NewReader(encoded), ContentLength: aws.Int64(int64(len(encoded))), ContentType: aws.String(zstdContentType), CacheControl: aws.String(immutableCacheControl), IfNoneMatch: aws.String("*")})
+	_, err = b.client.PutObject(ctx, &awss3.PutObjectInput{Bucket: new(b.bucket), Key: new(key), Body: bytes.NewReader(encoded), ContentLength: new(int64(len(encoded))), ContentType: new(zstdContentType), CacheControl: new(immutableCacheControl), IfNoneMatch: new("*")})
 	// A precondition failure means the content-addressed object already exists.
 	if api, ok := errors.AsType[smithy.APIError](err); err != nil && (!ok || api.ErrorCode() != "PreconditionFailed") {
 		return zstar.Extent{}, objectError(redacted(err))

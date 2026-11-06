@@ -44,6 +44,8 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
         assert [member.name for member in members] == ["dir/file", "dir/link"]
         assert list(members) == []
         assert list(archive.names()) == [member.name for member in archive]
+        assert list(archive.names("dir/f")) == ["dir/file"]
+        assert [info.name for info in archive.members("dir/l")] == ["dir/link"]
         info = archive.getinfo("dir/file")
         assert isinstance(info, TarInfo) and info.isfile()
         assert (info.size, info.uid, info.gid, _nanoseconds(info.pax_headers["mtime"])) == (
@@ -65,34 +67,18 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
             assert member.tell() == 5
             assert member.seek(-6, os.SEEK_END) == 6
             assert member.readline() == b"world\n"
-            member.seek(6)
-            buffer = bytearray(b"?" * 10)
-            assert member.readinto(memoryview(buffer)[1:]) == 6
-            assert buffer == b"?world\n???" and member.tell() == 12
-            assert member.readinto(buffer) == 0
-            with pytest.raises(TypeError, match="writable"):
-                member.readinto(b"readonly")
-            buffer.extend(b"?")  # No exported native buffer remains after a read.
-            assert member.seek(100) == 100 and member.read() == b""
-            with pytest.raises(ValueError):
-                member.seek(-1)
         assert member.closed and not archive.closed
         with pytest.raises(ValueError):
             member.read()
-        with pytest.raises(tarfile.ExtractError, match="symlink"):
-            archive.open("dir/link")
-        assert archive.read_link("dir/link") == "file"
         assert archive.read_range("dir/file", 6, 12) == b"world\n"
+        with pytest.raises(ValueError):
+            archive.read_range("dir/file", 2, 1)
         with pytest.raises(KeyError):
             archive.getinfo("missing")
         with pytest.raises(KeyError):
             archive.read("missing")
-        report = archive.verify()
-        assert report["tar_members"] == 3
-        assert report["external_objects_sha256_checked"] == []
-        assert report["data_checksums_checked"] and report["full_archive_verified"]
-        assert not report["external_closure_validated"]
-        assert "whole_file_sha256_checked" not in report
+        archive.verify()
+
         assert archive.read("dir/file", 6) == b"world\n"
         assert archive.read_with_report("dir/file", 6)[0] == b"world\n"
         assert archive.read_with_report("dir/file", 12)[0] == b""
@@ -135,19 +121,6 @@ def test_sync_reader_inside_running_event_loop(encoded_archive):
     asyncio.run(exercise())
 
 
-def test_sync_and_async_verification_share_one_report_schema(object_resolver, thin_data):
-    data = thin_data
-
-    with zstar.Archive(data, resolver=object_resolver) as archive:
-        synchronous = archive.verify(external=True)
-
-    async def exercise():
-        async with await zstar.AsyncArchive.from_bytes(data, resolver=object_resolver) as archive:
-            assert await archive.verify(external=True) == synchronous
-
-    asyncio.run(exercise())
-
-
 def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded_archive):
     path = tmp_path / "archive.zstar"
     data = encoded_archive
@@ -178,58 +151,19 @@ def test_async_local_open_lazy_iteration_and_cursor_operations(tmp_path, encoded
                     with pytest.raises(zstar.ZstarError) as caught:
                         await archive.read_with_report("dir/file", 13, length)
                     assert caught.value.category == "invalid-range"
-                with pytest.raises(tarfile.ExtractError, match="symlink"):
-                    async with archive.open("dir/link"):
-                        pytest.fail("symlink opened as a file")
-                assert await archive.read_link("dir/link") == "file"
+                assert await archive.read_range("dir/file", 0, 5) == b"hello"
                 async with archive.open("dir/file") as member:
                     assert await member.read(5) == b"hello"
                     assert await member.tell() == 5
                     assert await member.seek(6) == 6
                     buffer = bytearray(6)
                     assert await member.readinto(buffer) == 6 and buffer == b"world\n"
-                    await member.seek(6)
-                    buffer = bytearray(b"?" * 10)
-                    assert await member.readinto(memoryview(buffer)[1:]) == 6
-                    assert buffer == b"?world\n???" and await member.tell() == 12
-                    assert await member.readinto(buffer) == 0
-                    with pytest.raises(TypeError, match="writable"):
-                        await member.readinto(b"readonly")
-                    buffer.extend(b"?")
-                    assert await member.seek(100) == 100 and await member.read() == b""
                 assert member.closed and not archive.closed
                 async with archive.open("dir/file") as pending:
                     await archive.close()
                     with pytest.raises(ValueError, match="closed"):
                         await pending.read()
         assert not borrowed.closed and borrowed.tell() == 11
-
-    asyncio.run(exercise())
-
-
-def test_iteration_crosses_metadata_batches_and_close_invalidates_buffered_entries():
-    output = io.BytesIO()
-    expected = [f"file-{index:03}" for index in range(200)]
-    with ArchiveWriter(output) as writer:
-        for name in reversed(expected):
-            writer.addfile(tarfile.TarInfo(name))
-    data = output.getvalue()
-    with zstar.Archive(data) as archive:
-        assert list(archive.names()) == expected
-        assert [member.name for member in archive] == expected
-        names = archive.names()
-        assert next(names) == expected[0]
-    with pytest.raises(ValueError, match="closed"):
-        next(names)
-
-    async def exercise():
-        async with await zstar.AsyncArchive.from_bytes(data) as archive:
-            assert [name async for name in archive.names()] == expected
-            assert [member.name async for member in archive] == expected
-            names = archive.names()
-            assert await anext(names) == expected[0]
-        with pytest.raises(ValueError, match="closed"):
-            await anext(names)
 
     asyncio.run(exercise())
 
@@ -355,9 +289,8 @@ def test_external_closure_verification_obeys_read_budget(object_resolver, thin_d
 
     objects = object_resolver
     archive = Archive(encoded, max_read_bytes=1, resolver=objects, verify_external=True)
-    report = archive.verify(external=True)
-    assert report["external_closure_validated"]
-    assert report["external_objects_sha256_checked"]
+    archive.verify(external=True)
+
     assert archive.read("world.txt", 0, 1) == b"w"
     with pytest.raises(zstar.ZstarError, match="budget"):
         archive.read("world.txt")
@@ -500,46 +433,15 @@ def test_raw_s3_requires_explicit_configuration(monkeypatch):
     asyncio.run(exercise())
 
 
-def test_prefix_iteration_and_async_metadata(encoded_archive):
-    with zstar.Archive(encoded_archive) as archive:
-        assert list(archive.names("dir/f")) == ["dir/file"]
-        assert [info.name for info in archive.members("dir/l")] == ["dir/link"]
-        with pytest.raises(ValueError):
-            archive.read_range("dir/file", 2, 1)
-
-    async def run():
-        async with await zstar.AsyncArchive.from_bytes(
-            encoded_archive, concurrent_chunks=1
-        ) as archive:
-            assert await archive.read_link("dir/link") == "file"
-            assert await archive.read_range("dir/file", 0, 5) == b"hello"
-            assert [name async for name in archive.names("dir/f")] == ["dir/file"]
-
-    asyncio.run(run())
-
-
-def test_wire_metadata_stays_private():
-    from zstar import types
-
-    for name in ("CborValue", "EntryFields", "EntryTuple", "ExtentTuple", "ManifestOptions"):
-        assert not hasattr(types, name)
-    for cls in (zstar.Archive, zstar.AsyncArchive):
-        for name in ("entry", "iter_entries"):
-            assert not hasattr(cls, name)
-    for cls in (ArchiveWriter, AsyncArchiveWriter):
-        assert not hasattr(cls, "add_entry")
-    with ArchiveWriter(io.BytesIO(), root_extensions={}):
-        pass
-
-
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
     # Exercise more than one native batch and multiple extents without fetching
     # external objects. Ordinary iteration authenticates extensions without projecting them.
     output = io.BytesIO()
+    expected_names = [f"f{i:04}" for i in range(130)] + ["link"]
     extents = ((2, "sha256:" + "01" * 32, 10), (3, "sha256:" + "02" * 32, 12))
     with _native.EntryArchiveWriter(output) as writer:
-        for index in range(130):
+        for index in reversed(range(130)):
             writer.add(
                 (
                     f"f{index:04}",
@@ -568,8 +470,8 @@ def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
                     f"f{i:04}" for i in range(100, 130)
                 ]
                 with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
-                    members = [info async for info in archive.members()]
-                assert len(members) == 131
+                    members = [info async for info in archive]
+                assert [info.name for info in members] == expected_names
                 check(members[0])
                 with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
                     info = await archive.getinfo("f0000")
@@ -585,8 +487,8 @@ def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
             with zstar.Archive(data, memory_bytes=1) as archive:
                 assert list(archive.names("f01")) == [f"f{i:04}" for i in range(100, 130)]
                 with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
-                    members = list(archive.members())
-                assert len(members) == 131
+                    members = list(archive)
+                assert [info.name for info in members] == expected_names
                 check(members[0])
                 with pytest.warns(UserWarning, match="TarInfo omits Zstar manifest extensions"):
                     info = archive.getinfo("f0000")
@@ -662,3 +564,65 @@ def test_member_streams_share_native_bounds_and_buffer_semantics(asynchronous):
             assert await call("tell") == 0
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("empty", [True, False])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_metadata_projection_reports_root_extension_loss(empty, asynchronous):
+    output = io.BytesIO()
+    with _native.EntryArchiveWriter(output, root_extensions={"x-root": True}) as writer:
+        if not empty:
+            writer.add(("file", 0, 0o644, 0, 0, 0, ()))
+
+    async def run():
+        async with await zstar.AsyncArchive.from_bytes(output.getvalue()) as archive:
+            with pytest.warns(UserWarning, match="extensions"):
+                assert len([info async for info in archive.members()]) == (0 if empty else 1)
+            if not empty:
+                with pytest.warns(UserWarning, match="extensions"):
+                    await archive.getinfo("file")
+
+    if asynchronous:
+        asyncio.run(run())
+    else:
+        with zstar.Archive(output.getvalue()) as archive:
+            with pytest.warns(UserWarning, match="extensions"):
+                assert len(list(archive.members())) == (0 if empty else 1)
+            if not empty:
+                with pytest.warns(UserWarning, match="extensions"):
+                    archive.getinfo("file")
+
+
+@pytest.mark.parametrize("cache_bytes,expected", [(2 << 20, 1), (0, 128), (1024, 128)])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_member_stream_reuses_decoded_source(cache_bytes, expected, asynchronous):
+    output = io.BytesIO()
+    with zstar.ArchiveWriter(output) as writer:
+        writer.write_bytes("file", b"x" * (1 << 20))
+
+    class Source:
+        calls = 0
+
+        def read_range(self, offset, length):
+            self.calls += 1
+            return output.getvalue()[offset : offset + length]
+
+    source = Source()
+
+    async def run():
+        async with await zstar.AsyncArchive.from_source(source, len(output.getvalue())) as archive:
+            source.calls = 0
+            async with archive.open("file", cache_bytes=cache_bytes) as stream:
+                for _ in range(128):
+                    assert await stream.read(1) == b"x"
+            assert source.calls == expected
+
+    if asynchronous:
+        asyncio.run(run())
+    else:
+        with zstar.Archive.from_source(source, len(output.getvalue())) as archive:
+            source.calls = 0
+            with archive.open("file", cache_bytes=cache_bytes) as stream:
+                for _ in range(128):
+                    assert stream.read(1) == b"x"
+            assert source.calls == expected

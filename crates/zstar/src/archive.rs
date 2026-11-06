@@ -24,41 +24,17 @@ pub trait ObjectResolver: Send + Sync {
     /// `hint` is an advisory encoded size, not a decoded-size bound. Return
     /// [`Error::MissingObject`] if the object is unavailable.
     async fn get_encoded(&self, address: [u8; 32], hint: u64, max_bytes: u64) -> Result<Bytes>;
-    /// Reserved capability for explicit callers. Archive reads currently call
-    /// `get_encoded` and do not consult this flag.
-    fn supports_batch(&self) -> bool {
-        false
-    }
-    /// Actual stored frame length when cheaply known from resolver metadata.
-    /// This is advisory for explicit callers; Archive does not consult it.
-    fn encoded_length(&self, _address: [u8; 32]) -> Option<u64> {
-        None
-    }
-    /// Convenience batch for explicit callers; Archive does not invoke it.
-    async fn get_encoded_many(&self, requests: &[ObjectRequest]) -> Result<Vec<Bytes>> {
-        let mut output = Vec::with_capacity(requests.len());
-        for request in requests {
-            output.push(
-                self.get_encoded(request.address, request.hint, request.max_bytes)
-                    .await?,
-            );
-        }
-        Ok(output)
-    }
 }
 
-/// One complete encoded object requested in an explicit resolver batch.
-#[derive(Clone, Copy, Debug)]
-pub struct ObjectRequest {
-    pub address: [u8; 32],
-    pub hint: u64,
-    pub max_bytes: u64,
-}
 /// Metadata, concurrency, and external-object policies for an [`Archive`].
 #[derive(Clone)]
 pub struct ReaderOptions {
-    /// Metadata parsing and storage limits, including the returned-read budget.
-    pub manifest: ManifestOptions,
+    /// Metadata parsing, retained index, and temporary storage policy.
+    pub metadata: crate::MetadataReaderOptions,
+    /// Per-source frame/window and entry/extent/pointer limits. Zero disables each limit.
+    pub limits: crate::Limits,
+    /// Maximum bytes returned by one allocating read or batch; defaults to 64 MiB.
+    pub max_read_bytes: u64,
     /// Bounds both outstanding content requests and detached decode jobs.
     pub concurrent_chunks: usize,
     /// Fixed reader-local external hash policy. Data checksums are mandatory.
@@ -67,17 +43,22 @@ pub struct ReaderOptions {
     pub resolver: Option<Arc<dyn ObjectResolver>>,
 }
 impl ReaderOptions {
-    /// Sets only metadata/index/spool policy, preserving content configuration.
-    #[must_use]
-    pub fn with_metadata(mut self, options: crate::MetadataReaderOptions) -> Self {
-        options.apply(&mut self.manifest);
-        self
+    fn manifest_options(&self) -> ManifestOptions {
+        let mut options = ManifestOptions {
+            limits: self.limits,
+            max_read_bytes: self.max_read_bytes,
+            ..Default::default()
+        };
+        self.metadata.clone().apply(&mut options);
+        options
     }
 }
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
-            manifest: ManifestOptions::default(),
+            metadata: crate::MetadataReaderOptions::default(),
+            limits: crate::Limits::default(),
+            max_read_bytes: 64 << 20,
             concurrent_chunks: 8,
             verify_external: false,
             resolver: None,
@@ -87,7 +68,9 @@ impl Default for ReaderOptions {
 impl std::fmt::Debug for ReaderOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReaderOptions")
-            .field("manifest", &self.manifest)
+            .field("metadata", &self.metadata)
+            .field("limits", &self.limits)
+            .field("max_read_bytes", &self.max_read_bytes)
             .field("concurrent_chunks", &self.concurrent_chunks)
             .field("verify_external", &self.verify_external)
             .field("resolver", &self.resolver.as_ref().map(|_| "configured"))
@@ -102,22 +85,6 @@ pub enum VerificationScope {
     Archive,
     /// Also resolves and validates every external-object selection.
     ExternalClosure,
-}
-/// Checks completed by a successful [`Archive::verify`] call.
-#[derive(Clone, Debug, Default)]
-pub struct VerificationReport {
-    /// Successful verification of this scope includes metadata, tar and data checksums.
-    pub scope: VerificationScope,
-    /// Logical tar members, excluding PAX headers and end records.
-    pub tar_members: u64,
-    /// Tar members that contain external-object pointers.
-    pub pointer_members: u64,
-    /// Data frames decoded and checked.
-    pub data_frames: u64,
-    /// Decoded object hashes checked against their addresses.
-    pub external_objects_sha256_checked: Vec<[u8; 32]>,
-    /// Object addresses read with external hash verification disabled.
-    pub external_objects_unchecked: Vec<[u8; 32]>,
 }
 /// Checks completed by a selective read; does not certify the whole archive.
 #[derive(Clone, Debug, Default)]
@@ -329,7 +296,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// Maximum bytes returned by a single allocating read operation.
     #[must_use]
     pub const fn max_read_bytes(&self) -> u64 {
-        self.options.manifest.max_read_bytes
+        self.options.max_read_bytes
     }
     /// Returns the archive-level extension values.
     #[must_use]
@@ -415,26 +382,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .entry(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
-        self.cursor_from_entry(entry).await
-    }
-    /// Opens a borrowed cursor from metadata obtained from this archive.
-    ///
-    /// The supplied metadata must match the authenticated entry at its path.
-    /// Metadata differing from the authenticated entry is rejected before content I/O.
-    ///
-    /// # Errors
-    /// Returns an error for non-file entries or invalid extent selections.
-    pub async fn cursor_from_entry(&self, entry: Entry) -> Result<crate::FileCursor> {
-        let mut cursor = self
-            .metadata(move |manifest| {
-                if manifest.range_entry(&entry.path).map(|(entry, _)| entry) != Some(&entry) {
-                    return Err(Error::Unsupported("entry does not match this archive"));
-                }
-                crate::FileCursor::new(entry)
-            })
-            .await?;
-        cursor.owner = Some(Arc::downgrade(&self.manifest));
-        Ok(cursor)
+        crate::FileCursor::new(entry, Arc::downgrade(&self.manifest))
     }
     async fn file(&self, entry: Entry) -> Result<crate::File<R>> {
         if entry.extents.len() <= 64 {
@@ -485,10 +433,11 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         reason = "Unwraps enforce internal invariants established before this operation."
     )]
     /// Verifies the complete physical archive and the requested external scope.
+    /// External object hashing follows [`ReaderOptions::verify_external`].
     ///
     /// Cancellation drops pending transport futures; worker permits remain held
     /// until any already running frame decode completes.
-    pub async fn verify(&self, scope: VerificationScope) -> Result<VerificationReport> {
+    pub async fn verify(&self, scope: VerificationScope) -> Result<()> {
         let (cancel, receiver) = tokio::sync::watch::channel(false);
         struct Cancel(tokio::sync::watch::Sender<bool>);
         impl Drop for Cancel {
@@ -504,7 +453,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             cancel: receiver,
         };
         let manifest = self.manifest.clone();
-        let options = self.options.manifest.clone();
+        let options = self.options.manifest_options();
         let data_end = self.data_end;
         let digest = self.metadata_digest;
         let permit = self
@@ -513,26 +462,18 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .acquire_owned()
             .await
             .map_err(|_| Error::Unsupported("reader closed"))?;
-        let physical = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             crate::backend::BlockingArchive::from_manifest(
                 source, manifest, data_end, options, digest,
             )
-            .visit_payloads_with_report(|_, _| Ok(()))
+            .validate()
         })
         .await
         .map_err(worker_error)??;
-        let mut report = VerificationReport {
-            scope,
-            tar_members: physical.members,
-            pointer_members: physical.pointers,
-            data_frames: physical.frames,
-            ..Default::default()
-        };
         if scope == VerificationScope::ExternalClosure {
             let entries = self.entries();
             futures_util::pin_mut!(entries);
-            let mut checked = std::collections::BTreeSet::new();
             while let Some(file) = futures_util::TryStreamExt::try_next(&mut entries).await? {
                 if !file.metadata().is_external() {
                     continue;
@@ -549,18 +490,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                     }
                     let raw = &previous.as_ref().unwrap().1;
                     crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
-                    if let Key::Object(hash) = key {
-                        checked.insert(hash);
-                    }
                 }
             }
-            if self.options.verify_external {
-                report.external_objects_sha256_checked.extend(checked);
-            } else {
-                report.external_objects_unchecked.extend(checked);
-            }
         }
-        Ok(report)
+        Ok(())
     }
 
     #[expect(
@@ -582,7 +515,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             && hint.end == size - 80
             && hint.start < hint.end
             && hint.end - hint.start > 8
-            && hint.end - hint.start <= options.manifest.max_encoded_bytes
+            && hint.end - hint.start <= options.metadata.max_encoded_bytes
             // Keep speculative hint reads within one bounded metadata window.
             && size - hint.start <= 1 << 20
         {
@@ -617,7 +550,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         };
         let metadata_digest = footer.toc_sha256;
         let data_end = footer.toc_offset;
-        let mut ingest = ManifestIngest::new(footer, size, Spool::new(options.manifest.clone()))?;
+        let mut ingest = ManifestIngest::new(footer, size, Spool::new(options.manifest_options()))?;
         while !ingest.complete() {
             let at = ingest.position();
             let header = ranges.read(ingest.header_range()?).await?;
@@ -679,41 +612,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let path = path.to_owned();
         self.metadata(move |manifest| manifest.entry(&path)).await
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    /// Collects all owned entry metadata into a vector.
-    ///
-    /// Use [`Self::entries`] to enumerate without allocating a second complete list.
-    pub async fn collect_entries(&self) -> Result<Vec<Entry>> {
-        self.metadata(ManifestReader::collect_entries).await
-    }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     /// Creates a cursor for bounded metadata batches.
     ///
     /// Prefer [`Self::entries`] for ordinary enumeration.
+    #[doc(hidden)]
     pub async fn cursor(&self) -> Result<EntryCursor> {
         self.metadata(|manifest| Ok(manifest.cursor())).await
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     /// Creates a bounded cursor over paths beginning with `prefix`.
+    #[doc(hidden)]
     pub async fn cursor_prefix(&self, prefix: &str) -> Result<EntryCursor> {
         let prefix = prefix.to_owned();
         self.metadata(move |manifest| Ok(manifest.cursor_prefix(&prefix)))
             .await
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     /// Returns the advanced cursor with at most `limit` owned entries.
+    #[doc(hidden)]
     pub async fn next_entries(
         &self,
         mut cursor: EntryCursor,
@@ -734,11 +648,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         })
         .await
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     /// Returns a symlink target verbatim, without resolving or following it.
+    ///
+    /// # Errors
+    /// Returns an error if the entry is missing, is not a symlink, or cannot be read.
     pub async fn read_link(&self, path: &str) -> Result<String> {
         self.entry(path)
             .await?
@@ -836,13 +749,13 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             Key::Object(hash) => {
                 resolver
                     .ok_or(Error::Unsupported("external read requires resolver"))?
-                    .get_encoded(*hash, hint, self.options.manifest.limits.encoded_limit())
+                    .get_encoded(*hash, hint, self.options.limits.encoded_limit())
                     .await?
             }
         };
         let key_copy = key.clone();
         let verify = self.options.verify_external;
-        let limits = self.options.manifest.limits;
+        let limits = self.options.limits;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let raw = match key_copy {
@@ -868,7 +781,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .iter()
             .map(|r| (r.path.to_owned(), r.offset, r.length))
             .collect();
-        let budget = self.options.manifest.max_read_bytes;
+        let budget = self.options.max_read_bytes;
         self.metadata(move |manifest| {
             build_plan(
                 requests

@@ -207,7 +207,7 @@ func (s *manifestContentState) load(ctx context.Context, candidate *manifestCont
 		return nil, err
 	}
 	if object && verify && !candidate.verified {
-		if err = VerifySHA256(candidate.raw, digest); err != nil {
+		if err = verifySHA256(candidate.raw, digest); err != nil {
 			return nil, err
 		}
 		candidate = &manifestContentChunk{raw: candidate.raw, verified: true}

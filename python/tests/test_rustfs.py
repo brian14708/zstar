@@ -69,7 +69,7 @@ def test_native_s3_and_presigned_archive_and_external_objects(monkeypatch):
             secret_access_key="zstar-test-secret",
         ) as native:
             assert native.read("hello", 6, 6) == b"RustFS"
-            assert native.verify()["metadata_validated"]
+            assert native.verify() is None
         with zstar.Archive.from_s3(
             bucket,
             "thin.zstar",
@@ -425,7 +425,7 @@ def test_fsspec_s3_writer_commit_and_abort():
             original.close()
         with zstar.Archive(encoded) as archive:
             assert archive.read("dir/data") == b"hello"
-            assert archive.verify()["full_archive_verified"]
+            assert archive.verify() is None
         with (
             pytest.raises(RuntimeError, match="abort"),
             fsspec.filesystem("zstar", fo=location, mode="w", target_options=options) as fs,

@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use zstar::backend::{BlockingArchive, EncodedObjectResolver};
-use zstar::{Error, ManifestOptions, Result, SliceReader};
+use zstar::backend::{ManifestOptions, SliceReader};
+use zstar::{Error, Result};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/entry-manifest")
@@ -41,7 +42,7 @@ impl Objects {
                 .flat_map(|m| m.iter())
                 .map(|(address, path)| {
                     (
-                        zstar::manifest::parse_object_address(address).unwrap(),
+                        zstar::backend::manifest::parse_object_address(address).unwrap(),
                         artifact(path.as_str().unwrap()),
                     )
                 })
@@ -108,7 +109,7 @@ fn compare_outcome(case: &Value, result: Result<()>) {
 }
 fn check_hash(case: &Value, bytes: &[u8]) {
     assert_eq!(
-        hex::encode(zstar::Digest::sha256(bytes).as_bytes()),
+        hex::encode(zstar::backend::Digest::sha256(bytes).as_bytes()),
         case["archive_sha256"].as_str().unwrap()
     );
 }
@@ -213,10 +214,22 @@ mod asynchronous {
             let bytes = artifact(case["archive"].as_str().unwrap());
             check_hash(&case, &bytes);
             let result = async {
+                let config = options(&case);
                 let reader = Archive::open_with_options(
                     Arc::new(Source(bytes.into())),
                     ReaderOptions {
-                        manifest: options(&case),
+                        limits: config.limits,
+                        max_read_bytes: config.max_read_bytes,
+                        metadata: zstar::MetadataReaderOptions {
+                            max_encoded_bytes: config.max_encoded_bytes,
+                            max_decoded_bytes: config.max_decoded_bytes,
+                            max_retained_entry_bytes: config.max_retained_entry_bytes,
+                            max_entries: config.max_entries,
+                            spool: zstar::SpoolOptions {
+                                memory_bytes: config.memory_bytes,
+                                ..Default::default()
+                            },
+                        },
                         resolver: Some(Arc::new(Objects::from_case(&case))),
                         verify_external: case["verify_external"].as_bool().unwrap_or(false),
                         ..Default::default()

@@ -16,36 +16,31 @@ disk = ["dep:tempfile"]
 fs = ["async", "dep:cap-fs-ext", "dep:cap-std"]
 http = ["async", "dep:reqwest"]
 s3 = ["http", "dep:object_store"]
-async = [
-    "dep:tokio",
-    "dep:async-trait",
-    "dep:bytes",
-    "dep:futures-util",
-]
+async = ["dep:tokio", "dep:async-trait", "dep:bytes", "dep:futures-util"]
 
 [dependencies]
-cap-fs-ext = { workspace = true, optional = true }
-cap-std = { workspace = true, optional = true }
-object_store = { workspace = true, optional = true, features = ["aws"] }
-reqwest = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+cap-fs-ext = { workspace = true, optional = true }
+cap-std = { workspace = true, optional = true }
+ciborium.workspace = true
 fastcdc.workspace = true
+futures-util = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true, features = ["aws"] }
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-ciborium.workspace = true
 sha2.workspace = true
-thiserror.workspace = true
 tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 zstd.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["fs"] }
 hex = { workspace = true }
 proptest = { workspace = true }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 
 [[example]]
 name = "in_memory"

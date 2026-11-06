@@ -11,7 +11,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use zstar::{Entry, EntryKind, Error, ManifestOptions, backend::BlockingBuilder};
+use zstar::backend::ManifestOptions;
+use zstar::{Entry, EntryKind, Error, backend::BlockingBuilder};
 struct Sink(Py<PyAny>);
 impl Write for Sink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -251,14 +252,14 @@ impl EntryArchiveWriter {
                 {
                     return Err(Error::Budget("external extent count"));
                 }
-                let digest = *zstar::Digest::sha256(&raw).as_bytes();
-                let encoded = zstar::encode_frame(&raw, self.compression_level)?;
+                let digest = *zstar::backend::Digest::sha256(&raw).as_bytes();
+                let encoded = zstar::backend::encode_frame(&raw, self.compression_level)?;
                 let encoded_size = Python::attach(|py| {
                     callback
                         .call1(
                             py,
                             (
-                                zstar::manifest::object_address(&digest),
+                                zstar::backend::manifest::object_address(&digest),
                                 pyo3::types::PyBytes::new(py, &encoded),
                                 raw.len(),
                             ),

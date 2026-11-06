@@ -5,9 +5,7 @@ title: "Create your first archive with Python"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../python/examples/tutorial_fsspec.py?raw";
 
-Create an archive with fsspec's filesystem interface, then list and read its
-members. Use this interface for standard filesystem operations such as opening
-files, listing directories, and reading bytes.
+Create an archive with fsspec, then list and read its members.
 
 The example creates its own data. It writes `example-fsspec.zstar` in your current
 directory; running it again replaces that archive.
@@ -22,36 +20,29 @@ uv run tutorial_fsspec.py
 ```
 
 The script declares Python 3.11 or later and its dependencies with PEP 723
-metadata. uv installs them automatically. `zstar-py` includes fsspec and registers
-the `zstar` protocol, so no separate fsspec installation is needed.
+metadata. uv installs them automatically.
 
 ## Create the archive
 
-Open a `zstar` filesystem with `mode="w"`. `fo` names the output archive;
-paths passed to filesystem methods name members inside it.
-
-Use `fs.open(..., "wt", encoding="utf-8")` to write text, or `pipe_file()` to
-add bytes. Parent directories are created automatically. Close each member
-before writing the next one. Leaving the outer `with` block finalizes the
+`fo` names the archive; filesystem paths name its members. Write text with
+`open()` or bytes with `pipe_file()`. Parent directories are created automatically.
+Close each member before writing the next; the outer `with` block finalizes the
 archive. Append and update modes are unsupported.
 
 <Example source={source} lang="python" region="create" />
 
 ## List and read members
 
-Reopen the filesystem in its default read mode. `ls()` lists a directory;
-`detail=False` returns names. Open a member in text mode to decode UTF-8, or
-use `cat_file()` to read its bytes.
+Reopen in read mode. `ls(..., detail=False)` returns names; `cat_file()` returns
+bytes. Open a member in text mode to decode UTF-8.
 
 <Example source={source} lang="python" region="read" />
 
 ## Open a member by URL
 
-Resolve a chained URL `zstar://<member>::<archive>` with
-`fsspec.core.url_to_fs()` to get a filesystem and member path. The `with` block
-closes both the member and the filesystem. Binary mode returns bytes, and
-`read(5)` selects the first five bytes. Keep a filesystem open as above when
-reading multiple members to reuse the archive's metadata.
+`fsspec.core.url_to_fs()` resolves `zstar://<member>::<archive>` to a filesystem
+and member path. Close both with a `with` block. Keep the filesystem open across
+related reads to reuse metadata.
 
 <Example source={source} lang="python" region="url" />
 

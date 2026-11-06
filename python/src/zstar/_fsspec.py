@@ -6,6 +6,7 @@ import asyncio
 import errno
 import io
 import os
+import threading
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from datetime import UTC, datetime, timedelta
@@ -28,9 +29,25 @@ from ._file import AsyncArchiveFile
 from ._info import _nanoseconds
 from ._publication import _Publication, _WriteSession
 from ._writer import _writer_call
-from .types import FileInfo, ProgressCallback, ReaderOptions, WriterOptions
+from .types import FileInfo, FileSystemReaderOptions, ProgressCallback, ReaderOptions, WriterOptions
 
 __all__ = ["FileInfo", "ZstarFileSystem"]
+
+_cleanup_tasks: set[asyncio.Task[None]] = set()
+_cleanup_tasks_lock = threading.Lock()
+
+
+def _release_cleanup(task: asyncio.Task[None]) -> None:
+    with _cleanup_tasks_lock:
+        _cleanup_tasks.discard(task)
+
+
+def _retain_cleanup(task: asyncio.Task[None]) -> asyncio.Task[None]:
+    # Event loops keep only weak task references; retain cleanup until done.
+    with _cleanup_tasks_lock:
+        _cleanup_tasks.add(task)
+    task.add_done_callback(_release_cleanup)
+    return task
 
 
 def _write_all(output: BinaryIO, data: bytes) -> None:
@@ -381,7 +398,8 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     Use ``zstar://member::file:///path/archive.zstar`` or construct with ``fo``.
     Member paths are relative; ``""`` is the root. ``asynchronous=True`` enables
     fsspec's async methods and ``open_async``. Use ``await fs.aclose()`` for async
-    cleanup. The default sync facade shares the same async reader.
+    cleanup. The default sync facade shares the same async reader. Use explicit
+    close or a context manager; garbage-collection cleanup is best effort.
 
     ``mode="w"`` creates a new archive. Close each member before opening the
     next; ancestors are created automatically and duplicate names are rejected.
@@ -394,7 +412,8 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     objects, stored as ``<lowercase sha256>.zst``. Files of at least
     ``external_threshold`` bytes (16 MiB by default) are externalized on write
     using FastCDC with 2/8/16 MiB minimum/target/maximum chunks. Custom resolvers
-    belong to the low-level API.
+    belong to the low-level API. ``verify_external`` controls external SHA-256
+    checking; ``reader_options`` accepts only budgets and concurrency settings.
 
     Chained URLs and ``fs=`` use fsspec seekable range streams. Keep their
     underlying archive objects immutable. S3 paths use fsspec/s3fs credentials
@@ -432,7 +451,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         member_spool_bytes: int = 8 << 20,
         member_cache_bytes: int = 2 << 20,
         writer_options: WriterOptions | None = None,
-        reader_options: ReaderOptions | None = None,
+        reader_options: FileSystemReaderOptions | None = None,
         **kwargs: object,
     ) -> None:
         if "resolver" in kwargs:
@@ -450,7 +469,9 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             raise ValueError(
                 "fs requires an archive path and is already configured; omit target_options"
             )
-        self.fo, self.target_protocol, self.mode = fo, target_protocol, mode
+        self.fo: str | PathLike[str] | BinaryIO = fo
+        self.target_protocol: str | None = target_protocol
+        self.mode: str = mode
         if (
             isinstance(member_cache_bytes, bool)
             or not isinstance(member_cache_bytes, int)
@@ -459,20 +480,20 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             raise ValueError("member_cache_bytes must be a nonnegative integer")
         self.member_cache_bytes = member_cache_bytes
         self.member_spool_bytes = member_spool_bytes
-        self._reader_options = cast(ReaderOptions, dict(reader_options or {}))
+        self._reader_options = cast(FileSystemReaderOptions, dict(reader_options or {}))
         if "resolver" in self._reader_options:
             raise TypeError("use external=filesystem instead of a resolver")
+        if "verify_external" in self._reader_options:
+            raise TypeError("use verify_external= instead of reader_options['verify_external']")
         self._writer_options = cast(WriterOptions, dict(writer_options or {}))
         self._write_session: _WriteSession | None = None
         self._write_loading: asyncio.Task[_WriteSession] | None = None
         self._write_lock = asyncio.Lock()
         self._aborting = False
         self._filesystem = fs
-        self.verify_external, self.external, self.external_threshold = (
-            verify_external,
-            external,
-            external_threshold,
-        )
+        self.verify_external: bool = verify_external
+        self.external: str | AbstractFileSystem | None = external
+        self.external_threshold: int = external_threshold
         self._backend_options = dict(target_options or {})
         self._resources: _ArchiveResources | None = None
         self._loading: asyncio.Task[AsyncArchive] | None = None
@@ -585,10 +606,10 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             else None
         )
         options: ReaderOptions = {
+            **self._reader_options,
             "verify_external": self.verify_external,
             "resolver": external,
         }
-        options.update(self._reader_options)
         if not isinstance(self.fo, (str, PathLike)):
             try:
                 archive = await AsyncArchive.from_file(self.fo, **options)
@@ -665,7 +686,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             return
         self._closed = True
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._drain_close())
+            self._close_task = _retain_cleanup(asyncio.create_task(self._drain_close()))
         await asyncio.shield(self._close_task)
 
     def close(self) -> None:
@@ -693,6 +714,9 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         with suppress(Exception):
             await self.aclose()
 
+    def _start_finalizer(self) -> None:
+        _retain_cleanup(asyncio.create_task(self._finalize()))
+
     def __del__(self) -> None:
         if not hasattr(self, "_closed") or self._closed:
             return
@@ -702,12 +726,12 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             running_loop = None
         owner_loop = self._bound_loop or (self._loop if not self.asynchronous else None)
         if running_loop is not None and running_loop is owner_loop:
-            running_loop.create_task(self._finalize())
+            self._start_finalizer()
         elif owner_loop is not None and owner_loop.is_running():
             # GC can run while fsspec's sync facade holds an Event condition.
             # Waiting here would stop that loop completing the enclosing call.
             with suppress(RuntimeError):
-                owner_loop.call_soon_threadsafe(lambda: asyncio.create_task(self._finalize()))
+                owner_loop.call_soon_threadsafe(self._start_finalizer)
         elif not isinstance(self.fo, (str, PathLike)):
             with suppress(Exception):
                 self.fo.close()
@@ -972,7 +996,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                 if on_error == "raise":
                     raise
                 results.append(exc)
-        batch = 4096 if batch_size in (None, -1) else min(batch_size, 4096)
+        batch = 4096 if batch_size is None or batch_size == -1 else min(batch_size, 4096)
         for offset in range(0, len(requests), batch):
             selected = requests[offset : offset + batch]
             indices = positions[offset : offset + batch]
@@ -1041,7 +1065,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             if member and not entries[member].isdir():
                 return [_file_info(member, entries[member])] if detail else [member]
             prefix = member + "/" if member else ""
-            items = [
+            items: list[FileInfo] = [
                 _file_info(name, entry)
                 for name, entry in sorted(entries.items())
                 if name.startswith(prefix) and "/" not in name[len(prefix) :] and name != member
@@ -1062,7 +1086,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                 async for entry in archive.members(prefix)
                 if "/" not in (name := entry.name)[len(prefix) :]
             ]
-        items: list[FileInfo] = []
+        items = []
         async for entry in archive.members(prefix):
             if "/" in entry.name[len(prefix) :]:
                 continue

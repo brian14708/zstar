@@ -11,33 +11,29 @@ Options are specific to their operation:
 
 | Operation | Options |
 | --- | --- |
-| `ReaderOptions.Manifest`, `OpenManifest` | `ManifestReaderOptions` |
-| `WriterOptions.Manifest`, `NewManifestWriter` | `ManifestWriterOptions` |
-| `NewWriter`, `NewEntryArchiveWriter` | `WriterOptions` |
+| `ReaderOptions.Manifest` | `ManifestReaderOptions` |
+| `WriterOptions.Manifest` | `ManifestWriterOptions` |
+| `NewWriter` | `WriterOptions` |
 
 Zero-valued option fields select defaults. Storage budgets and spill factories
 can be configured independently for each operation. Pass the same `SpoolBudget`
 pointer to share a quota across owners.
 
-Put content controls such as `MaxReadBytes` and `ConcurrentChunks` on
-`ReaderOptions`; nonzero values override the legacy nested manifest fields.
-Keep metadata/index/spool budgets in `ManifestReaderOptions`. Put encoding
+Set `MaxReadBytes`, `ConcurrentChunks`, and metadata/index/spool budgets in
+`ReaderOptions.Manifest` (`ManifestReaderOptions`). Put encoding
 settings such as `CompressionLevel`, `RootExtensions`, and `BlockTarget` in
 `ManifestWriterOptions`.
 
 ## Validation
 
-Use `Open`/`OpenWithOptions` and `NewWriter` with `Header` for ordinary archive
-operations. `Manifest`, `NewManifestWriter`, and `EntryArchiveWriter` expose
-advanced metadata and encoding operations; they are not needed for normal reads
-and writes.
+Use `Open`/`OpenWithOptions` to read and `NewWriter` with `Header` to write.
 
-Opening validates all metadata. `VerifyScope(ctx, zstar.VerifyArchive)` checks
-physical content; `VerifyScope(ctx, zstar.VerifyExternalClosure)` also resolves
-external selections. `Verify(ctx, bool)` remains a compatibility shorthand.
+Opening validates all metadata. `Verify(ctx, zstar.VerifyArchive)` checks
+physical content; `Verify(ctx, zstar.VerifyExternalClosure)` also resolves
+external selections.
 External SHA-256 checking defaults to disabled; opt in through
 `ReaderOptions.VerifyExternalHash`. Metadata hashes, frame checksums, and extent
-bounds are always checked, and reports identify unchecked external content.
+bounds are always checked.
 Checksum mismatches report `integrity-failure`. The index must fit
 `MaxRetainedEntryBytes`. Spooling metadata to disk does not reduce index memory.
 
@@ -49,12 +45,11 @@ are rejected before payload I/O.
 
 ## Member streams
 
-For sequential reads, use `Reader.OpenStreamWithOptions(ctx, path, options)`.
+For sequential reads, use `Reader.OpenStream(ctx, path, options)`.
 The returned `Stream` implements `io.ReadSeekCloser` and also provides
 `ReadContext`. It retains at most one validated decoded source. Zero-valued
 `StreamOptions` select a 2 MiB cache including fixed bookkeeping;
-`StreamOptions{DisableCache: true}` disables retention. The legacy
-`OpenStream(ctx, path, cacheBytes)` keeps its zero-means-default convention. Sources exceeding
+`StreamOptions{DisableCache: true}` disables retention. Sources exceeding
 the cache budget are decoded normally but not retained. Close the stream to
 release its cache, and keep the parent reader open while using it. The stream
 owns entry metadata outside the cache budget. `OpenFile` remains the concurrent
@@ -74,11 +69,10 @@ for entry, err := range reader.Entries("dir/") {
 }
 ```
 
-`Manifest.Entries` offers the same `iter.Seq2[Entry, error]` API. Prefixes match
+Prefixes match
 literal UTF-8 bytes; `"dir/"` selects descendants, `"dir"` also matches names
 such as `"directory"`, and `""` selects everything. Iteration seeks with binary
 search, retains one bounded batch and releases it on early loop exit.
-`CursorPrefix` remains available for callers needing explicit batch sizes.
 
 ## Writing
 
@@ -86,9 +80,7 @@ search, retains one bounded batch and releases it on early loop exit.
 `WriterOptions.Manifest.CompressionLevel`. Zero selects the codec default
 (Zstandard level 3). `WriterOptions.Workers` selects 0 (serial, default) or 1–16
 ordered compression workers. Each worker has one outstanding independent frame;
-tar order and frame emission order remain unchanged. Both `NewWriter(output,
-WriterOptions)` and `NewEntryArchiveWriter(output, WriterOptions)` accept the same
-options.
+tar order and frame emission order remain unchanged.
 
 Resolvers implement `GetEncoded`. `ReadMany` groups repeated sources and loads
 distinct sources concurrently.

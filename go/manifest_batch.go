@@ -46,20 +46,20 @@ type manifestReadJob struct {
 // disabled. Outputs are compact, independent owned buffers in caller order.
 // Sources and resolvers must support concurrent calls. Cancellation joins batch
 // workers; uninterruptible source callbacks retain their bounded work slots.
-func (m *Manifest) ReadMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal bool) ([][]byte, error) {
+func (m *manifest) ReadMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal bool) ([][]byte, error) {
 	out, _, err := m.readMany(ctx, requests, resolver, verifyExternal, false)
 	return out, err
 }
 
 // ReadManyWithReport reads a bounded batch and reports which selected chunks
 // were checked. Failure returns no results and joins the batch workers.
-func (m *Manifest) ReadManyWithReport(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal bool) ([][]byte, ReadReport, error) {
+func (m *manifest) ReadManyWithReport(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal bool) ([][]byte, ReadReport, error) {
 	return m.readMany(ctx, requests, resolver, verifyExternal, true)
 }
 
 // ReadWithReport reads a bounded member range and reports selected-content
 // checks. The returned bytes are owned by the caller.
-func (m *Manifest) ReadWithReport(ctx context.Context, path string, offset, size uint64, resolver EncodedContentResolver, verifyExternal bool) ([]byte, ReadReport, error) {
+func (m *manifest) ReadWithReport(ctx context.Context, path string, offset, size uint64, resolver EncodedContentResolver, verifyExternal bool) ([]byte, ReadReport, error) {
 	out, report, err := m.readMany(ctx, []ReadRequest{{path, offset, size}}, resolver, verifyExternal, true)
 	if err != nil {
 		return nil, ReadReport{}, err
@@ -75,7 +75,7 @@ type readSelection struct {
 	output []byte
 }
 
-func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
+func (m *manifest) readMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, ReadReport{}, err
 	}
@@ -89,7 +89,7 @@ func (m *Manifest) readMany(ctx context.Context, requests []ReadRequest, resolve
 	return m.readRanges(ctx, selections, resolver, verifyExternal, wantReport)
 }
 
-func (m *Manifest) readRanges(ctx context.Context, requests []readSelection, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
+func (m *manifest) readRanges(ctx context.Context, requests []readSelection, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
 	if err := m.content.checkOpen(ctx); err != nil {
 		return nil, ReadReport{}, err
 	}
@@ -195,8 +195,8 @@ func (m *Manifest) readRanges(ctx context.Context, requests []readSelection, res
 			}
 		}
 		slices.Sort(report.DataFramesChecked)
-		sort.Strings(report.ExternalObjectsSHA256Checked)
-		sort.Strings(report.ExternalObjectsUnchecked)
+		slices.Sort(report.ExternalObjectsSHA256Checked)
+		slices.Sort(report.ExternalObjectsUnchecked)
 	}
 	return out, report, nil
 }

@@ -2,21 +2,23 @@ package zstar
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"hash"
 	"io"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/exp/collection/set"
 )
 
-// ManifestWriter writes a deterministic manifest sequence in bounded compressed segments,
+// manifestWriter writes a deterministic manifest sequence in bounded compressed segments,
 // then the existing terminal footer. It does not close the archive destination.
-type ManifestWriter struct {
+type manifestWriter struct {
 	output                          io.Writer
 	encoder                         *zstd.Encoder
 	encodedBuffer                   []byte
@@ -29,9 +31,9 @@ type ManifestWriter struct {
 	closed                          bool
 }
 
-// NewManifestWriter creates a bounded manifest encoder for data ending at
+// newManifestWriter creates a bounded manifest encoder for data ending at
 // dataEnd. The caller owns the destination and must close the encoder.
-func NewManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOptions) (*ManifestWriter, error) {
+func newManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOptions) (*manifestWriter, error) {
 	if output == nil || dataEnd == 0 {
 		return nil, errors.New("zstar: invalid metadata destination")
 	}
@@ -53,12 +55,12 @@ func NewManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOp
 	if err != nil {
 		return nil, err
 	}
-	return &ManifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, hash: sha256.New(), options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
+	return &manifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, hash: sha256.New(), options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
 }
 
 // AddEntry snapshots and spools one entry. Paths may arrive in any order.
 // Close sorts entries and rejects duplicates and missing ancestors.
-func (w *ManifestWriter) AddEntry(entry Entry) error {
+func (w *manifestWriter) AddEntry(entry Entry) error {
 	if w.closed {
 		return errors.New("zstar: manifest writer closed")
 	}
@@ -109,7 +111,7 @@ func cborHead(major byte, n uint64) []byte {
 	return out
 }
 
-func (w *ManifestWriter) writeSegment(raw []byte) error {
+func (w *manifestWriter) writeSegment(raw []byte) error {
 	if len(raw) == 0 {
 		return rejected(CategoryMalformedTOC, "metadata segment maximum")
 	}
@@ -146,20 +148,16 @@ func (w *ManifestWriter) writeSegment(raw []byte) error {
 	return nil
 }
 
-func (w *ManifestWriter) writeDocument() (err error) {
-	var fields []struct {
-		key      string
+func (w *manifestWriter) writeDocument() (err error) {
+	type field struct {
 		keyBytes []byte
 		value    []byte
 	}
+	var fields []field
 	add := func(key string, value any) error {
 		b, err := manifestEncode(value)
 		if err == nil {
-			fields = append(fields, struct {
-				key      string
-				keyBytes []byte
-				value    []byte
-			}{key: key, keyBytes: mustManifestKey(key), value: b})
+			fields = append(fields, field{keyBytes: mustManifestKey(key), value: b})
 		}
 		return err
 	}
@@ -181,12 +179,11 @@ func (w *ManifestWriter) writeDocument() (err error) {
 			return err
 		}
 	}
-	sort.Slice(fields, func(i, j int) bool {
-		a, b := fields[i].keyBytes, fields[j].keyBytes
-		if len(a) != len(b) {
-			return len(a) < len(b)
+	slices.SortFunc(fields, func(a, b field) int {
+		if order := cmp.Compare(len(a.keyBytes), len(b.keyBytes)); order != 0 {
+			return order
 		}
-		return bytes.Compare(a, b) < 0
+		return bytes.Compare(a.keyBytes, b.keyBytes)
 	})
 	var pending []byte
 	flush := func() error {
@@ -217,7 +214,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 	}
 	defer func() { err = errors.Join(err, sorted.close()) }()
 	previous := ""
-	directories := map[string]bool{}
+	directories := set.Of[string]()
 	for at := uint64(0); at < sorted.size; {
 		value, e := sorted.readRecord(&at)
 		if e != nil {
@@ -232,16 +229,16 @@ func (w *ManifestWriter) writeDocument() (err error) {
 		}
 		for d := range directories {
 			if !stringsHasPathPrefix(entry.Path, d) && entry.Path > d+"/" {
-				delete(directories, d)
+				directories.Delete(d)
 			}
 		}
 		for _, parent := range pathAncestors(entry.Path) {
-			if !directories[parent] {
+			if !directories.Contains(parent) {
 				return rejected(CategoryMalformedTOC, "missing ancestor directory")
 			}
 		}
 		if entry.Type == TypeDirectory {
-			directories[entry.Path] = true
+			directories.Insert(entry.Path)
 		}
 		previous = entry.Path
 	}
@@ -274,7 +271,7 @@ func (w *ManifestWriter) writeDocument() (err error) {
 
 // Close sorts and validates entries, writes metadata and the footer, and
 // releases spools. It leaves the destination open; failures are sticky.
-func (w *ManifestWriter) Close() (err error) {
+func (w *manifestWriter) Close() (err error) {
 	if w.closed {
 		return w.err
 	}

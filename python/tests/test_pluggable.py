@@ -35,7 +35,7 @@ def test_external_chunks_and_lossless_metadata_rewrite():
     output = io.BytesIO()
     with Archive.from_bytes(data, resolver=objects, verify_external=True) as archive:
         assert archive.read_many([ReadRequest(path="hello", offset=1, length=3)]) == [b"bcd"]
-        assert archive.verify(external=True)["external_objects_sha256_checked"]
+        assert archive.verify(external=True) is None
         metadata = archive.getmetadata("hello")
         with (
             ArchiveWriter(output, root_extensions=archive.root_extensions) as writer,

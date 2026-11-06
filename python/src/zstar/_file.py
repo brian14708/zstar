@@ -31,7 +31,7 @@ class ArchiveFile(io.RawIOBase):
         self.name = name
         self.mode = "rb"
         self._cursor: _native.MemberCursor | None = cursor
-        self.size = cursor.size
+        self.size: int = cursor.size
 
     def _owner(self) -> "Archive":
         archive = self._archive
@@ -123,7 +123,7 @@ class AsyncArchiveFile:
         self._archive: AsyncArchive | None = archive
         self.name, self.mode = name, "rb"
         self._cursor: _native.MemberCursor | None = cursor
-        self.size = cursor.size
+        self.size: int = cursor.size
         self._lock = asyncio.Lock()
 
     @property

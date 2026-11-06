@@ -1,8 +1,17 @@
 //! Archive I/O for the entry-oriented manifest. No persistent frame table.
 use crate::decoded_body::DecodedBody;
 use crate::manifest::{Entry, EntryKind, Extent, Source, decode_pointer_bounded, encode_pointer};
-use crate::manifest_io::{ManifestEncoder, ManifestOptions, ManifestReader, SpillStore, Spool};
-use crate::{Error, Limits, RangeReader, Result};
+use crate::manifest_io::SpillStore;
+pub use crate::manifest_io::{
+    EntryCursor, ManifestEncoder, ManifestOptions, ManifestReader, Spool,
+};
+pub use crate::primitives::*;
+pub use crate::tar::{TarHeader, parse_header_prefix as parse_member_header};
+use crate::{Error, Limits, Result};
+/// Internal manifest encoding and validation helpers.
+pub mod manifest {
+    pub use crate::manifest::*;
+}
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
@@ -586,12 +595,6 @@ impl<W: Write> BlockingBuilder<W> {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct PhysicalReport {
-    pub frames: u64,
-    pub members: u64,
-    pub pointers: u64,
-}
 pub struct BlockingArchive<R: RangeReader> {
     source: R,
     manifest: std::sync::Arc<ManifestReader>,
@@ -769,14 +772,6 @@ impl<R: RangeReader> BlockingArchive<R> {
         self.source
     }
 
-    /// Validate and stream physical payloads. Output is provisional until this
-    /// call succeeds; external payloads are pointer JSON, not original content.
-    pub fn visit_payloads(
-        &mut self,
-        visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
-    ) -> Result<()> {
-        self.visit_payloads_with_report(visitor).map(|_| ())
-    }
     #[expect(
         clippy::cast_possible_truncation,
         reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
@@ -793,10 +788,12 @@ impl<R: RangeReader> BlockingArchive<R> {
         clippy::too_many_lines,
         reason = "Keep the ordered validation or protocol operation together."
     )]
-    pub(crate) fn visit_payloads_with_report(
+    /// Validates and streams physical payloads; output is provisional until success.
+    /// External payloads are pointer JSON.
+    pub fn visit_payloads(
         &mut self,
         mut visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
-    ) -> Result<PhysicalReport> {
+    ) -> Result<()> {
         struct Member {
             entry: Entry,
             remaining: u64,
@@ -804,7 +801,6 @@ impl<R: RangeReader> BlockingArchive<R> {
             pointer: Vec<u8>,
             extents: Vec<Extent>,
         }
-        let mut report = PhysicalReport::default();
         let mut headers = Vec::new();
         let mut member: Option<Member> = None;
         let mut zero_records = 0_u64;
@@ -822,7 +818,6 @@ impl<R: RangeReader> BlockingArchive<R> {
                 self.options.limits,
             )?;
             let raw = decode_content_with_limits(&encoded, true, self.options.limits)?;
-            report.frames += 1;
             if raw.is_empty() {
                 return Err(Error::MalformedFrame("empty data frame".into()));
             }
@@ -890,10 +885,6 @@ impl<R: RangeReader> BlockingArchive<R> {
                         || entry.linkname != parsed.target
                     {
                         return Err(Error::TarTocMismatch("member metadata"));
-                    }
-                    report.members += 1;
-                    if entry.is_external() {
-                        report.pointers += 1;
                     }
                     let size = parsed.size.unwrap_or(0);
                     if !entry.is_external() && size != entry.size()? {
@@ -983,7 +974,7 @@ impl<R: RangeReader> BlockingArchive<R> {
             if self.manifest.next_entry(&mut cursor)?.is_some() {
                 return Err(Error::TarTocMismatch("missing tar member"));
             }
-            return Ok(report);
+            return Ok(());
         }
         fn path_key(v: &ciborium::Value) -> Result<String> {
             match v {
@@ -1006,7 +997,7 @@ impl<R: RangeReader> BlockingArchive<R> {
         if at != observed.len() {
             return Err(Error::TarTocMismatch("unindexed or duplicate member"));
         }
-        Ok(report)
+        Ok(())
     }
     pub fn validate(&mut self) -> Result<()> {
         self.visit_payloads(|_, _| Ok(()))

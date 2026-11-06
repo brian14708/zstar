@@ -5,13 +5,8 @@ title: "Create your first archive with Rust"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../crates/zstar/examples/tutorial_file.rs?raw";
 
-Create an archive containing a small text file, save it as `example.zstar`,
-and read it back. Then read just the first five bytes and check the archive for
-errors.
-
-The example creates the text for you, so you do not need any input files.
-`example.txt` is the file inside the archive; `example.zstar` is the archive
-saved in your current directory. Running the example again replaces it.
+Create `example.zstar` containing `example.txt`, read the file and a byte range,
+and verify the archive. Running the example again replaces the archive.
 
 ## Set up
 
@@ -34,29 +29,22 @@ Replace `src/main.rs` with the complete example below and run `cargo run`.
 
 ## Write the archive
 
-`File::create()` opens `example.zstar` for writing. `append_bytes()` adds a
-file named `example.txt` with the text `Hello from Zstar` and a newline.
-`finish()` completes the archive, including the index used to locate files.
-Drop the returned file handle to close it before reading.
+`append_bytes()` adds a member. `finish()` writes the index and footer;
+drop the returned file handle before reopening the archive.
 
 <Example source={source} lang="rust" region="create" />
 
 ## Read a file and a byte range
 
-Reopen `example.zstar` with `AsyncLocalFileSource` and pass it to `Archive::open`.
-The source lets Zstar read the parts of the file it needs.
-
-`read()` returns all the bytes of `example.txt`. `read_range()` takes a Rust
-range: `0..5` selects bytes 0 through 4, giving `Hello`. The assertions check
-that both reads return the expected text.
+Open the archive with `AsyncLocalFileSource`. `read()` returns the whole member;
+`read_range()` uses a half-open range, so `0..5` returns `Hello`.
 
 <Example source={source} lang="rust" region="read" />
 
 ## Verify the archive
 
-`verify(VerificationScope::Archive)` checks the entire archive for errors,
-including content you have not read. Rust closes the reader when it goes out
-of scope.
+`verify(VerificationScope::Archive)` checks every frame and tar member,
+including content you have not read.
 
 <Example source={source} lang="rust" region="verify" />
 
@@ -78,7 +66,7 @@ Archive verified
 </details>
 
 [View the source](https://github.com/brian14708/zstar/blob/main/crates/zstar/examples/tutorial_file.rs).
-If you have cloned the Zstar repository, run this from its root directory:
+From the repository root, run:
 
 ```sh
 cargo run --locked -p zstar --features fs --example tutorial_file

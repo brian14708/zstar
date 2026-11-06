@@ -3392,7 +3392,6 @@ dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-types",
- "bytes",
  "clap",
  "futures-util",
  "quick-xml",

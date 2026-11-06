@@ -5,10 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 )
 
@@ -39,20 +38,27 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 		Archives      map[string]struct {
 			SHA256 string `json:"sha256"`
 			Cases  []struct {
-				Name, Operation         string
-				ExpectedError           *string        `json:"expected_error"`
-				ExpectedVerification    map[string]any `json:"expected_verification"`
-				Objects, Members, Links map[string]string
-				Limits                  struct {
+				Name                 string            `json:"name"`
+				Operation            string            `json:"operation"`
+				ExpectedError        *string           `json:"expected_error"`
+				ExpectedVerification map[string]any    `json:"expected_verification"`
+				Objects              map[string]string `json:"objects"`
+				Members              map[string]string `json:"members"`
+				Links                map[string]string `json:"links"`
+				Limits               struct {
 					Policy          Limits `json:"limits"`
 					MaxDecodedBytes uint64 `json:"max_decoded_bytes"`
 					MaxReadBytes    uint64 `json:"max_read_bytes"`
-				}
-				Request        ReadRequest
+				} `json:"limits"`
+				Request struct {
+					Path   string `json:"path"`
+					Offset uint64 `json:"offset"`
+					Length uint64 `json:"length"`
+				} `json:"request"`
 				RangeResult    string `json:"range_result"`
 				VerifyExternal *bool  `json:"verify_external"`
-			}
-		}
+			} `json:"cases"`
+		} `json:"archives"`
 	}
 	root := "../testdata/entry-manifest"
 	artifact := func(t *testing.T, path string) []byte {
@@ -84,19 +90,22 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 				resolver := manifestCorpusObjects{root, test.Objects}
 				verify := test.VerifyExternal != nil && *test.VerifyExternal
 				m, err := OpenWithOptions(ctx, memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{Limits: test.Limits.Policy, MemoryBytes: 1, MaxDecodedBytes: test.Limits.MaxDecodedBytes, MaxReadBytes: test.Limits.MaxReadBytes}, Resolver: resolver, VerifyExternalHash: verify})
-				var report VerificationReport
 				if err == nil {
 					defer testClose(t, m)
 					switch test.Operation {
 					case "metadata":
 						// Opening has already authenticated and validated metadata.
 					case "full-archive", "external-closure":
-						report, err = m.Verify(ctx, test.Operation == "external-closure")
+						scope := VerifyArchive
+						if test.Operation == "external-closure" {
+							scope = VerifyExternalClosure
+						}
+						err = m.Verify(ctx, scope)
 					case "inline-range", "external-range":
 						var got []byte
 						var selective ReadReport
 						got, selective, err = m.ReadWithReport(ctx, test.Request.Path, test.Request.Offset, test.Request.Length)
-						batch, batchErr := m.ReadMany(ctx, []ReadRequest{test.Request})
+						batch, batchErr := m.ReadMany(ctx, []ReadRequest{ReadRequest(test.Request)})
 						if ErrorCategory(batchErr) != ErrorCategory(err) || err == nil && (len(batch) != 1 || !bytes.Equal(batch[0], got)) {
 							t.Fatalf("batch disagrees: %v", batchErr)
 						}
@@ -127,17 +136,6 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 				}
 				if err != nil {
 					return
-				}
-				actualScopes := map[string]any{
-					"full_archive_verified":           report.FullArchiveValidated,
-					"data_checksums_checked":          report.DataFramesChecked != 0,
-					"external_closure_validated":      report.ExternalClosureValidated,
-					"external_objects_sha256_checked": report.ExternalObjectsSHA256Checked,
-				}
-				for key, want := range test.ExpectedVerification {
-					if !reflect.DeepEqual(actualScopes[key], want) {
-						t.Fatalf("scope %s: want %#v got %#v", key, want, actualScopes[key])
-					}
 				}
 				requests := make([]ReadRequest, 0, len(test.Members))
 				wants := make([][]byte, 0, len(test.Members))

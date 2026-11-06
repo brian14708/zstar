@@ -84,7 +84,7 @@ class _Publication:
         abort = abort or bool(failures)
         if abort and self._discard is not None and isinstance(self.output, AbstractBufferedFile):
             # Prevent close from uploading buffered output before it is discarded.
-            self.output.forced = True
+            cast(AbstractBufferedFile, self.output).forced = True
         try:
             self.output.close()
         except BaseException as error:

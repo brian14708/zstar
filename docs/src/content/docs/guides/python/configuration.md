@@ -33,7 +33,9 @@ or symlinks. Symlink downloads are rejected by policy. `get_file()` also accepts
 borrowed binary output stream and fsspec progress callbacks. `cat_ranges()` batches
 member ranges in Rust, supports negative offsets, and follows fsspec's per-range
 error handling. Pass `reader_options={"concurrent_chunks": 4, ...}` to tune native
-reader limits; use `external=` for external content.
+reader limits; use `external=` for external content and `verify_external=True`
+for SHA-256 checking. `reader_options` uses `FileSystemReaderOptions` and rejects
+`resolver` and `verify_external`; set object policy on the filesystem directly.
 
 Use `Path` objects or strings for local archives. `fo` may also be an owned
 binary sink, or a path understood by another fsspec filesystem. Pass a configured
@@ -124,7 +126,7 @@ async with fsspec.filesystem(
 
 For async backends, use their native async filesystem and pass `asynchronous=True`.
 Native compression and archive work run on Rust workers; backend stream operations are
-awaited on the owning event loop. `aiofiles` and `aiofile` objects are not required.
+awaited on the owning event loop.
 
 On failure, writers close owned files before removing unfinished output, including
 on Windows. Transactional fsspec outputs are discarded without committing them;
@@ -158,9 +160,8 @@ Reader options include
 and storage protocol types live in `zstar.types`.
 
 Write file metadata with `ArchiveWriter.addfile(tarinfo, body)` or its async
-counterpart. Manifest tuples and extent references are private implementation
-details. Extension metadata is public through
-`getmetadata()` and `root_extensions`. `getinfo()` and `members()` emit
+counterpart. Use `getmetadata()` and `root_extensions` for extension metadata.
+`getinfo()` and `members()` emit
 `UserWarning` when their `TarInfo` projection omits entry or archive-level
 extensions, including when enumerating an empty archive. Rewriting that metadata
 loses those extensions. Use `getmetadata()` and pass its `extensions` to
@@ -211,8 +212,8 @@ chain and is configured independently through `target_options` or `fs=`.
 ## Performance
 
 Writers accept entries in any order. UTF-8 path order avoids an additional
-native manifest sorting spool at close; namespace validation still applies.
-Native filesystem capture uses this path automatically.
+native manifest sorting spool at close. Native filesystem capture uses this
+path automatically.
 
 Keep the archive or filesystem open across reads to reuse parsed metadata. Use
 `read_many()` or fsspec's `cat_ranges()` to share work across related ranges.
@@ -239,9 +240,8 @@ async uploads do not speed up insertion into one archive.
 active jobs across writers. Cancellation waits for running work before cleaning
 up. The `workers` option controls compression parallelism separately.
 
-The index and manifest are stored inside the archive. To set storage object
-metadata, configure the output sink through your backend before passing it to a
-writer.
+Configure storage object metadata on the backend output sink before passing it
+to a writer.
 
 ## Resource limits
 

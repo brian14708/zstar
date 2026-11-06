@@ -34,13 +34,13 @@ func (s *manifestGatedObject) GetEncoded(context.Context, [32]byte, uint64, uint
 	return bytes.Clone(s.data), nil
 }
 
-func openThinManifest(t *testing.T, options ManifestReaderOptions) *Manifest {
+func openThinManifest(t *testing.T, options ManifestReaderOptions) *manifest {
 	t.Helper()
 	data, err := os.ReadFile("../testdata/entry-manifest/thin.zstar")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(data), options)
+	m, err := openManifest(context.Background(), memoryRange(data), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestManifestBatchValidatesWholeSelectedExtent(t *testing.T) {
 	address := fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
 	var out bytes.Buffer
 	out.Write(make([]byte, 1000))
-	w, err := NewManifestWriter(&out, 1000, ManifestWriterOptions{})
+	w, err := newManifestWriter(&out, 1000, ManifestWriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestManifestBatchValidatesWholeSelectedExtent(t *testing.T) {
 	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := OpenManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
+	m, err := openManifest(context.Background(), memoryRange(out.Bytes()), ManifestReaderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

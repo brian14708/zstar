@@ -2,7 +2,7 @@
 
 **Status:** working draft; see SDK READMEs for support.
 
-This standalone extension to [Zstar core draft](core.md) defines the
+This optional extension to [Zstar core draft](core.md) defines the
 `external-content` required feature, external extent sources, thin archive
 pointer payloads, standalone content references, and reconstruction. Core
 framing, deterministic CBOR, integer bounds, namespace, file-read rules, and
@@ -49,14 +49,13 @@ A standalone external reference is the deterministic CBOR map `{"version": 1,
 entries. It has no separate whole-file object ID or logical size. A reference
 MUST contain one or more object extents; their checked size sum MUST fit uint64.
 Readers MUST reject versions other than 1 and fields other than `version` and
-`extents`. Empty content has no standalone reference and remains inline in archives. Reference byte and extent-count
-limits are caller policy. Core's deterministic CBOR and recursive value rules
-apply.
+`extents`. Empty content has no standalone reference and remains inline in
+archives. Reference byte and extent-count limits are caller policy. Core's
+deterministic CBOR and recursive value rules apply.
 
 ### Physical pointer payloads
 
-The physical payload is a JSON document, separate from the deterministic CBOR
-archive manifest and standalone content reference:
+The physical payload is a JSON document:
 
 ```json
 {
@@ -119,10 +118,7 @@ must agree exactly, including chunk order and count. Validation does not require
 canonical JSON bytes. A fetched object's current encoded length must not replace
 its stored advisory hint during comparison.
 
-JSON is the only physical pointer encoding. Pointer decoders and full archive
-validators MUST reject the former line-based payload; there is no legacy
-fallback. This is a breaking draft change. Metadata-only and selective readers
-do not establish physical pointer validity.
+Pointer decoders and full archive validators MUST reject non-JSON payloads.
 
 ## External object resolution
 
@@ -172,8 +168,8 @@ provenance supporting the declared verification policy.
 External SHA-256 verification is opt-in and defaults to disabled. APIs MUST
 offer an explicit opt-in that hashes each complete decoded external object and
 checks it against its address. All other required checks remain enabled
-regardless of this policy. Unhashed bytes MUST be reported as unchecked and
-MUST NOT become verified without hashing the complete object. Failed promotion
+regardless of this policy. Unhashed bytes MUST NOT be treated as hash-verified
+without hashing the complete object. Failed promotion
 MUST NOT expose unchecked bytes to verified callers.
 
 Resolver attestation of object bytes does not establish local SHA-256
@@ -208,7 +204,8 @@ verified closure. Full archive validation does not establish external
 availability, verified closure, or content authenticity. Implementations MUST
 distinguish missing objects, malformed encodings, integrity failures, transport
 failures, and local resource rejections, and MUST NOT claim checks they did not
-complete.
+complete. Validation APIs MAY return only success or an error; the selected
+scope and hash policy determine which checks success establishes.
 
 ## Security and retention
 
@@ -278,61 +275,31 @@ pointer-chunk = {
 
 **Informative:** this appendix adds no conformance requirements.
 
-Content-addressed storage (CAS) looks up content by a digest of its bytes. It is a
-common storage model with no universal API or protocol. Implementations differ in
-address syntax, transports, range access, retention, and garbage collection.
-
-The [external-content extension](#declaration-and-extents) defines Zstar's external
-object requirements. It requires no particular backend layout or storage service.
+Content-addressed storage (CAS) retrieves content by a digest of its bytes.
+Zstar requires no particular backend layout, transport, or retention API.
 
 ### Object identity and storage representation
-
-An object address identifies complete object bytes:
 
 ```text
 object_id = "sha256:" + lowercase_hex(SHA-256(object_bytes))
 ```
 
-Storage or transport encoding is a separate representation of those bytes.
-Identical object bytes have the same address regardless of reference kind; the
-reference determines their interpretation. An address carries no object kind,
-location, credentials, availability guarantee, or publisher trust.
+For external content, object bytes are the complete decoded content; recompressing
+its Zstandard representation preserves the address. Extent offsets select decoded
+bytes, and encoded-size hints are advisory.
 
-For external content, object bytes are the raw content obtained by decoding the
-resolver's Zstandard representation. Recompressing that representation preserves
-the address. Extent offsets select object bytes; encoded-size fields describe the
-representation and remain advisory.
-
-The same model can identify an archive as an object: its object bytes are the
-complete `.tar.zst` file, including metadata and footer. Changing internal archive
-compression changes those bytes and their address. Additional storage encoding
-would remain separate. Core archives do not store their own object address; the
-footer digest covers decoded manifest metadata only.
-
-The [catalog proposal](catalog.md) uses this archive identity for layers and
-hashes exact UTF-8 JSON document bytes for nested catalogs. Reformatting JSON
-changes the catalog address. Neither interpretation changes external payload
-identity, and a verified archive digest does not verify its external payloads.
+For an archive stored as an object, object bytes are the complete `.tar.zst`
+file. Changing internal compression changes its address. The archive footer
+hashes decoded manifest metadata, not the complete archive.
 
 ### Lookup and verification
 
-The [external resolver contract](#external-object-resolution)
-returns one complete Zstandard representation per lookup. Each response binds to
-one immutable representation, but separate lookups can return equivalent encodings.
-An object address alone does not fix an encoded length or layout. Caches of encoded
-bytes therefore need a representation binding as well as an object address.
-
-External SHA-256 verification is opt-in and defaults to disabled. Framing, bounds,
-resource budgets, and snapshot checks still apply. Unchecked bytes do not become
-verified through address equality. Complete object bytes already hash-verified
-against that address can be reused with their verification provenance; framing,
-selection, and interpretation checks still apply where required.
+The [resolver contract](#external-object-resolution) returns one complete immutable
+Zstandard representation per lookup. Equivalent representations may differ between
+lookups. [Verification and cache rules](#external-identity-and-verification) bind
+encoded caches to a representation and distinguish unchecked from hash-verified bytes.
 
 ### Retention
 
-Content addressing provides identity, not perpetual availability. Pins and leases
-are common retention mechanisms, but they are not inherent in CAS. Keeping archive
-bytes does not by itself retain their external dependencies. The
-[external-content retention rules](#security-and-retention)
-require accounting for retained references before deleting objects. Physical
-packing, storage paths, and retention APIs remain implementation choices.
+Retain objects reachable from every retained archive or standalone reference.
+See [security and retention](#security-and-retention) for deletion rules.

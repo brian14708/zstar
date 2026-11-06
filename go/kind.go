@@ -1,18 +1,5 @@
 package zstar
 
-// Kind identifies the member kind supplied to a Writer. The empty kind means
-// KindFile, matching the zero-value regular-file entry type.
-type Kind string
-
-const (
-	// KindFile denotes a regular file, including an external content reference.
-	KindFile Kind = "file"
-	// KindDirectory denotes a directory with no body.
-	KindDirectory Kind = "directory"
-	// KindSymlink denotes a symbolic link whose target is preserved verbatim.
-	KindSymlink Kind = "symlink"
-)
-
 // EntryType identifies the effective tar member type stored in the manifest.
 type EntryType uint64
 

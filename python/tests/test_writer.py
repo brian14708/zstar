@@ -26,7 +26,7 @@ def test_sync_round_trip_modes_and_borrowed_streams(tmp_path):
         ArchiveWriter.from_file(path, "x")
     with zstar.Archive.from_file(path) as reader:
         assert reader.read("hello.txt", offset=6) == b"world"
-        assert reader.verify()["full_archive_verified"]
+        assert reader.verify() is None
 
     output = io.BytesIO()
     with ArchiveWriter.from_file(output, "w") as writer:
@@ -159,7 +159,7 @@ def test_async_round_trip_and_filesystem_capture(tmp_path):
                 "extra.txt",
             ]
             assert await reader.read("data/file.txt") == b"hello"
-            assert (await reader.verify())["full_archive_verified"]
+            assert await reader.verify() is None
         with pytest.raises(FileExistsError):
             async with await AsyncArchiveWriter.from_file(path, "x"):
                 pass
@@ -337,7 +337,7 @@ def test_async_writer_serializes_concurrent_adds_and_propagates_body_errors(tmp_
             await asyncio.gather(*(writer.addfile(TarInfo(f"file-{i}")) for i in range(20)))
         async with await zstar.AsyncArchive.from_file(path) as archive:
             assert archive.entry_count == 20
-            assert (await archive.verify())["full_archive_verified"]
+            assert await archive.verify() is None
 
         with pytest.raises(zstar.ZstarError, match="broken body"):
             async with await AsyncArchiveWriter.from_file(path, "w") as writer:
@@ -554,7 +554,7 @@ def test_writer_large_external_entry(corpus_dir):
         writer._writer.add(entry)
     with zstar.Archive(output.getvalue()) as reader:
         assert len(reader._reader.entry("file")[6]) == 65_537
-        assert reader.verify()["full_archive_verified"]
+        assert reader.verify() is None
 
 
 def test_writer_preflights_impossible_inline_metadata():
@@ -581,7 +581,7 @@ def test_frame_sizes_are_caller_policy():
     encoded = output.getvalue()
     with zstar.Archive(encoded) as reader:
         assert reader.read_range("large", (17 << 20) - 1, 17 << 20) == b"x"
-        assert reader.verify()["full_archive_verified"]
+        assert reader.verify() is None
     with pytest.raises(zstar.ZstarError) as caught:
         zstar.Archive(encoded, limits={"max_frame_decoded_bytes": 16 << 20})
     assert caught.value.category == "resource-limit"

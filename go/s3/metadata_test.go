@@ -198,7 +198,7 @@ func TestManifestHintsSaveRequestAndFallBackSafely(t *testing.T) {
 		})
 	}
 	client := &hintedClient{data: data, metadata: good}
-	if _, err := zstar.OpenManifest(context.Background(), NewSource(client, "bucket", "key"), zstar.ManifestReaderOptions{MaxEncodedBytes: 1}); zstar.ErrorCategory(err) != zstar.CategoryResourceLimit {
+	if _, err := zstar.OpenWithOptions(context.Background(), NewSource(client, "bucket", "key"), zstar.ReaderOptions{Manifest: zstar.ManifestReaderOptions{MaxEncodedBytes: 1}}); zstar.ErrorCategory(err) != zstar.CategoryResourceLimit {
 		t.Fatal(err)
 	}
 	if client.gets != 1 {

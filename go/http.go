@@ -329,8 +329,7 @@ func (r *RefreshingRangeReader) ReadRange(ctx context.Context, offset, length in
 			return nil, httpFailure(ctx, err)
 		}
 		data, err := r.state.read(ctx, r.Client, url, headers, offset, length)
-		var status httpStatusError
-		if attempt == 0 && errors.As(err, &status) && (int(status) == 401 || int(status) == 403) {
+		if status, ok := errors.AsType[httpStatusError](err); attempt == 0 && ok && (int(status) == 401 || int(status) == 403) {
 			continue
 		}
 		return data, err

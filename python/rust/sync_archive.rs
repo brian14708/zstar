@@ -127,7 +127,7 @@ impl SyncArchive {
             external = false,
         )
     )]
-    fn verify(&self, py: Python<'_>, external: bool) -> PyResult<Py<pyo3::types::PyDict>> {
+    fn verify(&self, py: Python<'_>, external: bool) -> PyResult<()> {
         let lease = self.reader()?;
         block_on(py, lease.verify(external))
     }

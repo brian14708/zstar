@@ -35,8 +35,8 @@ func ParseFooter(data []byte) (Footer, error) {
 	return f, nil
 }
 
-// VerifySHA256 checks a decoded buffer against the expected SHA-256 digest.
-func VerifySHA256(data []byte, expected [32]byte) error {
+// verifySHA256 checks a decoded buffer against the expected SHA-256 digest.
+func verifySHA256(data []byte, expected [32]byte) error {
 	if sha256.Sum256(data) != expected {
 		return rejected(CategoryIntegrityFailure, "digest mismatch")
 	}

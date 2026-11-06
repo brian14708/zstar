@@ -102,11 +102,7 @@ async fn tar_style_roundtrip_ranges_metadata_and_verification() {
     assert!(report.metadata_authenticated);
     assert!(!report.full_archive_validated);
     assert_ne!(report.data_frames_checked, [] as [u64; 0]);
-    let report = archive.verify(VerificationScope::Archive).await.unwrap();
-    assert_eq!(report.scope, VerificationScope::Archive);
-    assert_eq!(report.tar_members, 4);
-    assert_eq!(report.pointer_members, 0);
-    assert!(report.data_frames > 1);
+    archive.verify(VerificationScope::Archive).await.unwrap();
 }
 
 #[tokio::test]
@@ -134,12 +130,9 @@ async fn handles_seek_across_frames_and_survive_archive_drop() {
 }
 
 #[tokio::test]
-async fn standalone_cursors_read_retained_entries_across_extents() {
+async fn archive_cursors_read_across_extents() {
     let archive = Archive::from_bytes(fixture().await).await.unwrap();
-    let mut entry = archive.entry("dir/file").await.unwrap().unwrap();
-    // Reads must use the retained entry even when its path is not indexed.
-    entry.path = "retained-entry".into();
-    let cursor = zstar::FileCursor::new(entry).unwrap();
+    let cursor = archive.open_cursor("dir/file").await.unwrap();
     let expected = payload();
     for (offset, length) in [(0, 1), (500, 2048), (1000, 6000), (8190, 3), (8193, 0)] {
         assert_eq!(
@@ -161,22 +154,18 @@ async fn archive_cursors_reject_other_archives() {
     let bytes = fixture().await;
     let archive = Archive::from_bytes(bytes.clone()).await.unwrap();
     let other = Archive::from_bytes(bytes).await.unwrap();
-    let entry = archive.entry("dir/file").await.unwrap().unwrap();
-    for cursor in [
-        archive.open_cursor("dir/file").await.unwrap(),
-        archive.cursor_from_entry(entry).await.unwrap(),
-    ] {
-        assert!(matches!(
-            cursor.read(&other, 0, 1).await,
-            Err(Error::Unsupported(_))
-        ));
-        let (first, second) = tokio::join!(
-            cursor.read(&archive, 0, 1000),
-            cursor.read(&archive, 500, 2048),
-        );
-        assert_eq!(first.unwrap(), payload()[..1000]);
-        assert_eq!(second.unwrap(), payload()[500..2548]);
-    }
+    let cursor = archive.open_cursor("dir/file").await.unwrap();
+    assert_eq!(cursor.read(&archive, 0, 1).await.unwrap(), payload()[..1]);
+    assert!(matches!(
+        cursor.read(&other, 0, 1).await,
+        Err(Error::Unsupported(_))
+    ));
+    let (first, second) = tokio::join!(
+        cursor.read(&archive, 0, 1000),
+        cursor.read(&archive, 500, 2048),
+    );
+    assert_eq!(first.unwrap(), payload()[..1000]);
+    assert_eq!(second.unwrap(), payload()[500..2548]);
 }
 
 #[tokio::test]
@@ -220,7 +209,7 @@ async fn verify_finds_corruption_outside_a_selected_read() {
     builder.append_bytes("first", b"hello").await.unwrap();
     builder.append_bytes("last", &payload()).await.unwrap();
     let mut bytes = builder.finish().await.unwrap();
-    let footer = zstar::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
+    let footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
     bytes[footer.toc_offset as usize - 1] ^= 1;
     let archive = Archive::from_bytes(bytes).await.unwrap();
     assert_eq!(archive.read("first").await.unwrap(), b"hello".as_slice());
@@ -243,7 +232,9 @@ impl ObjectResolver for Objects {
 #[tokio::test]
 async fn configured_resolver_applies_to_reads_handles_batches_and_closure() {
     let objects = Arc::new(Objects {
-        encoded: zstar::encode_frame(b"hello\nworld\n", 3).unwrap().into(),
+        encoded: zstar::backend::encode_frame(b"hello\nworld\n", 3)
+            .unwrap()
+            .into(),
         calls: AtomicUsize::new(0),
     });
     let source = Arc::new(Bytes::from_static(include_bytes!(
@@ -259,8 +250,7 @@ async fn configured_resolver_applies_to_reads_handles_batches_and_closure() {
     )
     .await
     .unwrap();
-    let physical = archive.verify(VerificationScope::Archive).await.unwrap();
-    assert!(physical.pointer_members > 0);
+    archive.verify(VerificationScope::Archive).await.unwrap();
     assert_eq!(objects.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         archive.read("repeat").await.unwrap(),
@@ -281,12 +271,10 @@ async fn configured_resolver_applies_to_reads_handles_batches_and_closure() {
             .unwrap()[0],
         b"ell".as_slice()
     );
-    let closure = archive
+    archive
         .verify(VerificationScope::ExternalClosure)
         .await
         .unwrap();
-    assert_eq!(closure.external_objects_sha256_checked.len(), 1);
-    assert_eq!(closure.external_objects_unchecked, [] as [[u8; 32]; 0]);
     assert!(objects.calls.load(Ordering::SeqCst) > 1);
     let unresolved = Archive::open(source).await.unwrap();
     assert!(
@@ -323,11 +311,14 @@ async fn panicking_codec_callbacks_do_not_strand_output_waits() {
     let mut builder = Builder::with_options(
         Vec::new(),
         WriterOptions {
-            manifest: zstar::ManifestOptions {
-                memory_bytes: 1,
-                create_spill_store: Some(zstar::SpillFactory::new(|| {
-                    panic!("spill callback failed")
-                })),
+            metadata: zstar::MetadataWriterOptions {
+                spool: zstar::SpoolOptions {
+                    memory_bytes: 1,
+                    create_store: Some(zstar::SpillFactory::new(|| {
+                        panic!("spill callback failed")
+                    })),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -620,17 +611,6 @@ async fn cancelling_physical_verification_drops_pending_source_reads() {
     );
 }
 
-#[tokio::test]
-async fn modified_entries_cannot_become_authenticated_cursors() {
-    let archive = Archive::from_bytes(fixture().await).await.unwrap();
-    let mut entry = archive.entry("dir/file").await.unwrap().unwrap();
-    entry.extents[0].offset += 1;
-    assert!(matches!(
-        archive.cursor_from_entry(entry).await,
-        Err(Error::Unsupported(_))
-    ));
-}
-
 struct CountedSource {
     bytes: Bytes,
     calls: AtomicUsize,
@@ -679,33 +659,6 @@ async fn stream_cache_reuses_validated_sources_and_obeys_its_budget() {
     }
 }
 
-#[tokio::test]
-async fn standalone_cursor_cache_never_mixes_archive_sessions() {
-    let mut first = Builder::new(Vec::new());
-    first.append_bytes("file", b"aaaaaa").await.unwrap();
-    let first = Archive::from_bytes(first.finish().await.unwrap())
-        .await
-        .unwrap();
-    let mut second = Builder::new(Vec::new());
-    second.append_bytes("file", b"bbbbbb").await.unwrap();
-    let second = Archive::from_bytes(second.finish().await.unwrap())
-        .await
-        .unwrap();
-    let cursor = zstar::FileCursor::new(first.entry("file").await.unwrap().unwrap()).unwrap();
-    assert_eq!(
-        cursor.read(&first, 0, 6).await.unwrap(),
-        b"aaaaaa".as_slice()
-    );
-    assert_eq!(
-        cursor.read(&second, 0, 6).await.unwrap(),
-        b"bbbbbb".as_slice()
-    );
-    assert_eq!(
-        cursor.read(&first, 0, 6).await.unwrap(),
-        b"aaaaaa".as_slice()
-    );
-}
-
 #[test]
 fn writer_construction_is_runtime_independent() {
     let builder = Builder::new(Vec::new());
@@ -745,8 +698,8 @@ async fn external_chunks_accept_boxed_writers_and_reject_bad_sizes() {
             tokio::task::yield_now().await;
             Ok(zstar::Extent {
                 size: raw.len() as u64,
-                source: zstar::Source::Object(*zstar::Digest::sha256(&raw).as_bytes()),
-                encoded_size: zstar::encode_frame(&raw, 3)?.len() as u64,
+                source: zstar::Source::Object(*zstar::backend::Digest::sha256(&raw).as_bytes()),
+                encoded_size: zstar::backend::encode_frame(&raw, 3)?.len() as u64,
                 offset: 0,
             })
         }
@@ -782,20 +735,80 @@ async fn external_chunks_accept_boxed_writers_and_reject_bad_sizes() {
 
 #[tokio::test]
 async fn focused_metadata_options_enforce_index_limits() {
-    let options = WriterOptions::default().with_metadata(zstar::MetadataWriterOptions {
-        block_target: 512,
+    let options = WriterOptions {
+        metadata: zstar::MetadataWriterOptions {
+            block_target: 512,
+            ..Default::default()
+        },
         ..Default::default()
-    });
+    };
     let mut builder = Builder::try_with_options(Vec::new(), options)
         .await
         .unwrap();
     builder.append_bytes("a", b"a").await.unwrap();
     builder.append_bytes("b", b"b").await.unwrap();
     let bytes = builder.finish().await.unwrap();
-    let options = ReaderOptions::default().with_metadata(zstar::MetadataReaderOptions {
-        max_entries: 1,
+    let options = ReaderOptions {
+        metadata: zstar::MetadataReaderOptions {
+            max_entries: 1,
+            ..Default::default()
+        },
         ..Default::default()
-    });
+    };
     let result = Archive::open_with_options(Arc::new(Bytes::from(bytes)), options).await;
     assert!(matches!(result, Err(Error::Budget(_))));
+}
+
+#[tokio::test]
+async fn content_limits_are_independent_of_metadata_options() {
+    let bytes = fixture().await;
+    let options = ReaderOptions {
+        metadata: zstar::MetadataReaderOptions {
+            max_entries: 10,
+            ..Default::default()
+        },
+        max_read_bytes: 1,
+        ..Default::default()
+    };
+    let archive = Archive::open_with_options(Arc::new(bytes.clone()), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        &archive.read_range("dir/file", 0..1).await.unwrap()[..],
+        &payload()[..1]
+    );
+    assert!(matches!(
+        archive.read_range("dir/file", 0..2).await,
+        Err(Error::Budget(_))
+    ));
+    archive.verify(VerificationScope::Archive).await.unwrap();
+
+    let options = ReaderOptions {
+        metadata: zstar::MetadataReaderOptions::default(),
+        limits: zstar::Limits {
+            max_extents: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(matches!(
+        Archive::open_with_options(Arc::new(bytes), options).await,
+        Err(Error::Budget(_))
+    ));
+
+    let options = WriterOptions {
+        metadata: zstar::MetadataWriterOptions::default(),
+        limits: zstar::Limits {
+            max_entry_bytes: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut builder = Builder::try_with_options(Vec::new(), options)
+        .await
+        .unwrap();
+    assert!(matches!(
+        builder.append_bytes("file", b"ab").await,
+        Err(Error::Budget(_))
+    ));
 }

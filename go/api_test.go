@@ -21,14 +21,14 @@ func testAPIReader(t *testing.T, symlink bool) *Reader {
 		t.Fatal(err)
 	}
 	for _, header := range []Header{
-		{Path: "dir", Kind: KindDirectory, Mode: 0o755},
+		{Path: "dir", Type: TypeDirectory, Mode: 0o755},
 		{Path: "dir/a", Size: 3, Mode: 0o6750, MtimeNS: -123},
-		{Path: "dir/nested", Kind: KindDirectory, Mode: 0o755},
+		{Path: "dir/nested", Type: TypeDirectory, Mode: 0o755},
 		{Path: "dir/nested/b", Size: 3, Mode: 0o644},
 		{Path: "z", Size: 3, Mode: 0o644},
 	} {
 		var body io.Reader
-		if header.Kind != KindDirectory {
+		if header.Type != TypeDirectory {
 			body = bytes.NewBufferString("abc")
 		}
 		if err := w.Add(context.Background(), header, body); err != nil {
@@ -36,7 +36,7 @@ func testAPIReader(t *testing.T, symlink bool) *Reader {
 		}
 	}
 	if symlink {
-		if err := w.Add(context.Background(), Header{Path: "link", Kind: KindSymlink, Target: "dir/a"}, nil); err != nil {
+		if err := w.Add(context.Background(), Header{Path: "link", Type: TypeSymlink, Target: "dir/a"}, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,9 +230,9 @@ func TestArchiveDirectorySubtreeBoundaries(t *testing.T) {
 	var output bytes.Buffer
 	w := mustTestWriter(t, &output, WriterOptions{})
 	for _, h := range []Header{
-		{Path: "a", Kind: KindDirectory},
+		{Path: "a", Type: TypeDirectory},
 		{Path: "a-keep"},
-		{Path: "a/child", Kind: KindDirectory},
+		{Path: "a/child", Type: TypeDirectory},
 		{Path: "a/child-keep"},
 		{Path: "a/child/grandchild"},
 		{Path: "a0keep"},
@@ -257,12 +257,12 @@ func TestArchiveDirectorySubtreeBoundaries(t *testing.T) {
 func TestNamedVerificationScopes(t *testing.T) {
 	reader := testAPIReader(t, true)
 	for _, scope := range []VerificationScope{VerifyArchive, VerifyExternalClosure} {
-		report, err := reader.VerifyScope(context.Background(), scope)
-		if err != nil || !report.FullArchiveValidated || report.ExternalClosureValidated != (scope == VerifyExternalClosure) {
-			t.Fatalf("scope %v: %+v, %v", scope, report, err)
+		err := reader.Verify(context.Background(), scope)
+		if err != nil {
+			t.Fatalf("scope %v: %v", scope, err)
 		}
 	}
-	if _, err := reader.VerifyScope(context.Background(), VerificationScope(255)); ErrorCategory(err) != CategoryUnsupportedOperation {
+	if err := reader.Verify(context.Background(), VerificationScope(255)); ErrorCategory(err) != CategoryUnsupportedOperation {
 		t.Fatalf("invalid scope: %v", err)
 	}
 }

@@ -2,11 +2,12 @@ package s3
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"io"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -87,7 +88,7 @@ func Upload(ctx context.Context, client MultipartClient, bucket, key string, inp
 	if cache == "" {
 		cache = cacheControl(options.Immutable)
 	}
-	created, err := client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), Metadata: metadata, ContentType: aws.String(contentType), CacheControl: aws.String(cache)})
+	created, err := client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{Bucket: new(bucket), Key: new(key), Metadata: metadata, ContentType: new(contentType), CacheControl: new(cache)})
 	if err != nil {
 		return redacted(err)
 	}
@@ -104,7 +105,7 @@ func Upload(ctx context.Context, client MultipartClient, bucket, key string, inp
 		if !completed {
 			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
-			_, abortErr := client.AbortMultipartUpload(cleanup, &awss3.AbortMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id})
+			_, abortErr := client.AbortMultipartUpload(cleanup, &awss3.AbortMultipartUploadInput{Bucket: new(bucket), Key: new(key), UploadId: id})
 			if abortErr != nil && !emptyStored {
 				err = errors.Join(err, errors.New("zstar s3: multipart abort failed"))
 			}
@@ -154,7 +155,7 @@ readLoop:
 		raw = raw[:n]
 		group.Go(func() {
 			defer func() { <-slots }()
-			result, uploadErr := client.UploadPart(work, &awss3.UploadPartInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id, PartNumber: aws.Int32(partNumber), Body: bytes.NewReader(raw), ContentLength: aws.Int64(int64(len(raw)))})
+			result, uploadErr := client.UploadPart(work, &awss3.UploadPartInput{Bucket: new(bucket), Key: new(key), UploadId: id, PartNumber: new(partNumber), Body: bytes.NewReader(raw), ContentLength: new(int64(len(raw)))})
 			if uploadErr != nil {
 				fail(redacted(uploadErr))
 				return
@@ -164,7 +165,7 @@ readLoop:
 				return
 			}
 			mu.Lock()
-			parts = append(parts, types.CompletedPart{ETag: result.ETag, PartNumber: aws.Int32(partNumber)})
+			parts = append(parts, types.CompletedPart{ETag: result.ETag, PartNumber: new(partNumber)})
 			mu.Unlock()
 		})
 		if readErr == io.ErrUnexpectedEOF {
@@ -180,15 +181,17 @@ readLoop:
 	}
 	if len(parts) == 0 {
 		// S3 cannot complete a zero-part upload. The defer aborts its empty session.
-		_, err = client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(nil), ContentLength: aws.Int64(0), Metadata: metadata, ContentType: aws.String(contentType), CacheControl: aws.String(cache), IfNoneMatch: immutableCondition(options.Immutable)})
+		_, err = client.PutObject(ctx, &awss3.PutObjectInput{Bucket: new(bucket), Key: new(key), Body: bytes.NewReader(nil), ContentLength: new(int64(0)), Metadata: metadata, ContentType: new(contentType), CacheControl: new(cache), IfNoneMatch: immutableCondition(options.Immutable)})
 		if err != nil {
 			return redacted(err)
 		}
 		emptyStored = true
 		return nil
 	}
-	sort.Slice(parts, func(i, j int) bool { return *parts[i].PartNumber < *parts[j].PartNumber })
-	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: id, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}, IfNoneMatch: immutableCondition(options.Immutable)})
+	slices.SortFunc(parts, func(a, b types.CompletedPart) int {
+		return cmp.Compare(*a.PartNumber, *b.PartNumber)
+	})
+	_, err = client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{Bucket: new(bucket), Key: new(key), UploadId: id, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}, IfNoneMatch: immutableCondition(options.Immutable)})
 	if err != nil {
 		if options.Immutable {
 			return immutableError(err)
@@ -201,7 +204,7 @@ readLoop:
 
 func immutableCondition(enabled bool) *string {
 	if enabled {
-		return aws.String("*")
+		return new("*")
 	}
 	return nil
 }

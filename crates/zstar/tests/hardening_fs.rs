@@ -1,8 +1,9 @@
 #![cfg(all(feature = "fs", unix))]
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path};
+use zstar::backend::SliceReader;
 use zstar::backend::{BlockingArchive, BlockingBuilder};
 use zstar::fs::{ExtractOptions, OmittedField, extract_with_report};
-use zstar::{Entry, EntryKind, SliceReader};
+use zstar::{Entry, EntryKind};
 
 fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
     Entry {
@@ -35,8 +36,11 @@ fn run(
     dest: &Path,
     options: ExtractOptions,
 ) -> zstar::fs::AnyResult<zstar::fs::ExtractReport> {
-    let mut archive =
-        BlockingArchive::open(SliceReader::new(bytes), zstar::ManifestOptions::default()).unwrap();
+    let mut archive = BlockingArchive::open(
+        SliceReader::new(bytes),
+        zstar::backend::ManifestOptions::default(),
+    )
+    .unwrap();
     extract_with_report(&mut archive, dest, None, options)
 }
 
@@ -215,8 +219,8 @@ fn metadata_not_applied_is_reported_and_symlink_modes_do_not_abort() {
     assert_eq!(report.symlinks, 1);
     // Convenience extraction must expose the same omissions rather than discard them.
     let mut archive = zstar::backend::BlockingArchive::open(
-        zstar::SliceReader::new(&bytes),
-        zstar::ManifestOptions::default(),
+        zstar::backend::SliceReader::new(&bytes),
+        zstar::backend::ManifestOptions::default(),
     )
     .unwrap();
     let convenience = zstar::fs::extract_with_options(

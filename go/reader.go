@@ -9,12 +9,9 @@ import (
 // ReaderOptions controls bounded metadata/content storage and external hashes.
 // Metadata is always authenticated and archive data checksums are mandatory.
 type ReaderOptions struct {
-	// ConcurrentChunks overrides Manifest.ConcurrentChunks when nonzero.
-	ConcurrentChunks int
-	// MaxReadBytes overrides Manifest.MaxReadBytes when nonzero.
-	MaxReadBytes uint64
-	Manifest     ManifestReaderOptions
-	Resolver     EncodedContentResolver
+	// Manifest controls metadata storage and content resource budgets.
+	Manifest ManifestReaderOptions
+	Resolver EncodedContentResolver
 	// VerifyExternalHash opts into SHA-256 verification of resolved objects.
 	// The default checks object availability, encoded bounds and decoded extent lengths.
 	VerifyExternalHash bool
@@ -25,7 +22,7 @@ type ReaderOptions struct {
 // Close releases entries and cancels loads, without closing source.
 // Sources and resolvers must support concurrent calls and stay immutable.
 type Reader struct {
-	manifest       *Manifest
+	manifest       *manifest
 	resolver       EncodedContentResolver
 	verifyExternal bool
 }
@@ -49,13 +46,7 @@ func Open(ctx context.Context, source RangeReader) (*Reader, error) {
 // the source and resolver. Sources and resolvers must support
 // concurrent calls. ctx applies only to opening, not subsequent reads.
 func OpenWithOptions(ctx context.Context, source RangeReader, options ReaderOptions) (*Reader, error) {
-	if options.ConcurrentChunks != 0 {
-		options.Manifest.ConcurrentChunks = options.ConcurrentChunks
-	}
-	if options.MaxReadBytes != 0 {
-		options.Manifest.MaxReadBytes = options.MaxReadBytes
-	}
-	manifest, err := OpenManifest(ctx, source, options.Manifest)
+	manifest, err := openManifest(ctx, source, options.Manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -80,24 +71,11 @@ func (r *Reader) EntryCount() uint64 { return r.manifest.EntryCount() }
 // RootExtensions returns an owned copy of authenticated root metadata.
 func (r *Reader) RootExtensions() Extensions { return r.manifest.RootExtensions() }
 
-// Cursor creates an independent cursor over sorted owned member metadata.
-func (r *Reader) Cursor() *ManifestCursor { return r.manifest.Cursor() }
-
-// CursorPrefix visits paths beginning with prefix. Use "dir/" for descendants
-// and an empty prefix for all entries. Returned metadata is caller-owned.
-func (r *Reader) CursorPrefix(prefix string) *ManifestCursor {
-	return r.manifest.CursorPrefix(prefix)
-}
-
 // Entries yields owned entries whose paths begin with prefix, in path order.
 // Use "dir/" for descendants or "" for all entries. Stop on a nonnil error.
 func (r *Reader) Entries(prefix string) iter.Seq2[Entry, error] {
 	return r.manifest.Entries(prefix)
 }
-
-// VisitEntries visits sorted owned entries without holding the metadata lock.
-// Callbacks may read the archive. The first callback error stops visitation.
-func (r *Reader) VisitEntries(visit func(Entry) error) error { return r.manifest.VisitEntries(visit) }
 
 // Read returns an owned buffer containing exactly size bytes at the logical
 // member offset. The range must fit within the member and MaxReadBytes.
@@ -145,7 +123,7 @@ func (r *Reader) ReadLink(path string) (string, error) {
 	return *entry.Linkname, nil
 }
 
-// VerificationScope selects the checks performed by Reader.VerifyScope.
+// VerificationScope selects the checks performed by Reader.Verify.
 type VerificationScope uint8
 
 const (
@@ -156,31 +134,11 @@ const (
 	VerifyExternalClosure
 )
 
-// VerifyScope validates the archive under an explicit verification scope.
-func (r *Reader) VerifyScope(ctx context.Context, scope VerificationScope) (VerificationReport, error) {
+// Verify validates the archive under an explicit verification scope.
+// External object hashing follows ReaderOptions.VerifyExternalHash.
+func (r *Reader) Verify(ctx context.Context, scope VerificationScope) error {
 	if scope != VerifyArchive && scope != VerifyExternalClosure {
-		return VerificationReport{}, rejected(CategoryUnsupportedOperation, "unknown verification scope")
+		return rejected(CategoryUnsupportedOperation, "unknown verification scope")
 	}
 	return r.manifest.Verify(ctx, r.resolver, r.verifyExternal, scope == VerifyExternalClosure)
-}
-
-// Verify is the compatibility shorthand for VerifyScope. It validates the
-// physical archive and, when externalClosure is true, every external extent.
-// SHA-256 follows VerifyExternalHash; codec checksums and bounds always apply.
-//
-// Deprecated: use VerifyScope with an explicit VerificationScope.
-func (r *Reader) Verify(ctx context.Context, externalClosure bool) (VerificationReport, error) {
-	scope := VerifyArchive
-	if externalClosure {
-		scope = VerifyExternalClosure
-	}
-	return r.VerifyScope(ctx, scope)
-}
-
-// VisitPayloads validates physical content while invoking borrowed payload
-// callbacks. Bytes are valid only until callback return and output remains
-// provisional until success. External payloads are pointer JSON; directories
-// and symlinks yield no payload. Callbacks must not close the reader.
-func (r *Reader) VisitPayloads(ctx context.Context, visit func(Entry, []byte) error) (ArchiveReport, error) {
-	return r.manifest.VisitPayloads(ctx, visit)
 }

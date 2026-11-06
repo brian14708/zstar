@@ -18,7 +18,7 @@ fn decode_object(
         )));
     }
     let raw = py
-        .detach(|| zstar::decode_frame(&encoded, size))
+        .detach(|| zstar::backend::decode_frame(&encoded, size))
         .map_err(|error| core_error(zstar::Error::MalformedExternalContent(error.to_string())))?;
     Ok(pyo3::types::PyBytes::new(py, &raw).unbind())
 }
@@ -33,9 +33,9 @@ fn pack_file(py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<Py<pyo3::typ
         .detach(|| {
             let mut writer = zstar::backend::BlockingBuilder::new(Vec::new())?;
             writer.add_file(
-                zstar::manifest::Entry {
+                zstar::backend::manifest::Entry {
                     path: path.to_owned(),
-                    kind: zstar::manifest::EntryKind::File,
+                    kind: zstar::backend::manifest::EntryKind::File,
                     mode: 0o644,
                     uid: 0,
                     gid: 0,
@@ -112,8 +112,8 @@ fn extract(
     let report = py
         .detach(|| -> zstar::fs::AnyResult<zstar::fs::ExtractReport> {
             let mut archive = zstar::backend::BlockingArchive::open(
-                zstar::SliceReader::new(&data),
-                zstar::ManifestOptions::default(),
+                zstar::backend::SliceReader::new(&data),
+                zstar::backend::ManifestOptions::default(),
             )?;
             let objects = objects
                 .as_deref()
@@ -176,8 +176,8 @@ fn materialize(
     let bytes = py
         .detach(|| -> zstar::fs::AnyResult<Vec<u8>> {
             let mut archive = zstar::backend::BlockingArchive::open(
-                zstar::SliceReader::new(&data),
-                zstar::ManifestOptions::default(),
+                zstar::backend::SliceReader::new(&data),
+                zstar::backend::ManifestOptions::default(),
             )?;
             let objects = objects
                 .as_deref()

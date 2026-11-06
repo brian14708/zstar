@@ -9,8 +9,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use zstar::ManifestOptions;
 use zstar::backend::BlockingArchive;
+use zstar::backend::ManifestOptions;
 use zstar::fs::{self as restore, LocalFileSource};
 use zstar::s3::object_store::client::CredentialProvider;
 use zstar::s3::object_store::{aws::AwsCredential, path::Path as ObjectPath};
@@ -370,11 +370,12 @@ async fn main() -> restore::AnyResult<()> {
                 .map_or(archive.as_path(), tempfile::NamedTempFile::path);
             let source = LocalFileSource::open(local)?;
             let size = source.len();
-            if size < zstar::FOOTER_SIZE as u64 {
+            if size < zstar::backend::FOOTER_SIZE as u64 {
                 return Err(zstar::Error::NotZstar.into());
             }
-            let footer =
-                zstar::parse_footer(&source.read_range(size - zstar::FOOTER_SIZE as u64..size)?)?;
+            let footer = zstar::backend::parse_footer(
+                &source.read_range(size - zstar::backend::FOOTER_SIZE as u64..size)?,
+            )?;
             let parsed = BlockingArchive::open(source, metadata.options())?;
             println!(
                 "metadata_offset={} metadata_encoded_size={} metadata_decoded_size={} entries={}",

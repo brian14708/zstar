@@ -6,8 +6,6 @@ A catalog is a named JSON document that organizes Zstar archives stored in
 content-addressed storage (CAS). Each collection combines one or more archives
 as layers. Slash-separated entry names group collections into folders, and
 references to other catalogs let those folders contain further collections.
-The catalog is stored separately from its archives and does not change Zstar's
-core manifest.
 
 This profile uses [core](core.md) for layers and the
 [CAS identity model](external-content.md#appendix-cas-storage) for references.
@@ -34,7 +32,7 @@ MUST, MUST NOT, SHOULD, and MAY have their BCP 14 meanings.
 }
 ```
 
-Hashes in examples are illustrative. A document has exactly two fields:
+A document has exactly two fields:
 `version`, the string `"zstar-catalog-v1"`, and `entries`, an array of entry objects.
 An empty array represents an empty catalog. The order of entries does not
 matter; the order within each `layers` array controls merging.
@@ -79,8 +77,8 @@ not affect interpretation. Canonical serialization is not required.
 The `shared` entry above mounts the referenced catalog under `shared`. If that
 catalog contains an `events` collection, its full name is `shared/events`.
 Delegations cannot have local children, layers, or `base-path`. A referenced
-catalog may itself
-contain delegations. Nested references MUST be addresses, never mutable names.
+catalog may itself contain delegations. Nested references MUST be addresses,
+never mutable names.
 
 Every address is `sha256:` followed by exactly 64 lowercase hexadecimal digits:
 
@@ -113,7 +111,7 @@ separately from malformed input.
 Layers MUST satisfy core and MAY use `external-content` if supported. No other
 required extension is defined here. External payloads retain their existing
 identity and verification policy: hashing a layer archive does not verify those
-payloads. Catalog JSON is not a Zstar external-content pointer or manifest.
+payloads.
 
 ## Overlay semantics
 
@@ -224,9 +222,6 @@ a new snapshot; old layers remain retained while reachable from any root.
 
 ## Validation and conformance
 
-Catalog conformance is separate from core and external-content conformance.
-No SDK currently declares the classes below.
-
 | Class | Required behavior |
 | --- | --- |
 | Catalog reader/writer | Validate or emit the complete local JSON schema and nonoverlapping path namespace. |
@@ -234,9 +229,7 @@ No SDK currently declares the classes below.
 | Closure validator | Validate every reachable catalog/archive and external payload at the declared hash-verification level. |
 | Publisher | Publish dependencies before atomically updating a name with a revision precondition. |
 
-Conformance to one class does not imply conformance to another. Parsing a catalog
-does not establish that its layers are available, and validating an archive does
-not establish that a catalog view has been resolved.
+Conformance to one class does not imply conformance to another.
 
 Distinguish invalid JSON/schema, invalid archive, unsupported feature, missing
 reference, transport error, integrity failure, invalid base path, delegation
@@ -272,9 +265,6 @@ Before declaring support, add shared positive and negative fixtures under
 - Missing/corrupt layers and nested catalogs, without fallback.
 - Valid archive hashes with missing or corrupt external payloads.
 - Pinned readers during replacement and conflicting conditional updates.
-
-SDK interfaces, package documentation, and publication adapters are also
-subsequent work.
 
 ## Formal definitions
 

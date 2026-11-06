@@ -47,7 +47,7 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 	if !store.closed {
 		t.Fatal("decoded spool retained after entry indexing")
 	}
-	if _, err = reader.VerifyScope(context.Background(), VerifyArchive); err != nil {
+	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
 		t.Fatal(err)
 	}
 	if err = reader.Close(); err != nil {
@@ -208,10 +208,10 @@ func TestSpoolQuotaPublicReaderAndWriterFailureCleanup(t *testing.T) {
 		SpoolBudget: budget, MemoryBytes: 1,
 		CreateSpillStore: func() (ManifestSpillStore, error) { t.Fatal("quota must precede callback"); return nil, nil },
 	}
-	if _, err = OpenManifest(context.Background(), memoryRange(data), options); ErrorCategory(err) != "resource-limit" {
+	if _, err = openManifest(context.Background(), memoryRange(data), options); ErrorCategory(err) != "resource-limit" {
 		t.Fatal(err)
 	}
-	writer, err := NewEntryArchiveWriter(io.Discard, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{
+	writer, err := newEntryArchiveWriter(io.Discard, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{
 		SpoolBudget: budget, MemoryBytes: 1, CreateSpillStore: options.CreateSpillStore,
 	}})
 	if err != nil {

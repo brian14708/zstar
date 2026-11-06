@@ -3,9 +3,11 @@
 import asyncio
 import gc
 import io
+import os
 import random
 import sys
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -420,6 +422,46 @@ def test_dropping_member_on_io_loop_closes_owned_filesystem(loaded):
     assert source.closed
 
 
+@pytest.mark.parametrize("finalize", [False, True])
+def test_cleanup_survives_collection_while_suspended(monkeypatch, finalize):
+    original = ZstarFileSystem._drain_close
+
+    async def exercise():
+        started, finished = asyncio.Event(), asyncio.Event()
+        pending = []
+
+        async def suspended_close(fs):
+            future = asyncio.get_running_loop().create_future()
+            pending.append(weakref.ref(future))
+            started.set()
+            await future
+            await original(fs)
+            finished.set()
+
+        monkeypatch.setattr(ZstarFileSystem, "_drain_close", suspended_close)
+        source = io.BytesIO(_native.pack_file("x", b"hello"))
+        fs = ZstarFileSystem(fo=source, asynchronous=True)
+        assert await fs._cat_file("x") == b"hello"
+        if not finalize:
+            close = asyncio.create_task(fs.aclose())
+            await asyncio.wait_for(started.wait(), 5)
+            close.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close
+            del close
+        del fs
+        gc.collect()
+        await asyncio.wait_for(started.wait(), 5)
+        gc.collect()
+        future = pending[0]()
+        assert future is not None, "pending cleanup was garbage collected"
+        future.set_result(None)
+        await asyncio.wait_for(finished.wait(), 5)
+        assert source.closed
+
+    asyncio.run(exercise())
+
+
 class RangeFile(fsspec.spec.AbstractBufferedFile):
     def __init__(self, fs, path, **options):
         options.setdefault("cache_type", fs.default_cache_type)
@@ -649,6 +691,17 @@ def test_bulk_helpers_and_batched_ranges(tmp_path, monkeypatch):
         assert dict(fs.get_mapper())["b.txt"] == b"world"
 
 
+@pytest.mark.parametrize("verify_external", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_hash_policy_has_one_configuration_path(verify_external, nested):
+    with pytest.raises(TypeError, match="use verify_external="):
+        ZstarFileSystem(
+            fo=io.BytesIO(),
+            verify_external=verify_external,
+            reader_options={"verify_external": nested},
+        )
+
+
 def test_reader_options_apply_to_fsspec():
     with ZstarFileSystem(
         fo=io.BytesIO(_native.pack_file("x", b"hello")),
@@ -679,3 +732,56 @@ def test_async_batched_ranges():
             assert await fs._cat_ranges(["x", "x"], [0, 2], [2, None]) == [b"he", b"llo"]
 
     asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Descriptor-relative local paths")
+@pytest.mark.parametrize("parent_link", [False, True])
+def test_download_rejects_destination_symlinks(tmp_path, parent_link):
+    output = io.BytesIO()
+    with zstar.ArchiveWriter(output) as writer:
+        writer.write_bytes("file", b"replacement")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "file"
+    victim.write_bytes(b"original")
+    destination = tmp_path / "destination"
+    if parent_link:
+        destination.symlink_to(outside, target_is_directory=True)
+    else:
+        destination.mkdir()
+        (destination / "file").symlink_to(victim)
+    with zstar.ZstarFileSystem(io.BytesIO(output.getvalue())) as fs, pytest.raises(OSError):
+        fs.get_file("file", destination / "file")
+    assert victim.read_bytes() == b"original"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Descriptor-relative local paths")
+def test_download_parent_replacement_cannot_redirect_write(tmp_path, monkeypatch):
+    from zstar import _fsspec
+
+    output = io.BytesIO()
+    with zstar.ArchiveWriter(output) as writer:
+        writer.write_bytes("file", b"replacement")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_bytes(b"original")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    parked = tmp_path / "parked"
+    original_open = _fsspec.os.open
+    replaced = False
+
+    def swap_before_leaf(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if path == "file" and dir_fd is not None and not replaced:
+            replaced = True
+            destination.rename(parked)
+            destination.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(_fsspec.os, "open", swap_before_leaf)
+    with zstar.ZstarFileSystem(io.BytesIO(output.getvalue())) as fs:
+        fs.get_file("file", destination / "file")
+    assert replaced
+    assert (outside / "file").read_bytes() == b"original"
+    assert (parked / "file").read_bytes() == b"replacement"
