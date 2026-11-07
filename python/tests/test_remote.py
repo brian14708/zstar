@@ -517,7 +517,7 @@ def test_remote_external_objects_share_encoded_resolver_reads_and_report_scope(
             ]
             raw, report = await archive.read_with_report("hello.txt", 0, 6)
             assert raw == b"hello\n"
-            assert report["metadata_authenticated"]
+            assert report["metadata_validated"]
             assert not report["full_archive_validated"]
             assert report["external_objects_sha256_checked"]
             assert not report["external_objects_unchecked"]

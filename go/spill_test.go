@@ -64,8 +64,11 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 		t.Fatalf("opening cleanup ignored: %v", err)
 	}
 	// Opening failure must close its transferred store and retain both causes.
-	corrupt := bytes.Clone(data)
-	corrupt[len(corrupt)-1] ^= 1
+	corrupt, err := os.ReadFile("../testdata/entry-manifest/split-document.zstar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt[len(corrupt)-FooterSize-1] ^= 1
 	store = &failingCloseSpill{failure: cleanupFailure}
 	_, err = OpenWithOptions(context.Background(), memoryRange(corrupt), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },

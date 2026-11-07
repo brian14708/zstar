@@ -55,9 +55,9 @@ func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 		t.Fatalf("iteration: %d %v", count, err)
 	}
 	bad := bytes.Clone(output.Bytes())
-	bad[len(bad)-1] ^= 1
+	bad[len(bad)-FooterSize-1] ^= 1
 	if _, err = openManifest(context.Background(), memoryRange(bad), ManifestReaderOptions{}); err == nil {
-		t.Fatal("bad manifest hash accepted")
+		t.Fatal("bad metadata checksum accepted")
 	}
 }
 

@@ -19,10 +19,10 @@ type ReadRequest struct {
 }
 
 // ReadReport describes selected content only. Successful reads always
-// authenticate metadata and check archive data-frame checksums; they never
+// validate metadata and check archive data-frame checksums; they never
 // establish that unread tar headers, pointer JSON or end markers are valid.
 type ReadReport struct {
-	MetadataAuthenticated        bool     `json:"metadata_authenticated"`
+	MetadataValidated            bool     `json:"metadata_validated"`
 	FullArchiveValidated         bool     `json:"full_archive_validated"`
 	DataFramesChecked            []uint64 `json:"data_frames_checked"`
 	ExternalObjectsSHA256Checked []string `json:"external_objects_sha256_checked"`
@@ -179,7 +179,7 @@ func (m *manifest) readRanges(ctx context.Context, requests []readSelection, res
 
 	var report ReadReport
 	if wantReport {
-		report.MetadataAuthenticated = true
+		report.MetadataValidated = true
 		report.DataFramesChecked = []uint64{}
 		report.ExternalObjectsSHA256Checked, report.ExternalObjectsUnchecked = []string{}, []string{}
 		for _, job := range jobs {

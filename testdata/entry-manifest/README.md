@@ -26,14 +26,19 @@ include checksums and tar streams have exactly two terminal zero records.
 
 Checksum-mismatch cases for metadata, archive data, and external objects require
 `integrity-failure`. Missing checksums and malformed frame encodings retain their
-structural failure categories. Valid checksummed and checksum-optional metadata
-and object fixtures exercise the corresponding positive paths across all SDKs.
+structural failure categories. Metadata checksums are mandatory; checksum-free metadata fixtures are rejected.
+External-object checksums remain optional. Archives use the 28-byte `Z*01`
+footer; fixture SHA-256 values identify the complete encoded fixture files.
 
 Manifest headers use `requires`. The empty and thin archives cover empty and
-nonempty declarations; `invalid/missing-requires.zstar` omits the field. The
-`legacy-required-features` cases reject the obsolete key both alone and alongside
-`requires`.
+nonempty declarations; `invalid/missing-requires.zstar` omits the field.
+Unknown header fields are rejected.
 
 Pointer fixtures cover malformed fields, manifest agreement, JSON whitespace
 without a final newline, and rejection of non-JSON and empty payloads.
 Empty-payload cases exercise metadata, selective-read, and full validation scopes.
+
+Footer cases cover signature and payload errors, zero and inconsistent lengths,
+checked subtraction, truncation, and trailing bytes.
+Concatenated archives are rejected by full validation; metadata-only validation
+does not establish the validity of the preceding data region.

@@ -30,7 +30,7 @@ func metadataArchive(t *testing.T) ([]byte, zstar.Footer) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	footer, err := zstar.ParseFooter(out.Bytes()[out.Len()-80:])
+	footer, err := zstar.ParseFooter(out.Bytes()[out.Len()-zstar.FooterSize:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestUploadCompletedArchivesAddsMetadataAndPreservesCallerOptions(t *testing
 	if client.metadata["owner"] != "example" {
 		t.Fatal("empty PUT lost metadata")
 	}
-	if _, err := ArchiveMetadata(footer, uint64(len(data))+1); err == nil {
+	if _, err := ArchiveMetadata(footer, footer.ManifestEncodedSize+zstar.FooterSize); err == nil {
 		t.Fatal("invalid coverage accepted")
 	}
 }
@@ -169,15 +169,14 @@ func TestManifestHintsSaveRequestAndFallBackSafely(t *testing.T) {
 		metadata map[string]string
 		gets     int
 	}{
-		"present":              {good, 1},
-		"position-only":        {map[string]string{ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 1},
-		"absent":               {nil, 2},
-		"malformed":            {map[string]string{ManifestPositionMetadataKey: "+1:10"}, 2},
-		"overflow":             {map[string]string{ManifestPositionMetadataKey: "1:18446744073709551616"}, 2},
-		"bounds":               {map[string]string{ManifestPositionMetadataKey: "0:1"}, 2},
-		"unknown-version":      {map[string]string{VersionMetadataKey: "2", ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 2},
-		"stale":                {map[string]string{ManifestPositionMetadataKey: fmt.Sprintf("%d:%d", footer.ManifestOffset-1, footer.ManifestEncodedSize+1)}, 3},
-		"informational-digest": {map[string]string{ManifestPositionMetadataKey: good[ManifestPositionMetadataKey], ManifestSHA256MetadataKey: "bad"}, 1},
+		"present":         {good, 1},
+		"position-only":   {map[string]string{ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 1},
+		"absent":          {nil, 2},
+		"malformed":       {map[string]string{ManifestPositionMetadataKey: "+1:10"}, 2},
+		"overflow":        {map[string]string{ManifestPositionMetadataKey: "1:18446744073709551616"}, 2},
+		"bounds":          {map[string]string{ManifestPositionMetadataKey: "0:1"}, 2},
+		"unknown-version": {map[string]string{VersionMetadataKey: "2", ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 2},
+		"stale":           {map[string]string{ManifestPositionMetadataKey: fmt.Sprintf("%d:%d", uint64(len(data))-zstar.FooterSize-footer.ManifestEncodedSize-1, footer.ManifestEncodedSize+1)}, 3},
 	} {
 		t.Run(name, func(t *testing.T) {
 			client := &hintedClient{data: data, metadata: test.metadata}
@@ -205,7 +204,7 @@ func TestManifestHintsSaveRequestAndFallBackSafely(t *testing.T) {
 		t.Fatal("over-budget hint fetched")
 	}
 	corrupt := bytes.Clone(data)
-	corrupt[len(corrupt)-1] ^= 1
+	corrupt[len(corrupt)-zstar.FooterSize-1] ^= 1
 	client = &hintedClient{data: corrupt, metadata: good}
 	if _, err := zstar.Open(context.Background(), NewSource(client, "bucket", "key")); zstar.ErrorCategory(err) != zstar.CategoryIntegrityFailure {
 		t.Fatal(err)

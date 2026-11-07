@@ -35,7 +35,7 @@ type UploadOptions struct {
 	ContentType  string
 	CacheControl string
 	// Metadata is copied into the upload. Completed ReaderAt/Seeker archives
-	// automatically replace the three reserved zstar keys with footer values.
+	// automatically replace the two reserved zstar keys with footer values.
 	Metadata    map[string]string
 	PartSize    int // zero selects 8 MiB; [5 MiB,64 MiB]
 	Concurrency int // zero selects four; [1,32]

@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // endregion configure
 
     // region upload
-    let mut builder = Builder::new(Vec::new());
+    let mut builder = Builder::try_new(Vec::new()).await?;
     builder
         .append_bytes("example.txt", b"Hello from Zstar\n")
         .await?;

@@ -5,7 +5,7 @@ use zstar::{Archive, Builder, Header, VerificationScope};
 
 #[tokio::main]
 async fn main() -> zstar::Result<()> {
-    let mut builder = Builder::new(Vec::new());
+    let mut builder = Builder::try_new(Vec::new()).await?;
     builder
         .append_data(Header::file("hello.txt", 5), b"hello".as_slice())
         .await?;

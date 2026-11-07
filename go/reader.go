@@ -7,7 +7,7 @@ import (
 )
 
 // ReaderOptions controls bounded metadata/content storage and external hashes.
-// Metadata is always authenticated and archive data checksums are mandatory.
+// Metadata is always validated and archive data checksums are mandatory.
 type ReaderOptions struct {
 	// Manifest controls metadata storage and content resource budgets.
 	Manifest ManifestReaderOptions
@@ -17,7 +17,7 @@ type ReaderOptions struct {
 	VerifyExternalHash bool
 }
 
-// Reader owns authenticated sorted entries and bounded read state.
+// Reader owns validated sorted entries and bounded read state.
 // Metadata spools are released after open; retained entries use O(N) memory.
 // Close releases entries and cancels loads, without closing source.
 // Sources and resolvers must support concurrent calls and stay immutable.
@@ -35,14 +35,14 @@ func (r *readerResolver) GetEncoded(ctx context.Context, address [32]byte, hint,
 	return r.inner.GetEncoded(ctx, address, hint, maxBytes)
 }
 
-// Open authenticates an archive using default resource budgets. The caller
+// Open validates an archive using default resource budgets. The caller
 // owns the immutable, concurrently readable source. Close the returned reader
 // to release SDK resources. ctx applies only to the opening operation.
 func Open(ctx context.Context, source RangeReader) (*Reader, error) {
 	return OpenWithOptions(ctx, source, ReaderOptions{})
 }
 
-// OpenWithOptions authenticates an archive using options. The caller owns
+// OpenWithOptions validates an archive using options. The caller owns
 // the source and resolver. Sources and resolvers must support
 // concurrent calls. ctx applies only to opening, not subsequent reads.
 func OpenWithOptions(ctx context.Context, source RangeReader, options ReaderOptions) (*Reader, error) {
@@ -68,7 +68,7 @@ func (r *Reader) Entry(path string) (*Entry, error) { return r.manifest.Entry(pa
 // EntryCount returns the member count without listing entries.
 func (r *Reader) EntryCount() uint64 { return r.manifest.EntryCount() }
 
-// RootExtensions returns an owned copy of authenticated root metadata.
+// RootExtensions returns an owned copy of validated root metadata.
 func (r *Reader) RootExtensions() Extensions { return r.manifest.RootExtensions() }
 
 // Entries yields owned entries whose paths begin with prefix, in path order.

@@ -150,7 +150,7 @@ Each representation MUST satisfy the [core frame
 requirements](core.md#zstandard-frame-requirements) for independent Zstandard
 sources, including framing, dictionary, reserved-bit, content-size, and
 resource-budget rules. Its checksum is optional, but MUST be valid when
-present. Unlike archive data frames, external representations do not require
+present. Unlike archive data and metadata frames, external representations do not require
 checksums.
 
 ## External identity and verification
@@ -197,7 +197,7 @@ supported classes:
 | External resolver/reconstructor | Supply or consume complete bounded encoded objects, validate selected raw objects, and reconstruct selections in order under the selected hash policy. |
 | External-closure validator | Perform full archive validation and resolve every external selection. |
 
-A zero-length valid file read fetches no objects but still authenticates and
+A zero-length valid file read fetches no objects but still checksum-checks and
 validates the complete manifest. External-closure validation with SHA-256
 verification disabled still checks framing and bounds, but MUST NOT claim a
 verified closure. Full archive validation does not establish external
@@ -290,7 +290,7 @@ bytes, and encoded-size hints are advisory.
 
 For an archive stored as an object, object bytes are the complete `.tar.zst`
 file. Changing internal compression changes its address. The archive footer
-hashes decoded manifest metadata, not the complete archive.
+stores metadata lengths and no cryptographic digest.
 
 ### Lookup and verification
 

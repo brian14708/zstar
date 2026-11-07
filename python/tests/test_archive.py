@@ -436,7 +436,7 @@ def test_raw_s3_requires_explicit_configuration(monkeypatch):
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
     # Exercise more than one native batch and multiple extents without fetching
-    # external objects. Ordinary iteration authenticates extensions without projecting them.
+    # external objects. Ordinary iteration validates extensions without projecting them.
     output = io.BytesIO()
     expected_names = [f"f{i:04}" for i in range(130)] + ["link"]
     extents = ((2, "sha256:" + "01" * 32, 10), (3, "sha256:" + "02" * 32, 12))

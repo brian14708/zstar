@@ -3,6 +3,11 @@
 Read and write indexed `.tar.zst` archives with async Rust.
 Implements the Zstar core specification and its optional external-content extension.
 
+Archives use the compact 28-byte `Z*01` footer with 64-bit metadata lengths.
+Metadata and archive data frames require Zstandard checksums; opening validates
+the complete manifest.
+`ReadReport::metadata_validated` reports checksum and schema validation, not cryptographic authentication.
+
 [Rust API reference](https://docs.rs/zstar/latest/zstar/)
 
 ```toml
@@ -15,8 +20,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 ## Get started
 
-Use `Archive` to read and `Builder` to write; `Builder::finish` finalizes the
-archive. Default features include async I/O and temporary-file spooling.
+Use `Archive` to read and `Builder::try_new(sink).await?` to initialize a writer.
+Use `Builder::try_with_options` for custom options; initialization requires Tokio
+and returns configuration or storage errors immediately. `Builder::finish`
+finalizes the archive. Default features include async I/O and temporary-file spooling.
 Enable `fs`, `http`, or `s3` for storage adapters.
 
 Follow [your first archive](https://brian14708.github.io/zstar/tutorials/rust/first-archive/)

@@ -150,7 +150,7 @@ byte prefix. Results are owned snapshots; changing them does not change the arch
 `read_link()` returns a symlink's exact stored target, and
 `read_range(name, start, end)` reads a half-open member range.
 
-Opening completes metadata authentication and validation; use `verify()` for
+Opening completes metadata validation and validation; use `verify()` for
 physical archive or external-closure validation (`verify(external=True)`).
 External SHA-256 checking defaults to disabled; pass `verify_external=True` when
 opening to enable it. Metadata hashes, frame checksums, and extent bounds always

@@ -38,7 +38,7 @@ def test_async_iteration_reads_reports_verification_and_close(ranged, inline_dat
             assert await archive.read("a-b", 1, 4) == b"ello"
             payload, report = await archive.read_with_report("a-b", 0, 5)
             assert payload == b"hello"
-            assert report["metadata_authenticated"] and report["data_frames_checked"]
+            assert report["metadata_validated"] and report["data_frames_checked"]
             await archive.verify()
 
             pending = archive.members()
@@ -55,7 +55,7 @@ def test_async_iteration_reads_reports_verification_and_close(ranged, inline_dat
     asyncio.run(exercise())
 
 
-def test_async_open_authenticates_metadata_and_verify_checks_unread_content(corpus_dir):
+def test_async_open_validates_metadata_and_verify_checks_unread_content(corpus_dir):
     data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
 
     async def exercise():

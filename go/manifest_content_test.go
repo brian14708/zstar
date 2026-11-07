@@ -165,7 +165,7 @@ func TestManifestBatchGroupingBoundsAndFileStreams(t *testing.T) {
 	resolver := &manifestGatedObject{data: encodedFixture(t, "objects/4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92.zst")}
 	requests := []ReadRequest{{"world.txt", 0, 6}, {"repeat", 0, 12}, {"hello.txt", 0, 6}}
 	empty, report, err := m.ReadManyWithReport(ctx, []ReadRequest{{"repeat", 12, 0}, {"hello.txt", 0, 0}}, nil, true)
-	if err != nil || len(empty) != 2 || len(empty[0]) != 0 || len(empty[1]) != 0 || !report.MetadataAuthenticated || resolver.calls.Load() != 0 {
+	if err != nil || len(empty) != 2 || len(empty[0]) != 0 || len(empty[1]) != 0 || !report.MetadataValidated || resolver.calls.Load() != 0 {
 		t.Fatalf("zero-length batch: %q %#v %v", empty, report, err)
 	}
 	got, report, err := m.ReadManyWithReport(ctx, requests, resolver, true)

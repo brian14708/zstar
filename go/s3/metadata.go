@@ -2,7 +2,6 @@ package s3
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -15,21 +14,18 @@ const (
 	VersionMetadataKey = "zstar-version"
 	// ManifestPositionMetadataKey contains decimal offset:encoded_size, including segment headers.
 	ManifestPositionMetadataKey = "zstar-manifest-position"
-	// ManifestSHA256MetadataKey contains the decoded manifest SHA-256 as lowercase hex.
-	ManifestSHA256MetadataKey = "zstar-manifest-sha256"
 )
 
 // ArchiveMetadata creates S3 user metadata from a completed archive's footer.
-// It checks physical coverage; readers still authenticate the manifest itself.
+// It checks physical coverage; readers still validate the complete manifest.
 func ArchiveMetadata(footer zstar.Footer, objectSize uint64) (map[string]string, error) {
-	if objectSize < 80 || footer.ManifestOffset == 0 || footer.ManifestOffset > objectSize-80 ||
-		footer.ManifestEncodedSize <= 8 || footer.ManifestEncodedSize != objectSize-80-footer.ManifestOffset || footer.ManifestDecodedSize == 0 {
-		return nil, errors.New("zstar s3: invalid archive footer coverage")
+	offset, _, err := footer.ManifestRange(objectSize)
+	if err != nil {
+		return nil, err
 	}
 	return map[string]string{
 		VersionMetadataKey:          "1",
-		ManifestPositionMetadataKey: strconv.FormatUint(footer.ManifestOffset, 10) + ":" + strconv.FormatUint(footer.ManifestEncodedSize, 10),
-		ManifestSHA256MetadataKey:   fmt.Sprintf("%x", footer.ManifestSHA256),
+		ManifestPositionMetadataKey: strconv.FormatUint(offset, 10) + ":" + strconv.FormatUint(footer.ManifestEncodedSize, 10),
 	}, nil
 }
 
@@ -78,11 +74,11 @@ func inputArchiveMetadata(input io.Reader) (map[string]string, error) {
 	if _, err := source.Seek(start, io.SeekStart); err != nil {
 		return nil, err
 	}
-	if seekErr != nil || end < start || end-start < 80 {
+	if seekErr != nil || end < start || end-start < zstar.FooterSize {
 		return nil, nil //nolint:nilerr // A restored but unsized source can still be uploaded as a stream.
 	}
-	var raw [80]byte
-	n, readErr := source.ReadAt(raw[:], end-80)
+	var raw [zstar.FooterSize]byte
+	n, readErr := source.ReadAt(raw[:], end-zstar.FooterSize)
 	if n != len(raw) {
 		if readErr != nil {
 			return nil, readErr

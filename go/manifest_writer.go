@@ -3,10 +3,8 @@ package zstar
 import (
 	"bytes"
 	"cmp"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"hash"
 	"io"
 	"math"
 	"slices"
@@ -23,7 +21,6 @@ type manifestWriter struct {
 	encoder                         *zstd.Encoder
 	encodedBuffer                   []byte
 	start, position, decoded, count uint64
-	hash                            hash.Hash
 	options                         manifestOptions
 	entries                         manifestSpool
 	external                        bool
@@ -55,7 +52,7 @@ func newManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOp
 	if err != nil {
 		return nil, err
 	}
-	return &manifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, hash: sha256.New(), options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
+	return &manifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
 }
 
 // AddEntry snapshots and spools one entry. Paths may arrive in any order.
@@ -142,7 +139,6 @@ func (w *manifestWriter) writeSegment(raw []byte) error {
 	if err := writeExact(w.output, encoded); err != nil {
 		return err
 	}
-	_, _ = w.hash.Write(raw)
 	w.position += size
 	w.decoded += uint64(len(raw))
 	return nil
@@ -287,15 +283,12 @@ func (w *manifestWriter) Close() (err error) {
 	if err = w.writeDocument(); err != nil {
 		return err
 	}
-	footer := make([]byte, 80)
+	footer := make([]byte, FooterSize)
 	binary.LittleEndian.PutUint32(footer, 0x184D2A5F)
-	binary.LittleEndian.PutUint32(footer[4:], 72)
-	copy(footer[8:], "ZSTAR001")
-	binary.LittleEndian.PutUint32(footer[16:], 1)
-	binary.LittleEndian.PutUint64(footer[24:], w.start)
-	binary.LittleEndian.PutUint64(footer[32:], w.position-w.start)
-	binary.LittleEndian.PutUint64(footer[40:], w.decoded)
-	copy(footer[48:], w.hash.Sum(nil))
+	binary.LittleEndian.PutUint32(footer[4:], 20)
+	binary.LittleEndian.PutUint64(footer[8:], w.position-w.start)
+	binary.LittleEndian.PutUint64(footer[16:], w.decoded)
+	copy(footer[24:], "Z*01")
 	return writeExact(w.output, footer)
 }
 

@@ -39,7 +39,7 @@ and extents during reads.
 | External SHA-256 opt-in | `verify_external` | `VerifyExternalHash` | `verify_external` |
 | Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
 
-External SHA-256 checking defaults to disabled. Metadata digests, frame
+External SHA-256 checking defaults to disabled. Metadata validation, frame
 checksums, and extent bounds are always checked. Selective reads do not
 establish full physical validity, and these checks establish consistency rather
 than publisher authenticity. See each SDK's configuration guide for resource

@@ -47,7 +47,7 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
         blobs.get_encoded(digest, extent.encoded_size, 1).await,
         Err(Error::Budget(_))
     ));
-    let mut writer = Builder::new(Vec::new());
+    let mut writer = Builder::try_new(Vec::new()).await.unwrap();
     let mut entry = zstar::Entry::file("remote");
     entry.extents = vec![extent];
     entry.extents[0].encoded_size = 1;

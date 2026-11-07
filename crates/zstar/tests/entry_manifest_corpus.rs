@@ -255,7 +255,7 @@ mod asynchronous {
                         offset..offset.checked_add(length).ok_or(Error::Range)?,
                     )
                     .await?;
-                assert!(report.metadata_authenticated);
+                assert!(report.metadata_validated);
                 assert!(!report.full_archive_validated);
                 assert_eq!(
                     actual.as_ref(),

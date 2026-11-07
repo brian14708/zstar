@@ -24,7 +24,7 @@ Implementations declare which conformance classes they support:
 | Class | Minimum behavior |
 | --- | --- |
 | Portable writer | Emit a conformant archive with only archive-backed file extents. |
-| Metadata reader / full metadata validator | Authenticate all decoded metadata, validate the complete deterministic CBOR sequence, schema, namespace and required features. |
+| Metadata reader / full metadata validator | Check all metadata frame checksums and validate the complete deterministic CBOR sequence, schema, namespace and required features. |
 | Selective reader | Perform metadata-reader checks and validate each selected complete source and extent before returning its requested bytes. |
 | Full archive validator | Perform full metadata validation and validate every physical frame, tar member, payload mapping and end record, plus declared extension checks. |
 | Filesystem capturer/restorer | Follow the normative [filesystem profile](#filesystem-capture-and-restoration-profile), in addition to the applicable writer/reader classes. |
@@ -57,7 +57,7 @@ Byte positions use three coordinates:
 
 | Coordinate | Origin and use |
 | --- | --- |
-| Encoded archive position | Byte zero of the archive; footer manifest offsets and integer extent sources use this coordinate. |
+| Encoded archive position | Byte zero of the archive; derived manifest offsets and integer extent sources use this coordinate. |
 | Decoded tar position | Byte zero of the concatenated data-frame output; member headers, payloads and physical coverage use this coordinate. |
 | Decoded source selection | Byte zero of one complete decoded frame or object; an extent's optional `offset` uses this coordinate. |
 
@@ -74,7 +74,7 @@ The result MUST fit the address space and format limits.
 ```text
 [independent Zstandard data frames encoding one tar stream]
 [metadata skippable frames containing segments of a compressed CBOR sequence]
-[80-byte terminal skippable-frame footer]
+[28-byte terminal skippable-frame footer]
 ```
 
 Data frames occupy every byte before the metadata region. The metadata region
@@ -98,8 +98,8 @@ and host address-space limitations are implementation limitations, not wire
 maxima. Metadata payload lengths must additionally fit their uint32 wrapper
 field.
 
-Data frames require checksums. Metadata checksums and all content-size fields
-are optional; when present they MUST be valid. A declared content size MUST
+Data and metadata frames require checksums. All content-size fields are
+optional; when present they MUST be valid. A declared content size MUST
 equal the actual decoded length. Every frame MUST use standard magic
 `0xFD2FB528` and RFC 8878 reserved-bit, block, and frame encodings. The
 Frame_Header_Descriptor reserved bit (bit 3) MUST be zero. Readers MUST ignore
@@ -115,25 +115,22 @@ encoding those 1024 zero bytes.
 
 #### Footer
 
-The footer is exactly 80 bytes. Integer fields are unsigned little-endian;
-offsets are absolute encoded archive positions.
+The footer is exactly 28 bytes and ends at EOF. Integer fields are unsigned
+little-endian. Its terminal signature identifies this core wire layout.
 
 | Offset | Bytes | Value |
 | --- | --- | --- |
 | 0 | 4 | Skippable magic `0x184D2A5F` |
-| 4 | 4 | Payload length: 72 |
-| 8 | 8 | ASCII `ZSTAR001` |
-| 16 | 4 | Profile version: 1 |
-| 20 | 4 | Reserved: zero |
-| 24 | 8 | Start of the manifest region |
-| 32 | 8 | Total encoded manifest region length, including every wrapper |
-| 40 | 8 | Sum of decoded CBOR segment lengths |
-| 48 | 32 | SHA-256 of concatenated decoded CBOR segment bytes, in physical order |
+| 4 | 4 | Payload length: 20 |
+| 8 | 8 | Total encoded manifest region length, including every wrapper |
+| 16 | 8 | Sum of decoded CBOR segment lengths |
+| 24 | 4 | ASCII `Z*01` (literal bytes `5A 2A 30 31`) |
 
-For archive length `N`, manifest offset `T`, and region length `L`, require `N
->= 80`, `T > 0`, `L > 8`, and `T + L = N - 80`, using checked arithmetic.
-Reject incorrect magic, reserved values, versions, or digests, and any
-inconsistent fields or bounds.
+For archive length `N` and encoded manifest length `L`, derive manifest start
+`T = N - 28 - L` using checked subtraction. Require `N >= 28`, `T > 0`,
+`L > 8`, and a nonzero declared decoded length. Reject incorrect magic,
+payload length, signature, inconsistent lengths, or bounds. Trailing bytes
+and concatenated archives are invalid.
 
 #### Metadata region
 
@@ -142,8 +139,8 @@ header followed immediately by one Zstandard payload. Its header fields are
 little-endian uint32: magic `0x184D2A5E` and the encoded payload length.
 
 Apply local aggregate and per-frame budgets before fetching. Each segment must
-fit its uint32 wrapper length. Decode and hash all segments in physical order,
-checking the aggregate decoded length and SHA-256 against the footer before
+fit its uint32 wrapper length. Decode and checksum-validate all segments in physical order,
+checking the aggregate decoded length against the footer before
 using the manifest. The decoded sequence follows the [manifest
 rules](#entry-oriented-manifest).
 
@@ -260,7 +257,7 @@ UTF-8 path bytes across the entire sequence; physical tar order may differ. The
 sequence has no enclosing array, entry count, end marker, pages, page
 references, or global frame or object tables. Readers derive the entry count
 and may build a lookup index while parsing, but MUST NOT use it until the
-complete sequence is authenticated and validated.
+complete sequence is checksum-checked and validated.
 
 Each [metadata wrapper](#metadata-region) contains a frame that decodes to a
 nonempty sequence segment. Segment boundaries MAY split any item, including its
@@ -269,8 +266,9 @@ malformed or truncated items, a missing or repeated header, enclosing arrays,
 scalars in place of entries, and trailing items or bytes that do not form valid
 entry tuples.
 
-The footer's decoded length and SHA-256 cover all decoded segments concatenated
-in physical order; there are no per-segment hashes. Readers MUST authenticate
+The footer's decoded length covers all decoded segments concatenated in physical
+order. Each metadata frame has a mandatory Zstandard checksum; there is no
+aggregate checksum or cryptographic digest. Readers MUST check every checksum
 and validate the entire sequence before indexed reads. Aggregate metadata and
 parser limits are local policy. The wrapper length does not bound the decoded
 sequence or individual items.
@@ -296,7 +294,7 @@ rejection. The schema and metadata wrapper length requirements still apply.
 
 The header requires `version` and `requires`. Version is 1. Only `x-`
 extension fields may be added. Entry count is derived from the subsequent
-tuples; `entries`, `entry_count`, `index`, and root wrappers are forbidden. See
+tuples. See
 [Extensions and versions](#extensions-and-versions) for extension rules.
 
 The [lexical grammar](#lexical-grammar) defines `required-feature`. A name is
@@ -421,7 +419,7 @@ core semantics require a new version/profile.
 ### Validation and selective reads
 
 Metadata readers MUST validate footer structure and bounds, the complete
-manifest decoded length and hash, deterministic CBOR, sequence schema, the
+manifest decoded length and frame checksums, deterministic CBOR, sequence schema, the
 complete namespace, global ordering, and required-feature agreement before
 using indexed ranges. Selective readers MUST also validate selected source
 frames and extent bounds. Implementations MUST reject unsupported versions,
@@ -448,7 +446,7 @@ For a file request `(offset, length)`, compute logical size by checked extent
 summation. Both request values must fit uint64, with `offset <= logical_size`
 and `length <= logical_size - offset`. Reject out-of-range requests rather than
 truncating them. A valid zero-length request fetches no content, including at
-EOF, but still requires footer and complete-manifest hash validation.
+EOF, but still requires footer and complete-manifest checksum and schema validation.
 
 Use cumulative extent sizes to locate only sources intersecting the request.
 Decode each complete fetched source under its source-kind rules. Check each
@@ -469,10 +467,10 @@ and is not a separate manifest entry.
 
 #### Verification claims
 
-Footer and manifest digest checks and codec checks cannot be disabled.
-Extensions define verification of their external dependencies. Digests establish
-internal consistency, not authenticity. The core archive stores no digest of its
-complete encoded bytes.
+Footer validation, complete manifest validation, and required codec checksum
+checks cannot be disabled. Extensions define verification of their external
+dependencies. Checksums detect corruption, not authenticity. The core archive
+stores no cryptographic digest of its metadata or complete encoded bytes.
 
 ### Failure classes
 
@@ -484,7 +482,7 @@ names. Violating a wire limit makes input malformed; exceeding a lower local
 budget may reject valid input. A hash or checksum mismatch is an integrity
 failure when distinguishable from a codec structure error.
 
-Recognition, metadata authentication, and required-feature checks precede
+Recognition, metadata validation, and required-feature checks precede
 indexed use. Complete source validation precedes returning selected bytes. For
 independent defects, an operation may report any applicable failure unless a
 dependency requires another check first.
@@ -610,11 +608,13 @@ consuming untrusted input. A one-byte selection may require a whole source.
 Selective validation leaves unread tar data unchecked; only full validation
 establishes original frame boundaries and physical membership.
 
-Metadata hashes and data checksums establish consistency, not publisher
-authenticity: replacing both can produce another valid archive. Inline bytes have
-codec checksums, not a cryptographic manifest binding. The external-content
-extension defines content-address verification for external objects. Core archive
-digests do not cover the complete encoded archive.
+Metadata and data checksums detect corruption, not publisher authenticity.
+Per-frame checksums do not bind the aggregate metadata segment sequence and
+do not prevent replacement or reordering of intact frames. Length and schema
+checks do not replace an aggregate integrity check. Inline bytes have codec
+checksums, not a cryptographic manifest binding. The external-content
+extension defines content-address verification for external objects. Core
+archives contain no cryptographic digest of the complete encoded archive.
 
 Archive replacement MUST follow the snapshot contract. Follow the [filesystem
 profile](#filesystem-capture-and-restoration-profile) against traversal,

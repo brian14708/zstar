@@ -954,7 +954,7 @@ pub(crate) fn entry_allocation(entry: &Entry) -> usize {
 mod tests {
     use super::*;
     #[test]
-    fn document_rejects_legacy_missing_fields_and_trailing_items() {
+    fn document_rejects_missing_unknown_fields_and_trailing_items() {
         let empty = Value::Map(vec![
             (Value::Text("version".into()), Value::Integer(1.into())),
             (Value::Text("requires".into()), Value::Array(vec![])),
@@ -975,10 +975,8 @@ mod tests {
                 decode_document(&crate::cbor::encode(&Value::Map(missing)).unwrap(), 1).is_err()
             );
         }
-        fields.push((Value::Text("entry_count".into()), Value::Integer(0.into())));
+        fields.push((Value::Text("unexpected".into()), Value::Integer(0.into())));
         assert!(decode_document(&crate::cbor::encode(&Value::Map(fields)).unwrap(), 1).is_err());
-        let legacy = Value::Map(vec![(Value::Text("root".into()), Value::Map(vec![]))]);
-        assert!(decode_document(&crate::cbor::encode(&legacy).unwrap(), 1).is_err());
     }
     #[test]
     fn external_reference_and_pointer_sizes_fit_uint64() {

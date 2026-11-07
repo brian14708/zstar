@@ -99,7 +99,7 @@ fn ranged(request: &str, data: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn presigned_get_opens_archive_without_head_and_reloads_content() {
-    let mut writer = Builder::new(Vec::new());
+    let mut writer = Builder::try_new(Vec::new()).await.unwrap();
     writer.append_bytes("hello", b"hello world").await.unwrap();
     let data = writer.finish().await.unwrap();
     let server = server(move |request| ranged(request, &data)).await;

@@ -611,7 +611,6 @@ impl<R: RangeReader> BlockingArchive<R> {
         manifest: std::sync::Arc<ManifestReader>,
         data_end: u64,
         options: ManifestOptions,
-        _metadata: [u8; 32],
     ) -> Self {
         Self {
             source,
@@ -623,15 +622,16 @@ impl<R: RangeReader> BlockingArchive<R> {
 
     pub fn open(mut source: R, options: ManifestOptions) -> Result<Self> {
         let len = source.len();
-        if len < 80 {
+        if len < crate::FOOTER_SIZE as u64 {
             return Err(Error::NotZstar);
         }
-        let footer = crate::parse_footer(&source.read_range(len - 80..len)?)?;
+        let footer =
+            crate::parse_footer(&source.read_range(len - crate::FOOTER_SIZE as u64..len)?)?;
         let manifest = ManifestReader::open(&mut source, &footer, options.clone())?;
         Ok(Self {
             source,
             manifest: std::sync::Arc::new(manifest),
-            data_end: footer.toc_offset,
+            data_end: footer.metadata_range(len)?.start,
             options,
         })
     }

@@ -94,7 +94,7 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 					defer testClose(t, m)
 					switch test.Operation {
 					case "metadata":
-						// Opening has already authenticated and validated metadata.
+						// Opening has already validated metadata.
 					case "full-archive", "external-closure":
 						scope := VerifyArchive
 						if test.Operation == "external-closure" {
@@ -113,7 +113,7 @@ func TestEntryManifestCorpusOperations(t *testing.T) {
 							if !bytes.Equal(got, artifact(t, test.RangeResult)) {
 								t.Fatal("range bytes mismatch")
 							}
-							if !selective.MetadataAuthenticated || selective.FullArchiveValidated {
+							if !selective.MetadataValidated || selective.FullArchiveValidated {
 								t.Fatal("selective verification scope")
 							}
 							if test.Operation == "external-range" && verify && len(selective.ExternalObjectsSHA256Checked) != 1 {

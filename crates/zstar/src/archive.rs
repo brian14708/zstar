@@ -89,8 +89,8 @@ pub enum VerificationScope {
 /// Checks completed by a selective read; does not certify the whole archive.
 #[derive(Clone, Debug, Default)]
 pub struct ReadReport {
-    /// Whether manifest authentication completed.
-    pub metadata_authenticated: bool,
+    /// Whether manifest validation completed.
+    pub metadata_validated: bool,
     /// Selective reads do not claim physical tar validation.
     pub full_archive_validated: bool,
     /// Encoded offsets of the data frames checked.
@@ -223,7 +223,7 @@ impl<R: AsyncRangeReader + ?Sized> crate::RangeReader for VerificationSource<R> 
 
 /// An indexed archive backed by an immutable [`AsyncRangeReader`].
 ///
-/// Opening authenticates the complete manifest and retains a sorted index in
+/// Opening validates the complete manifest and retains a sorted index in
 /// O(N) memory. Clones share the source, index, and concurrency limits.
 /// Selected content is validated before it is returned. Use [`Self::verify`]
 /// to check the physical archive or its external-object closure.
@@ -249,7 +249,6 @@ pub struct Archive<R: AsyncRangeReader + ?Sized> {
     semaphore: Arc<Semaphore>,
     metadata_semaphore: Arc<Semaphore>,
     flights: Arc<Flights>,
-    metadata_digest: [u8; 32],
     data_end: u64,
 }
 impl Archive<Bytes> {
@@ -271,7 +270,6 @@ impl<R: AsyncRangeReader + ?Sized> Clone for Archive<R> {
             semaphore: self.semaphore.clone(),
             metadata_semaphore: self.metadata_semaphore.clone(),
             flights: self.flights.clone(),
-            metadata_digest: self.metadata_digest,
             data_end: self.data_end,
         }
     }
@@ -288,7 +286,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub(crate) fn resolver(&self) -> Option<&dyn ObjectResolver> {
         self.options.resolver.as_deref()
     }
-    /// Returns the number of entries in the authenticated manifest.
+    /// Returns the number of entries in the validated manifest.
     #[must_use]
     pub fn entry_count(&self) -> u64 {
         self.manifest.root().entry_count
@@ -455,7 +453,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let manifest = self.manifest.clone();
         let options = self.options.manifest_options();
         let data_end = self.data_end;
-        let digest = self.metadata_digest;
         let permit = self
             .semaphore
             .clone()
@@ -464,10 +461,8 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .map_err(|_| Error::Unsupported("reader closed"))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            crate::backend::BlockingArchive::from_manifest(
-                source, manifest, data_end, options, digest,
-            )
-            .validate()
+            crate::backend::BlockingArchive::from_manifest(source, manifest, data_end, options)
+                .validate()
         })
         .await
         .map_err(worker_error)??;
@@ -500,7 +495,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    /// Opens and authenticates an immutable source using the supplied policies.
+    /// Opens and validates an immutable source using the supplied policies.
     pub async fn open_with_options(source: Arc<R>, options: ReaderOptions) -> Result<Self> {
         if !(1..=1024).contains(&options.concurrent_chunks) {
             return Err(Error::Budget("invalid content concurrency"));
@@ -512,7 +507,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let mut prefetched = None;
         if let Some(hint) = source.manifest_range().await?
             && hint.start > 0
-            && hint.end == size - 80
+            && hint.end == size - crate::FOOTER_SIZE as u64
             && hint.start < hint.end
             && hint.end - hint.start > 8
             && hint.end - hint.start <= options.metadata.max_encoded_bytes
@@ -525,7 +520,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             }
             let end = bytes.len() - crate::FOOTER_SIZE;
             if let Ok(footer) = crate::parse_footer(&bytes[end..])
-                && footer.toc_offset == hint.start
+                && footer.metadata_range(size).is_ok_and(|range| range == hint)
                 && footer.toc_encoded_len == hint.end - hint.start
             {
                 prefetched = Some((footer, bytes.slice(..end)));
@@ -534,22 +529,22 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let (footer, buffer) = match prefetched {
             Some(result) => result,
             None => (
-                crate::parse_footer(&source.read_range(size - 80..size).await?)?,
+                crate::parse_footer(
+                    &source
+                        .read_range(size - crate::FOOTER_SIZE as u64..size)
+                        .await?,
+                )?,
                 Bytes::new(),
             ),
         };
-        let metadata_end = footer
-            .toc_offset
-            .checked_add(footer.toc_encoded_len)
-            .ok_or(Error::MalformedFooter("manifest coverage"))?;
+        let metadata_range = footer.metadata_range(size)?;
         let mut ranges = MetadataSource {
             source: source.as_ref(),
-            end: metadata_end,
-            start: footer.toc_offset,
+            end: metadata_range.end,
+            start: metadata_range.start,
             buffer,
         };
-        let metadata_digest = footer.toc_sha256;
-        let data_end = footer.toc_offset;
+        let data_end = metadata_range.start;
         let mut ingest = ManifestIngest::new(footer, size, Spool::new(options.manifest_options()))?;
         while !ingest.complete() {
             let at = ingest.position();
@@ -575,7 +570,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             metadata_semaphore: Arc::new(Semaphore::new(2)),
             flights: Arc::new(Mutex::new(HashMap::new())),
             options,
-            metadata_digest,
             data_end,
         })
     }
@@ -793,7 +787,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         })
         .await
     }
-    // Handles already own authenticated metadata; do not look up their paths
+    // Handles already own validated metadata; do not look up their paths
     // again when a logical selection crosses extent boundaries.
     pub(crate) fn read_entry_range(
         &self,
@@ -846,7 +840,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         resolver: Option<&dyn ObjectResolver>,
     ) -> Result<(Bytes, ReadReport)> {
         let mut report = ReadReport {
-            metadata_authenticated: true,
+            metadata_validated: true,
             ..Default::default()
         };
         let mut outputs = self
@@ -1083,9 +1077,11 @@ mod tests {
     }
     impl Source {
         fn new(bytes: Vec<u8>) -> Self {
-            let data_end = crate::parse_footer(&bytes[bytes.len() - 80..])
+            let data_end = crate::parse_footer(&bytes[bytes.len() - crate::FOOTER_SIZE..])
                 .unwrap()
-                .toc_offset;
+                .metadata_range(bytes.len() as u64)
+                .unwrap()
+                .start;
             Self {
                 bytes: bytes.into(),
                 data_end,
@@ -1192,7 +1188,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(raw, b"hello".as_slice());
-        assert!(report.metadata_authenticated);
+        assert!(report.metadata_validated);
         assert!(!report.full_archive_validated);
         assert_eq!(report.data_frames_checked.len(), 1);
         let mut cursor = reader.cursor().await.unwrap();
@@ -1461,7 +1457,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn mandatory_checksums_and_authenticated_metadata_cannot_be_skipped() {
+    async fn mandatory_checksums_and_validated_metadata_cannot_be_skipped() {
         let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/data-checksum.zstar");
         let reader = Archive::open_with_options(
             Arc::new(Source::new(bytes.to_vec())),
@@ -1476,7 +1472,8 @@ mod tests {
             reader.read_range("a-b", 0..5).await,
             Err(Error::Integrity)
         ));
-        let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/metadata-hash.zstar");
+        let bytes =
+            include_bytes!("../../../testdata/entry-manifest/invalid/metadata-checksum.zstar");
         assert!(
             Archive::open_with_options(
                 Arc::new(Source::new(bytes.to_vec())),

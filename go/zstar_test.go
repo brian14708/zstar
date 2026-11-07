@@ -2,10 +2,13 @@ package zstar
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 )
@@ -64,20 +67,6 @@ func TestHTTPRangeReaderRequiresExactPartialContent(t *testing.T) {
 	}
 }
 
-func TestParseFooter(t *testing.T) {
-	b := make([]byte, 80)
-	b[0] = 0x5f
-	b[1] = 0x2a
-	b[2] = 0x4d
-	b[3] = 0x18
-	b[4] = 72
-	copy(b[8:16], "ZSTAR001")
-	b[16] = 1
-	if _, err := ParseFooter(b); err == nil {
-		t.Fatal("expected bounds error")
-	}
-}
-
 func TestHTTPSizeUsesGETAndCachesSuccess(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,3 +104,46 @@ func checkCleanup(t testing.TB, err error) {
 	}
 }
 func testClose(t testing.TB, closer io.Closer) { t.Helper(); checkCleanup(t, closer.Close()) }
+
+func TestCompactFooterPreservesU64LengthsAndDerivesBounds(t *testing.T) {
+	footer := Footer{ManifestEncodedSize: 1<<32 + 9, ManifestDecodedSize: 1<<40 + 1}
+	raw := make([]byte, FooterSize)
+	binary.LittleEndian.PutUint32(raw, 0x184D2A5F)
+	binary.LittleEndian.PutUint32(raw[4:], 20)
+	binary.LittleEndian.PutUint64(raw[8:], footer.ManifestEncodedSize)
+	binary.LittleEndian.PutUint64(raw[16:], footer.ManifestDecodedSize)
+	copy(raw[24:], "Z*01")
+	parsed, err := ParseFooter(raw)
+	if err != nil || parsed != footer {
+		t.Fatalf("footer: %+v, %v", parsed, err)
+	}
+	archiveSize := footer.ManifestEncodedSize + FooterSize + 123
+	offset, size, err := parsed.ManifestRange(archiveSize)
+	if err != nil || offset != 123 || size != footer.ManifestEncodedSize {
+		t.Fatalf("range: %d, %d, %v", offset, size, err)
+	}
+	for _, archiveSize := range []uint64{0, 27, 28, footer.ManifestEncodedSize + FooterSize} {
+		if _, _, err := footer.ManifestRange(archiveSize); err == nil {
+			t.Fatalf("invalid size accepted: %d", archiveSize)
+		}
+	}
+	footer.ManifestEncodedSize = math.MaxUint64
+	if _, _, err := footer.ManifestRange(math.MaxUint64); err == nil {
+		t.Fatal("underflow accepted")
+	}
+}
+
+func TestFullValidationRejectsConcatenatedArchives(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/entry-manifest/invalid/footer-concatenated-archives.zstar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(context.Background(), memoryRange(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, reader)
+	if err := reader.Verify(context.Background(), VerifyArchive); err == nil {
+		t.Fatal("concatenated archives accepted")
+	}
+}

@@ -7,7 +7,7 @@ use zstar::{Archive, Builder, VerificationScope};
 async fn main() -> zstar::Result<()> {
     // region create
     let output = tokio::fs::File::create("example.zstar").await?;
-    let mut builder = Builder::new(output);
+    let mut builder = Builder::try_new(output).await?;
     builder
         .append_bytes("example.txt", b"Hello from Zstar\n")
         .await?;

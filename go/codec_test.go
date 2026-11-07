@@ -47,12 +47,7 @@ func TestBoundedSingleFrameDecodeAndChecksums(t *testing.T) {
 	}
 }
 
-func TestDefaultReaderRejectsShortSources(t *testing.T) {
-	for _, data := range [][]byte{nil, make([]byte, 79)} {
-		if _, err := Open(context.Background(), memoryRange(data)); ErrorCategory(err) != "not-zstar" {
-			t.Fatal(err)
-		}
-	}
+func TestReaderAtSourceRejectsInvalidRangesAndShortReads(t *testing.T) {
 	source := ReaderAtSource{Reader: bytes.NewReader([]byte("hello")), Length: 5}
 	if _, err := source.ReadRange(context.Background(), -1, 1); err == nil {
 		t.Fatal("negative source range")

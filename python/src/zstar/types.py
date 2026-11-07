@@ -180,9 +180,9 @@ class AsyncReaderOptions(_ReaderBudgets, total=False):
 
 
 class ReadReport(TypedDict):
-    """Content and authentication checks performed while reading an archive member."""
+    """Content and validation checks performed while reading an archive member."""
 
-    metadata_authenticated: bool
+    metadata_validated: bool
     full_archive_validated: bool
     data_frames_checked: list[int]
     external_objects_sha256_checked: list[str]

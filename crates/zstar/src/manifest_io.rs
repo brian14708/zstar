@@ -1,10 +1,7 @@
 //! One deterministic manifest sequence with bounded compression segments and disk spooling.
-#[cfg(test)]
-const LEGACY_FRAME_SIZE: usize = 16 << 20;
 use crate::manifest::{BLOCK_TARGET, Entry, ManifestRoot, entry_allocation, valid_path};
 use crate::{Error, Footer, RangeReader, Result, TOC_MAGIC};
 use ciborium::Value;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::io::{Cursor, Read};
@@ -68,7 +65,6 @@ pub struct ManifestEncoder<W: Write> {
     start: u64,
     position: u64,
     decoded: u64,
-    hash: Sha256,
     records: Spool,
     records_ordered: bool,
     previous_path: Option<String>,
@@ -89,7 +85,6 @@ impl<W: Write> ManifestEncoder<W> {
             start: data_end,
             position: data_end,
             decoded: 0,
-            hash: Sha256::new(),
             records: Spool::new(spool_options),
             records_ordered: true,
             previous_path: None,
@@ -156,7 +151,9 @@ impl<W: Write> ManifestEncoder<W> {
             return Err(Error::Budget("decoded manifest size"));
         }
         if self.compressor.is_none() {
-            self.compressor = Some(zstd::bulk::Compressor::new(self.level)?);
+            let mut compressor = zstd::bulk::Compressor::new(self.level)?;
+            compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+            self.compressor = Some(compressor);
         }
         let encoded = self.compressor.as_mut().unwrap().compress(&self.pending)?;
         self.options.limits.frame(&encoded)?;
@@ -175,7 +172,6 @@ impl<W: Write> ManifestEncoder<W> {
         self.output
             .write_all(&(encoded.len() as u32).to_le_bytes())?;
         self.output.write_all(&encoded)?;
-        self.hash.update(&self.pending);
         self.position = end;
         self.pending.clear();
         Ok(())
@@ -312,17 +308,15 @@ impl<W: Write> ManifestEncoder<W> {
         }
         self.flush_segment()?;
         let footer = Footer {
-            toc_offset: self.start,
             toc_encoded_len: self.position - self.start,
             toc_decoded_len: self.decoded,
-            toc_sha256: self.hash.finalize().into(),
         };
         self.output.write_all(&crate::encode_footer(&footer))?;
         Ok((self.output, footer))
     }
 }
 
-/// Independent sequential state over the authenticated entry vector.
+/// Independent sequential state over the validated entry vector.
 /// Cloning a cursor checkpoints its position without retaining entry data.
 #[derive(Clone)]
 pub struct EntryCursor {
@@ -345,22 +339,18 @@ pub struct ManifestReader {
     spilled: bool,
     cursor_owner: Arc<()>,
 }
-/// Segments are authenticated as bytes before the sequence is parsed.
+/// Segments are validated as bytes before the sequence is parsed.
 pub struct ManifestIngest {
     footer: Footer,
+    start: u64,
     spool: Spool,
     at: u64,
     end: u64,
     decoded: u64,
-    hash: Sha256,
 }
 impl ManifestIngest {
     pub(crate) fn new(footer: Footer, source_size: u64, mut spool: Spool) -> Result<Self> {
-        if footer.toc_offset.checked_add(footer.toc_encoded_len)
-            != source_size.checked_sub(crate::FOOTER_SIZE as u64)
-        {
-            return Err(Error::MalformedFooter("manifest coverage"));
-        }
+        let range = footer.metadata_range(source_size)?;
         if footer.toc_encoded_len > spool.options.max_encoded_bytes
             || footer.toc_decoded_len > spool.options.max_decoded_bytes
         {
@@ -368,12 +358,12 @@ impl ManifestIngest {
         }
         spool.options.max_encoded_bytes = spool.options.max_decoded_bytes;
         Ok(Self {
-            at: footer.toc_offset,
-            end: footer.toc_offset + footer.toc_encoded_len,
+            start: range.start,
+            at: range.start,
+            end: range.end,
             footer,
             spool,
             decoded: 0,
-            hash: Sha256::new(),
         })
     }
     pub(crate) const fn complete(&self) -> bool {
@@ -411,6 +401,9 @@ impl ManifestIngest {
         if encoded.len() as u64 != len {
             return Err(invalid("short metadata frame"));
         }
+        if encoded.len() < 5 || encoded[4] & 4 == 0 {
+            return Err(invalid("missing metadata checksum"));
+        }
         let limits = self.spool.options.limits;
         let limit = limits.decoded_limit().min(
             usize::try_from(
@@ -441,7 +434,6 @@ impl ManifestIngest {
         if self.decoded > self.footer.toc_decoded_len {
             return Err(invalid("decoded manifest length"));
         }
-        self.hash.update(&raw);
         self.spool.append(&raw)?;
         self.at += 8 + len;
         Ok(())
@@ -449,9 +441,6 @@ impl ManifestIngest {
     pub(crate) fn finish(mut self) -> Result<ManifestReader> {
         if self.at != self.end || self.decoded != self.footer.toc_decoded_len {
             return Err(invalid("decoded manifest length"));
-        }
-        if self.hash.finalize().as_slice() != self.footer.toc_sha256 {
-            return Err(Error::Integrity);
         }
         self.spool.store.seek(SeekFrom::Start(0))?;
         let reader = std::io::BufReader::new(&mut self.spool.store);
@@ -466,7 +455,7 @@ impl ManifestIngest {
         let (root, entries) = crate::manifest::decode_sequence_budgeted(
             reader,
             self.decoded,
-            self.footer.toc_offset,
+            self.start,
             retained,
             self.spool.options.max_entries,
             self.spool.options.limits,
@@ -513,7 +502,7 @@ impl ManifestIngest {
     }
 }
 impl ManifestReader {
-    /// Immutable, authenticated root metadata.
+    /// Immutable, validated root metadata.
     #[must_use]
     pub const fn root(&self) -> &ManifestRoot {
         &self.root
@@ -859,18 +848,13 @@ mod tests {
                     let len =
                         u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
                     let raw =
-                        crate::decode_bounded(&bytes[at + 8..at + 8 + len], LEGACY_FRAME_SIZE)
-                            .unwrap();
+                        crate::decode_bounded(&bytes[at + 8..at + 8 + len], block_target).unwrap();
                     assert!(raw.len() <= block_target);
                     decoded.extend(raw);
                     at += 8 + len;
                 }
                 assert_eq!(decoded, expected);
                 assert_eq!(footer.toc_decoded_len, expected.len() as u64);
-                assert_eq!(
-                    footer.toc_sha256.as_slice(),
-                    Sha256::digest(&expected).as_slice()
-                );
                 let (_, entries) = crate::manifest::decode_document(&decoded, 0).unwrap();
                 assert_eq!(entries, vec![entry.clone()]);
             }
@@ -1197,7 +1181,7 @@ mod tests {
         }
     }
     #[test]
-    fn document_hash_spill_and_lookup() {
+    fn document_checksum_spill_and_lookup() {
         let options = ManifestOptions {
             memory_bytes: 64,
             create_spill_store: Some(SpillFactory::new(|| {
@@ -1236,15 +1220,17 @@ mod tests {
         );
         assert!(reader.entry("file-0300").unwrap().is_none());
         assert_eq!(reader.collect_entries().unwrap().len(), 300);
-        let mut bad = footer;
-        bad.toc_sha256[0] ^= 1;
+        let mut corrupted = archive;
+        let checksum = corrupted.len() - crate::FOOTER_SIZE - 1;
+        corrupted[checksum] ^= 1;
+        let mut source = crate::SliceReader::new(&corrupted);
         assert!(matches!(
-            ManifestReader::open(&mut source, &bad, ManifestOptions::default()),
+            ManifestReader::open(&mut source, &footer, ManifestOptions::default()),
             Err(Error::Integrity)
         ));
     }
     #[test]
-    fn document_larger_than_segment_limit() {
+    fn spooled_document_spans_many_segments() {
         let options = ManifestOptions {
             memory_bytes: 1 << 20,
             create_spill_store: Some(SpillFactory::new(|| {
@@ -1272,7 +1258,7 @@ mod tests {
                 .unwrap();
         }
         let (metadata, footer) = writer.finish(vec![], BTreeMap::default()).unwrap();
-        assert!(footer.toc_decoded_len > LEGACY_FRAME_SIZE as u64);
+        assert!(footer.toc_decoded_len > options.block_target as u64);
         let mut archive = vec![0];
         archive.extend(metadata);
         let mut source = crate::SliceReader::new(&archive);

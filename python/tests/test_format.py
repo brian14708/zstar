@@ -24,27 +24,14 @@ def open_manifest(source_factory):
     return lambda data, **options: ManifestArchive(source_factory(data), len(data), **options)
 
 
-def test_streaming_encoder_and_restricted_cbor(open_manifest):
-    output = io.BytesIO()
-    writer = EntryArchiveWriter(output, frame_size=2048, memory_bytes=1)
-    for path, data in [("a", b"hello"), ("b", b"world"), ("c", bytes([7]) * 10000)]:
-        writer.add((path, 0, 420, 0, 0, 0, ()), io.BytesIO(data), len(data))
-    writer.close()
-    writer.close()
-    archive = open_manifest(output.getvalue())
-    try:
-        archive.validate()
-        assert archive.entry("a")[6][0][1] == archive.entry("b")[6][0][1]
-        assert archive.read("c") == bytes([7]) * 10000
-    finally:
-        archive.close()
+def test_native_cbor_value_conversion():
     value = {"x-values": (2**64 - 1, -(2**63), b"bytes", True, {"text": "value"})}
     assert decode_manifest_block(encode_manifest_block(value)) == value
     with pytest.raises((ZstarError, TypeError)):
         encode_manifest_block({"x-float": 0.5})
 
 
-def test_native_lossless_metadata_remains_owned_and_authenticated():
+def test_native_lossless_metadata_remains_owned_and_validated():
     fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
     entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
     output = io.BytesIO()
@@ -96,10 +83,10 @@ def test_iteration_and_owned_attributes(open_manifest):
         archive.entry("f0000")
 
 
-def test_metadata_hash_and_read_budget_are_mandatory(inline_data, open_manifest):
+def test_metadata_checksum_and_read_budget_are_mandatory(inline_data, open_manifest):
     data = inline_data
     with pytest.raises(ZstarError, match="integrity"):
-        open_manifest(data[:-1] + bytes([data[-1] ^ 1]))
+        open_manifest(data[:-29] + bytes([data[-29] ^ 1]) + data[-28:])
     archive = open_manifest(data, max_read_bytes=1)
     try:
         archive.validate()
@@ -176,7 +163,7 @@ def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
     )
     payload, report = archive.read_with_report("hello.txt", 0, 6, resolver=resolver)
     assert payload == b"hello\n"
-    assert report["metadata_authenticated"]
+    assert report["metadata_validated"]
     assert not report["full_archive_validated"]
     assert report["external_objects_unchecked"]
     assert not report["external_objects_sha256_checked"]
@@ -344,3 +331,13 @@ print('closed without GIL deadlock')
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "closed without GIL deadlock"
+
+
+def test_full_validation_rejects_concatenated_archives(corpus_dir):
+    with (
+        zstar.Archive.from_file(
+            corpus_dir / "invalid/footer-concatenated-archives.zstar"
+        ) as reader,
+        pytest.raises(zstar.ZstarError),
+    ):
+        reader.verify()

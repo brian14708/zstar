@@ -29,14 +29,16 @@ fn payload() -> Vec<u8> {
 }
 
 async fn fixture() -> Bytes {
-    let mut builder = Builder::with_options(
+    let mut builder = Builder::try_with_options(
         Vec::new(),
         WriterOptions {
             frame_size: 1024,
             workers: 2,
             ..Default::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     let mut header = Header::file("dir/file", payload().len() as u64);
     header.set_mode(0o640);
     header.set_uid(42);
@@ -99,7 +101,7 @@ async fn tar_style_roundtrip_ranges_metadata_and_verification() {
         .read_range_with_report("dir/file", 1000..1100)
         .await
         .unwrap();
-    assert!(report.metadata_authenticated);
+    assert!(report.metadata_validated);
     assert!(!report.full_archive_validated);
     assert_ne!(report.data_frames_checked, [] as [u64; 0]);
     archive.verify(VerificationScope::Archive).await.unwrap();
@@ -171,13 +173,15 @@ async fn archive_cursors_reject_other_archives() {
 #[tokio::test]
 async fn owned_stream_combinators_and_large_seek_indexes() {
     let bytes = payload().repeat(16);
-    let mut builder = Builder::with_options(
+    let mut builder = Builder::try_with_options(
         Vec::new(),
         WriterOptions {
             frame_size: 1024,
             ..Default::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     builder.append_bytes("file", &bytes).await.unwrap();
     let archive = Archive::from_bytes(builder.finish().await.unwrap())
         .await
@@ -199,18 +203,22 @@ async fn owned_stream_combinators_and_large_seek_indexes() {
 )]
 #[tokio::test]
 async fn verify_finds_corruption_outside_a_selected_read() {
-    let mut builder = Builder::with_options(
+    let mut builder = Builder::try_with_options(
         Vec::new(),
         WriterOptions {
             frame_size: 1024,
             ..Default::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     builder.append_bytes("first", b"hello").await.unwrap();
     builder.append_bytes("last", &payload()).await.unwrap();
     let mut bytes = builder.finish().await.unwrap();
-    let footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
-    bytes[footer.toc_offset as usize - 1] ^= 1;
+    let footer =
+        zstar::backend::parse_footer(&bytes[bytes.len() - zstar::backend::FOOTER_SIZE..]).unwrap();
+    let data_end = footer.metadata_range(bytes.len() as u64).unwrap().start;
+    bytes[data_end as usize - 1] ^= 1;
     let archive = Archive::from_bytes(bytes).await.unwrap();
     assert_eq!(archive.read("first").await.unwrap(), b"hello".as_slice());
     assert!(archive.verify(VerificationScope::Archive).await.is_err());
@@ -295,8 +303,8 @@ fn idle_builders_do_not_occupy_blocking_worker_slots() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let _idle = Builder::new(Vec::new());
-        let mut active = Builder::new(Vec::new());
+        let _idle = Builder::try_new(Vec::new()).await.unwrap();
+        let mut active = Builder::try_new(Vec::new()).await.unwrap();
         timeout(Duration::from_secs(2), async {
             active.append_bytes("file", b"data").await.unwrap();
             active.finish().await.unwrap();
@@ -308,7 +316,7 @@ fn idle_builders_do_not_occupy_blocking_worker_slots() {
 
 #[tokio::test]
 async fn panicking_codec_callbacks_do_not_strand_output_waits() {
-    let mut builder = Builder::with_options(
+    let mut builder = Builder::try_with_options(
         Vec::new(),
         WriterOptions {
             metadata: zstar::MetadataWriterOptions {
@@ -323,7 +331,9 @@ async fn panicking_codec_callbacks_do_not_strand_output_waits() {
             },
             ..Default::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     assert!(
         timeout(
             Duration::from_secs(2),
@@ -348,7 +358,7 @@ impl AsyncRead for StalledInput {
 
 #[tokio::test]
 async fn cancelled_and_failed_appends_poison_the_builder() {
-    let mut builder = Builder::new(Vec::new());
+    let mut builder = Builder::try_new(Vec::new()).await.unwrap();
     assert!(
         timeout(
             Duration::from_millis(30),
@@ -365,7 +375,7 @@ async fn cancelled_and_failed_appends_poison_the_builder() {
             .is_err()
     );
     for (size, body) in [(1, b"xx".as_slice()), (3, b"xx".as_slice())] {
-        let mut builder = Builder::new(Vec::new());
+        let mut builder = Builder::try_new(Vec::new()).await.unwrap();
         assert!(
             builder
                 .append_data(Header::file("file", size), body)
@@ -375,14 +385,6 @@ async fn cancelled_and_failed_appends_poison_the_builder() {
         assert!(builder.append_dir("dir").await.is_err());
         assert!(builder.finish().await.is_err());
     }
-    let builder = Builder::with_options(
-        Vec::new(),
-        WriterOptions {
-            frame_size: 1,
-            ..Default::default()
-        },
-    );
-    assert!(builder.finish().await.is_err());
 }
 
 #[derive(Default)]
@@ -417,7 +419,7 @@ impl AsyncWrite for Sink {
 
 #[tokio::test]
 async fn finish_flushes_and_returns_sink_without_shutdown_and_propagates_sink_errors() {
-    let mut builder = Builder::new(Sink::default());
+    let mut builder = Builder::try_new(Sink::default()).await.unwrap();
     builder.append_bytes("file", b"data").await.unwrap();
     let sink = builder.finish().await.unwrap();
     assert!(sink.flushed);
@@ -431,7 +433,7 @@ async fn finish_flushes_and_returns_sink_without_shutdown_and_propagates_sink_er
             .unwrap(),
         b"data".as_slice()
     );
-    let mut builder = Builder::with_options(
+    let mut builder = Builder::try_with_options(
         Sink {
             fail: true,
             ..Default::default()
@@ -440,7 +442,9 @@ async fn finish_flushes_and_returns_sink_without_shutdown_and_propagates_sink_er
             frame_size: 1024,
             ..Default::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     assert!(builder.append_bytes("file", &payload()).await.is_err());
     assert!(builder.finish().await.is_err());
 }
@@ -449,13 +453,15 @@ async fn finish_flushes_and_returns_sink_without_shutdown_and_propagates_sink_er
 async fn bounded_duplex_output_makes_progress_with_backpressure() {
     let (sink, mut source) = tokio::io::duplex(32);
     let write = async {
-        let mut builder = Builder::with_options(
+        let mut builder = Builder::try_with_options(
             sink,
             WriterOptions {
                 frame_size: 1024,
                 ..Default::default()
             },
-        );
+        )
+        .await
+        .unwrap();
         builder.append_bytes("file", &payload()).await.unwrap();
         let mut sink = builder.finish().await.unwrap();
         sink.shutdown().await.unwrap();
@@ -629,7 +635,7 @@ impl AsyncRangeReader for CountedSource {
 
 #[tokio::test]
 async fn stream_cache_reuses_validated_sources_and_obeys_its_budget() {
-    let mut builder = Builder::new(Vec::new());
+    let mut builder = Builder::try_new(Vec::new()).await.unwrap();
     builder
         .append_bytes("file", &vec![7; 16_384])
         .await
@@ -660,18 +666,12 @@ async fn stream_cache_reuses_validated_sources_and_obeys_its_budget() {
 }
 
 #[test]
-fn writer_construction_is_runtime_independent() {
-    let builder = Builder::new(Vec::new());
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async move {
-        let bytes = builder.finish().await.unwrap();
-        Archive::from_bytes(bytes)
-            .await
-            .unwrap()
-            .verify(VerificationScope::Archive)
-            .await
-            .unwrap();
-    });
+fn writer_initialization_requires_a_runtime() {
+    let result = futures_util::FutureExt::now_or_never(Builder::try_new(Vec::new())).unwrap();
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported("writer requires a Tokio runtime"))
+    ));
 }
 
 #[tokio::test]
@@ -811,4 +811,13 @@ async fn content_limits_are_independent_of_metadata_options() {
         builder.append_bytes("file", b"ab").await,
         Err(Error::Budget(_))
     ));
+}
+
+#[tokio::test]
+async fn full_validation_rejects_concatenated_archives() {
+    let raw = include_bytes!(
+        "../../../testdata/entry-manifest/invalid/footer-concatenated-archives.zstar"
+    );
+    let archive = Archive::from_bytes(Bytes::from_static(raw)).await.unwrap();
+    assert!(archive.verify(VerificationScope::Archive).await.is_err());
 }

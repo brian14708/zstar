@@ -591,7 +591,7 @@ pub fn batch_requests(requests: &Bound<'_, PyAny>) -> PyResult<Vec<(String, u64,
 
 pub fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo3::types::PyDict>> {
     let result = pyo3::types::PyDict::new(py);
-    result.set_item("metadata_authenticated", report.metadata_authenticated)?;
+    result.set_item("metadata_validated", report.metadata_validated)?;
     result.set_item("full_archive_validated", report.full_archive_validated)?;
     result.set_item("data_frames_checked", report.data_frames_checked)?;
     result.set_item(

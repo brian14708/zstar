@@ -60,7 +60,7 @@ class _Metadata(Generic[_Reader]):
 
     @property
     def root_extensions(self) -> dict[str, ExtensionValue]:
-        """Owned authenticated root extensions; pass to the output writer to preserve."""
+        """Owned validated root extensions; pass to the output writer to preserve."""
         self._check_open()
         return self._reader.root_extensions
 

@@ -54,7 +54,7 @@ virtual-hosted endpoints include the bucket in the host.
 
 External objects can be supplied to extraction with `--objects <directory>`.
 Their hashes are not checked by default; use `--verify-external-hash` to opt into
-SHA-256 verification. Manifest authentication and data checksums remain required.
+SHA-256 verification. Manifest validation and data checksums remain required.
 The [archive specification][spec] defines validation scopes.
 
 [spec]: https://github.com/brian14708/zstar/blob/main/spec/draft/core.md

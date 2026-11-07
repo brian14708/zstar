@@ -270,12 +270,17 @@ async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
     let bytes = Bytes::from_static(include_bytes!(
         "../../../testdata/entry-manifest/inline.zstar"
     ));
-    let footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
+    let footer =
+        zstar::backend::parse_footer(&bytes[bytes.len() - zstar::backend::FOOTER_SIZE..]).unwrap();
     let good = archive_attributes(&footer, bytes.len() as u64).unwrap();
     for (position, version, expected) in [
         (None, None, 2),
         (
-            Some(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
+            Some(format!(
+                "{}:{}",
+                footer.metadata_range(bytes.len() as u64).unwrap().start,
+                footer.toc_encoded_len
+            )),
             None,
             1,
         ),
@@ -284,7 +289,11 @@ async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
         (Some("18446744073709551616:10".into()), None, 2),
         (Some("1:18446744073709551615".into()), None, 2),
         (
-            Some(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
+            Some(format!(
+                "{}:{}",
+                footer.metadata_range(bytes.len() as u64).unwrap().start,
+                footer.toc_encoded_len
+            )),
             Some("2"),
             2,
         ),
@@ -293,7 +302,7 @@ async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
         (
             Some(format!(
                 "{}:{}",
-                footer.toc_offset - 1,
+                footer.metadata_range(bytes.len() as u64).unwrap().start - 1,
                 footer.toc_encoded_len + 1
             )),
             None,
@@ -333,12 +342,18 @@ async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
         assert_eq!(store.gets.load(Ordering::SeqCst), expected);
         assert_eq!(archive.read("a-b").await.unwrap(), b"hello"[..]);
     }
-    assert_eq!(good.len(), 5);
-    assert!(archive_attributes(&footer, bytes.len() as u64 + 1).is_err());
+    assert_eq!(good.len(), 4);
+    assert!(
+        archive_attributes(
+            &footer,
+            footer.toc_encoded_len + zstar::backend::FOOTER_SIZE as u64
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
-async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_hashes() {
+async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_checksums() {
     use object_store::{Attribute, GetOptions};
     use zstar::s3::{MANIFEST_POSITION_METADATA_KEY, put_archive};
     let bytes = Bytes::from_static(include_bytes!(
@@ -360,7 +375,7 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
         )
         .await
         .unwrap();
-    assert_eq!(head.attributes.len(), 5);
+    assert_eq!(head.attributes.len(), 4);
     assert_eq!(
         head.attributes
             .get(&Attribute::ContentType)
@@ -396,7 +411,7 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
     assert!(matches!(result, Err(Error::Budget(_))));
     assert_eq!(store.gets.load(Ordering::SeqCst), 1); // Footer only: oversized hint wasn't fetched.
     let mut corrupted = bytes.to_vec();
-    let last = corrupted.len() - 1;
+    let last = corrupted.len() - zstar::backend::FOOTER_SIZE - 1;
     corrupted[last] ^= 1;
     put_archive(store.as_ref(), &path, corrupted.into())
         .await

@@ -66,10 +66,9 @@ not become a lifetime deadline. `io/fs` and plain `io.Reader` methods use a
 background context; use `ReadContext` or `ReadAtContext` for remote deadlines.
 A caller-owned blocking `io.ReaderAt` cannot be interrupted by a context.
 
-Rust source futures must cancel pending work when dropped. Constructing a
-`Builder` is lazy and requires no runtime. Async writing requires Tokio;
-`Builder::try_new` and `try_with_options` report initialization errors before
-returning. Legacy `new` and `with_options` report them at the first operation.
+Rust source futures must cancel pending work when dropped. Async writing and
+builder initialization require Tokio. `Builder::try_new` and
+`try_with_options` report initialization errors before returning.
 Append failures/cancellation poison the writer; discard partial output.
 
 Python async source/resolver methods declared with `async def` run on the event

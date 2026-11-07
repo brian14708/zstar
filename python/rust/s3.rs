@@ -89,7 +89,12 @@ pub fn s3_archive_metadata(
 ) -> PyResult<std::collections::BTreeMap<String, String>> {
     let view = PyMemoryView::from(data)?.call_method1("cast", ("B",))?;
     let source_size = view.len()? as u64;
-    let tail = view.get_item(PySlice::new(py, -80, isize::MAX, 1))?;
+    let tail = view.get_item(PySlice::new(
+        py,
+        -(zstar::backend::FOOTER_SIZE.cast_signed()),
+        isize::MAX,
+        1,
+    ))?;
     let footer = crate::support::buffer_vec(py, &tail)?;
     let footer = zstar::backend::parse_footer(&footer).map_err(crate::support::core_error)?;
     let attributes =

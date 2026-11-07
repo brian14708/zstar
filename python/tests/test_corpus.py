@@ -67,7 +67,7 @@ def test_corpus(case, source_factory):
                 request["path"], request["offset"], request["length"], resolver=resolver
             )
             assert actual == artifact(case["range_result"])
-            assert report["metadata_authenticated"]
+            assert report["metadata_validated"]
             assert not report["full_archive_validated"]
             if operation == "external-range":
                 if case.get("verify_external", False):
@@ -107,7 +107,7 @@ def test_corpus(case, source_factory):
             assert actual == expected, key
 
 
-def test_error_compatibility_and_budgets():
+def test_error_categories_and_budgets():
     with pytest.raises(ValueError) as caught:
         zstar.Archive(b"invalid")
     assert isinstance(caught.value, zstar.ZstarError)

@@ -7,29 +7,36 @@ import (
 	"encoding/binary"
 )
 
-// Footer contains the authenticated manifest location, lengths and digest.
+// FooterSize is the fixed terminal skippable frame size, including its header.
+const FooterSize = 28
+
+// Footer contains metadata lengths. Its position is derived from archive size.
 type Footer struct {
-	ManifestOffset, ManifestEncodedSize, ManifestDecodedSize uint64
-	ManifestSHA256                                           [32]byte
+	ManifestEncodedSize, ManifestDecodedSize uint64
 }
 
-// ParseFooter parses and validates an exact 80-byte archive footer.
+// ManifestRange derives the metadata offset and encoded size from the complete archive size.
+// It rejects underflow, empty data regions, and invalid metadata lengths.
+func (f Footer) ManifestRange(archiveSize uint64) (offset, encodedSize uint64, err error) {
+	if archiveSize < FooterSize || f.ManifestEncodedSize <= 8 || f.ManifestDecodedSize == 0 || f.ManifestEncodedSize >= archiveSize-FooterSize {
+		return 0, 0, rejected(CategoryMalformedFooter, "metadata coverage")
+	}
+	return archiveSize - FooterSize - f.ManifestEncodedSize, f.ManifestEncodedSize, nil
+}
+
+// ParseFooter parses and validates an exact 28-byte archive footer.
+// Call ManifestRange to validate coverage against the complete archive size.
 func ParseFooter(data []byte) (Footer, error) {
 	var f Footer
-	if len(data) != 80 || binary.LittleEndian.Uint32(data[:4]) != 0x184D2A5F || string(data[8:16]) != "ZSTAR001" {
+	if len(data) != FooterSize || binary.LittleEndian.Uint32(data[:4]) != 0x184D2A5F || string(data[24:]) != "Z*01" {
 		return f, rejected(CategoryNotZstar, "footer signature")
 	}
-	if binary.LittleEndian.Uint32(data[4:8]) != 72 || binary.LittleEndian.Uint32(data[20:24]) != 0 {
-		return f, rejected(CategoryMalformedFooter, "footer lengths/reserved fields")
+	if binary.LittleEndian.Uint32(data[4:8]) != 20 {
+		return f, rejected(CategoryMalformedFooter, "footer payload length")
 	}
-	if binary.LittleEndian.Uint32(data[16:20]) != 1 {
-		return f, rejected(CategoryUnsupportedVersion, "footer version")
-	}
-	f.ManifestOffset = binary.LittleEndian.Uint64(data[24:32])
-	f.ManifestEncodedSize = binary.LittleEndian.Uint64(data[32:40])
-	f.ManifestDecodedSize = binary.LittleEndian.Uint64(data[40:48])
-	copy(f.ManifestSHA256[:], data[48:80])
-	if f.ManifestOffset == 0 || f.ManifestEncodedSize <= 8 || f.ManifestDecodedSize == 0 {
+	f.ManifestEncodedSize = binary.LittleEndian.Uint64(data[8:16])
+	f.ManifestDecodedSize = binary.LittleEndian.Uint64(data[16:24])
+	if f.ManifestEncodedSize <= 8 || f.ManifestDecodedSize == 0 {
 		return Footer{}, rejected(CategoryMalformedFooter, "invalid footer bounds")
 	}
 	return f, nil

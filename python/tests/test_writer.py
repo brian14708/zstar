@@ -442,7 +442,7 @@ def test_capture_normalizes_metadata_sorts_physical_members_and_preserves_on_req
         return output.getvalue()
 
     data = capture()
-    data_end = int.from_bytes(data[-56:-48], "little")
+    data_end = len(data) - 28 - int.from_bytes(data[-20:-12], "little")
     decoded = _native.decode_object(data[:data_end], 4096)
     with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
         assert physical.getnames() == ["root", "root/a", "root/a-b", "root/a/file"]
@@ -513,7 +513,7 @@ def test_capture_merges_directory_siblings_in_utf8_path_order(tmp_path):
     with ArchiveWriter(output) as writer:
         writer.add(root, "root")
     data = output.getvalue()
-    data_end = int.from_bytes(data[-56:-48], "little")
+    data_end = len(data) - 28 - int.from_bytes(data[-20:-12], "little")
     decoded = _native.decode_object(data[:data_end], 512 * len(expected) + 1024)
     with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
         assert physical.getnames() == expected

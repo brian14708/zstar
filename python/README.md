@@ -3,6 +3,11 @@
 Read and write indexed `.tar.zst` archives with Python 3.11 or later.
 Implements the Zstar core specification and its optional external-content extension.
 
+Archives use the compact 28-byte `Z*01` footer with 64-bit metadata lengths.
+Metadata and archive data frames require Zstandard checksums; opening validates
+the complete manifest.
+`ReadReport["metadata_validated"]` reports checksum and schema validation, not cryptographic authentication.
+
 ```sh
 pip install zstar-py
 ```

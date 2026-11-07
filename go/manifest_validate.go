@@ -9,7 +9,7 @@ import (
 )
 
 // checkOpen checks operation cancellation and manifest lifetime.
-// Metadata authentication and validation complete during openManifest.
+// Metadata validation complete during openManifest.
 func (m *manifest) checkOpen(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -50,5 +50,5 @@ func (m *manifest) validateEntries(ctx context.Context) error {
 	return nil
 }
 
-// EntryCount returns the authenticated number of members, excluding the root.
+// EntryCount returns the validated number of members, excluding the root.
 func (m *manifest) EntryCount() uint64 { return m.count }

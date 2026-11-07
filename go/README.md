@@ -3,6 +3,11 @@
 Read and write indexed `.tar.zst` archives with Go.
 Implements the Zstar core specification and its optional external-content extension.
 
+Archives use the compact 28-byte `Z*01` footer with 64-bit metadata lengths.
+Metadata and archive data frames require Zstandard checksums; opening validates
+the complete manifest.
+`ReadReport.MetadataValidated` reports checksum and schema validation, not cryptographic authentication.
+
 [Go API reference](https://pkg.go.dev/github.com/brian14708/zstar/go) ·
 [S3 API](https://pkg.go.dev/github.com/brian14708/zstar/go/s3)
 

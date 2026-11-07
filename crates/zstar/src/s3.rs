@@ -193,8 +193,6 @@ pub(crate) fn storage_error(error: object_store::Error) -> Error {
 pub const VERSION_METADATA_KEY: &str = "zstar-version";
 /// S3 user metadata containing `offset:encoded_size`, including segment headers.
 pub const MANIFEST_POSITION_METADATA_KEY: &str = "zstar-manifest-position";
-/// S3 user metadata containing the decoded manifest SHA-256 as lowercase hex.
-pub const MANIFEST_SHA256_METADATA_KEY: &str = "zstar-manifest-sha256";
 
 pub(crate) fn content_attributes(content_type: &'static str, immutable: bool) -> Attributes {
     [
@@ -217,21 +215,9 @@ pub(crate) fn content_attributes(content_type: &'static str, immutable: bool) ->
     reason = "Errors follow the documented operation contract and crate error types."
 )]
 /// Generate archive content headers and optional discovery metadata from a validated footer.
-/// The digest and decoded length in the actual footer remain authoritative.
+/// Readers validate the complete manifest before using indexed ranges.
 pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<Attributes> {
-    if footer.toc_offset == 0
-        || footer.toc_encoded_len <= 8
-        || footer.toc_decoded_len == 0
-        || footer.toc_offset.checked_add(footer.toc_encoded_len)
-            != source_size.checked_sub(crate::FOOTER_SIZE as u64)
-    {
-        return Err(Error::MalformedFooter("manifest coverage"));
-    }
-    let mut digest = String::with_capacity(64);
-    for byte in &footer.toc_sha256 {
-        use std::fmt::Write as _;
-        write!(digest, "{byte:02x}").expect("writing to String");
-    }
+    let range = footer.metadata_range(source_size)?;
     let mut attributes = content_attributes(crate::http::ZSTD_CONTENT_TYPE, false);
     for (key, value) in [
         (
@@ -240,11 +226,7 @@ pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<At
         ),
         (
             Attribute::Metadata(MANIFEST_POSITION_METADATA_KEY.into()),
-            AttributeValue::from(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
-        ),
-        (
-            Attribute::Metadata(MANIFEST_SHA256_METADATA_KEY.into()),
-            AttributeValue::from(digest),
+            AttributeValue::from(format!("{}:{}", range.start, footer.toc_encoded_len)),
         ),
     ] {
         attributes.insert(key, value);
@@ -257,7 +239,7 @@ pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<At
     reason = "Errors follow the documented operation contract and crate error types."
 )]
 /// Upload completed archive bytes with their optional S3 discovery metadata.
-/// Only the footer is inspected here; readers still authenticate the manifest.
+/// Only the footer is inspected here; readers still validate the manifest.
 pub async fn put_archive(
     store: &dyn ObjectStore,
     path: &Path,

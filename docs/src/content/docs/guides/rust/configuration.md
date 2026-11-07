@@ -7,7 +7,9 @@ Use this guide to configure storage, ownership, and resource limits. Start with 
 
 ## Archive lifecycle
 
-`Builder::finish` finalizes the manifest and footer. File paths are relative,
+`Builder::try_new` and `try_with_options` initialize writers asynchronously and
+return initialization errors before exposing a builder. `Builder::finish`
+finalizes the manifest and footer. File paths are relative,
 use `/` separators, and require explicit entries for ancestor directories.
 Add entries in any order; the writer sorts the manifest. UTF-8 path order avoids
 an additional manifest sorting spool at finish. Filesystem packing uses this
@@ -60,7 +62,7 @@ Inspect `is_lossless()` and `omitted`: ownership is never applied, and unauthori
 set-id bits and unsupported symlink metadata are reported by field and count.
 
 External SHA-256 checking defaults to disabled. Opt in with
-`ReaderOptions { verify_external: true, ..Default::default() }`; metadata hashes,
+`ReaderOptions { verify_external: true, ..Default::default() }`; metadata validation,
 frame checksums, and extent bounds are always checked. Verification returns
 `Result<()>` under the selected scope and hash policy.
 

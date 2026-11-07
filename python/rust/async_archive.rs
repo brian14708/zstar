@@ -5,7 +5,7 @@ use super::reader::{Lease, Session, async_reader_options as reader_options};
 use super::request::FailureSlot;
 
 /// Async indexed archive over bytes, local sources, HTTP, or S3.
-/// Open authenticates metadata; use `verify` to check physical content.
+/// Open validates metadata; use `verify` to check physical content.
 #[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncArchive {
     session: Session,

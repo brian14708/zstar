@@ -89,7 +89,7 @@ def test_external_hash_policy_keeps_codec_validation(
 
 
 @pytest.mark.parametrize(
-    "fixture", ["metadata-hash", "data-checksum", "tar-header", "tar-end", "pointer-mismatch"]
+    "fixture", ["metadata-checksum", "data-checksum", "tar-header", "tar-end", "pointer-mismatch"]
 )
 def test_filesystem_hash_opt_out_keeps_physical_and_metadata_validation(
     tmp_path, fixture, corpus_dir
