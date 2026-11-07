@@ -3,6 +3,12 @@
 Read and write indexed `.tar.zst` archives with Python 3.11 or later.
 Implements the Zstar core specification and its optional external-content extension.
 
+Archives use the 44-byte `Z*01` footer with 64-bit metadata lengths.
+Data and metadata use Zstandard frame checksums, with no separate metadata checksum.
+Opening validates
+the metadata directory. Reads validate selected entry pages and ancestors.
+`ReadReport["metadata_validated"]` reports metadata validation, not cryptographic authentication.
+
 ```sh
 pip install zstar-py
 ```
@@ -10,7 +16,6 @@ pip install zstar-py
 The package includes fsspec; install optional storage backends separately.
 Use context managers or explicit `close()` / `await aclose()` for cleanup.
 
-`verify()` returns `None` or raises; external hashing follows `verify_external`.
 
 ## Get started
 
@@ -42,3 +47,7 @@ from `zstar.types` for typed option dictionaries.
   custom storage, chunking, ownership, cancellation, and metadata preservation.
 - [API reference](https://brian14708.github.io/zstar/api/python/).
 - [Format specifications](https://github.com/brian14708/zstar/blob/main/spec/draft/README.md).
+
+Readers validate the directory on open and load entry pages on demand.
+`archive.entry_count` scans all metadata and can raise a validation error.
+For `AsyncArchive`, use `await archive.entry_count`. Listing also validates every page.

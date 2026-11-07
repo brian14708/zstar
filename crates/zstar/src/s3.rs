@@ -15,10 +15,10 @@
 //! outside the archive format.
 
 use crate::{AsyncRangeReader, Digest, Error, Extent, Result, Source};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, GetResult, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMode, PutOptions, PutResult,
+    Attribute, AttributeValue, Attributes, GetOptions, GetRange, GetResult, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult,
 };
 use std::time::{Duration, Instant};
 use std::{num::NonZeroUsize, ops::Range, sync::Arc};
@@ -189,13 +189,6 @@ pub(crate) fn storage_error(error: object_store::Error) -> Error {
     Error::Io(std::io::Error::new(kind, message))
 }
 
-/// S3 user metadata identifying the archive wire version.
-pub const VERSION_METADATA_KEY: &str = "zstar-version";
-/// S3 user metadata containing `offset:encoded_size`, including segment headers.
-pub const MANIFEST_POSITION_METADATA_KEY: &str = "zstar-manifest-position";
-/// S3 user metadata containing the decoded manifest SHA-256 as lowercase hex.
-pub const MANIFEST_SHA256_METADATA_KEY: &str = "zstar-manifest-sha256";
-
 pub(crate) fn content_attributes(content_type: &'static str, immutable: bool) -> Attributes {
     [
         (Attribute::ContentType, AttributeValue::from(content_type)),
@@ -216,48 +209,8 @@ pub(crate) fn content_attributes(content_type: &'static str, immutable: bool) ->
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-/// Generate archive content headers and optional discovery metadata from a validated footer.
-/// The digest and decoded length in the actual footer remain authoritative.
-pub fn archive_attributes(footer: &crate::Footer, source_size: u64) -> Result<Attributes> {
-    if footer.toc_offset == 0
-        || footer.toc_encoded_len <= 8
-        || footer.toc_decoded_len == 0
-        || footer.toc_offset.checked_add(footer.toc_encoded_len)
-            != source_size.checked_sub(crate::FOOTER_SIZE as u64)
-    {
-        return Err(Error::MalformedFooter("manifest coverage"));
-    }
-    let mut digest = String::with_capacity(64);
-    for byte in &footer.toc_sha256 {
-        use std::fmt::Write as _;
-        write!(digest, "{byte:02x}").expect("writing to String");
-    }
-    let mut attributes = content_attributes(crate::http::ZSTD_CONTENT_TYPE, false);
-    for (key, value) in [
-        (
-            Attribute::Metadata(VERSION_METADATA_KEY.into()),
-            AttributeValue::from("1"),
-        ),
-        (
-            Attribute::Metadata(MANIFEST_POSITION_METADATA_KEY.into()),
-            AttributeValue::from(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
-        ),
-        (
-            Attribute::Metadata(MANIFEST_SHA256_METADATA_KEY.into()),
-            AttributeValue::from(digest),
-        ),
-    ] {
-        attributes.insert(key, value);
-    }
-    Ok(attributes)
-}
-
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-/// Upload completed archive bytes with their optional S3 discovery metadata.
-/// Only the footer is inspected here; readers still authenticate the manifest.
+/// Upload completed archive bytes with content type and cache policy headers.
+/// Only the footer is inspected here; readers still validate the manifest.
 pub async fn put_archive(
     store: &dyn ObjectStore,
     path: &Path,
@@ -267,7 +220,8 @@ pub async fn put_archive(
         return Err(Error::NotZstar);
     }
     let footer = crate::parse_footer(&encoded[encoded.len() - crate::FOOTER_SIZE..])?;
-    let attributes = archive_attributes(&footer, encoded.len() as u64)?;
+    footer.metadata_range(encoded.len() as u64)?;
+    let attributes = content_attributes(crate::http::ZSTD_CONTENT_TYPE, false);
     store
         .put_opts(
             path,
@@ -283,28 +237,14 @@ pub async fn put_archive(
 
 struct PinnedMeta {
     object: ObjectMeta,
-    manifest: Option<Range<u64>>,
-}
-
-fn manifest_hint(attributes: &Attributes) -> Option<Range<u64>> {
-    if attributes
-        .get(&Attribute::Metadata(VERSION_METADATA_KEY.into()))
-        .is_some_and(|version| version.as_ref() != "1")
-    {
-        return None;
-    }
-    let value = attributes.get(&Attribute::Metadata(MANIFEST_POSITION_METADATA_KEY.into()))?;
-    let (offset, length) = value.as_ref().split_once(':')?;
-    let decimal = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-    if !decimal(offset) || !decimal(length) {
-        return None;
-    }
-    let offset = offset.parse::<u64>().ok()?;
-    let length = length.parse::<u64>().ok()?;
-    Some(offset..offset.checked_add(length)?)
+    tail: Bytes,
 }
 
 /// Exact ranged reads pinned to the first observed version/ETag and size.
+///
+/// The first operation fetches and retains up to 128 KiB from the object suffix,
+/// discovering size and identity without a separate HEAD. Metadata and content
+/// ranges reuse those bytes; uncached ranges remain conditional on that identity.
 /// Reuse this source for the lifetime of an indexed reader.
 pub struct S3RangeSource {
     /// A range reader over one object in an S3-compatible store.
@@ -323,6 +263,7 @@ impl S3RangeSource {
         }
     }
     /// Override the transport allocation bound independently of reader budgets.
+    /// This also caps the initial suffix prefetch.
     #[must_use]
     pub const fn with_max_range_bytes(mut self, limit: u64) -> Self {
         self.max_range_bytes = limit;
@@ -331,19 +272,50 @@ impl S3RangeSource {
     async fn metadata(&self) -> Result<&PinnedMeta> {
         self.meta
             .get_or_try_init(|| async {
+                let suffix = self.max_range_bytes.min(128 << 10);
+                if suffix == 0 {
+                    return Err(Error::Budget("S3 range size"));
+                }
                 let result = self
                     .store
                     .get_opts(
                         &self.path,
                         GetOptions {
-                            head: true,
+                            range: Some(GetRange::Suffix(suffix)),
                             ..Default::default()
                         },
                     )
-                    .await
-                    .map_err(storage_error)?;
-                let manifest = manifest_hint(&result.attributes);
-                let meta = result.meta;
+                    .await;
+                // Some stores reject suffix ranges for empty objects. Confirm an
+                // empty object with HEAD on a generic backend error only; never
+                // substitute a nonempty object's metadata for a failed range.
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error @ object_store::Error::Generic { .. }) => {
+                        match self
+                            .store
+                            .get_opts(
+                                &self.path,
+                                GetOptions {
+                                    head: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(result) if result.meta.size == 0 => result,
+                            _ => return Err(storage_error(error)),
+                        }
+                    }
+                    Err(error) => return Err(storage_error(error)),
+                };
+                if result.range != (result.meta.size.saturating_sub(suffix)..result.meta.size) {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "storage suffix range mismatch",
+                    )));
+                }
+                let meta = result.meta.clone();
                 if meta.e_tag.as_deref().is_none_or(str::is_empty)
                     && meta
                         .version
@@ -355,10 +327,8 @@ impl S3RangeSource {
                         "storage object has no immutable identity",
                     )));
                 }
-                Ok(PinnedMeta {
-                    object: meta,
-                    manifest,
-                })
+                let tail = read_exact(result, meta.size.min(suffix)).await?;
+                Ok(PinnedMeta { object: meta, tail })
             })
             .await
     }
@@ -368,18 +338,12 @@ impl AsyncRangeReader for S3RangeSource {
     async fn size(&self) -> Result<u64> {
         Ok(self.metadata().await?.object.size)
     }
-    async fn manifest_range(&self) -> Result<Option<Range<u64>>> {
-        let meta = self.metadata().await?;
-        Ok(meta.manifest.clone().filter(|range| {
-            range.start <= meta.object.size
-                && meta.object.size - range.start <= self.max_range_bytes
-        }))
-    }
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
         if range.start > range.end {
             return Err(Error::Range);
         }
-        let meta = &self.metadata().await?.object;
+        let pinned = self.metadata().await?;
+        let meta = &pinned.object;
         crate::checked_range(range.start, range.end - range.start, meta.size)?;
         if range.is_empty() {
             return Ok(Bytes::new());
@@ -387,6 +351,14 @@ impl AsyncRangeReader for S3RangeSource {
         if range.end - range.start > self.max_range_bytes {
             return Err(Error::Budget("S3 range size"));
         }
+        let tail_start = meta.size - pinned.tail.len() as u64;
+        if range.start >= tail_start {
+            let start = usize::try_from(range.start - tail_start).map_err(|_| Error::Range)?;
+            let end = usize::try_from(range.end - tail_start).map_err(|_| Error::Range)?;
+            return Ok(pinned.tail.slice(start..end));
+        }
+        let requested = range.clone();
+        let range = range.start..range.end.min(tail_start);
         let result = self
             .store
             .get_opts(
@@ -411,6 +383,15 @@ impl AsyncRangeReader for S3RangeSource {
             )));
         }
         let bytes = read_exact(result, range.end - range.start).await?;
+        if requested.end > range.end {
+            let length =
+                usize::try_from(requested.end - requested.start).map_err(|_| Error::Range)?;
+            let suffix = usize::try_from(requested.end - tail_start).map_err(|_| Error::Range)?;
+            let mut out = BytesMut::with_capacity(length);
+            out.extend_from_slice(&bytes);
+            out.extend_from_slice(&pinned.tail[..suffix]);
+            return Ok(out.freeze());
+        }
         Ok(bytes)
     }
 }

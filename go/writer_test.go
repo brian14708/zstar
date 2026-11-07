@@ -72,9 +72,7 @@ func TestWriterRoundTripAndReaderAt(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer testClose(t, archive)
-			if err := archive.Verify(context.Background(), VerifyArchive); err != nil {
-				t.Fatal(err)
-			}
+
 			want := strings.Repeat("abcd", 1500)
 			got, err := archive.Read(context.Background(), "nested/data", 0, 6000)
 			if err != nil || string(got) != want {
@@ -340,9 +338,6 @@ func TestWriterAcceptsMoreThan65536InlineExtents(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{7}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestWriterLargeExternalEntryAndReference(t *testing.T) {
@@ -381,9 +376,6 @@ func TestWriterLargeExternalEntryAndReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer testClose(t, result)
-	if err = result.Verify(context.Background(), VerifyArchive); err != nil {
-		t.Fatal(err)
-	}
 }
 
 type unreadableBody struct{}
@@ -428,14 +420,35 @@ func TestFrameSizesAreCallerPolicy(t *testing.T) {
 	if err != nil || !bytes.Equal(last, []byte{9}) {
 		t.Fatalf("last byte: %v %v", last, err)
 	}
-	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
+
+	limits := Limits{MaxFrameDecodedBytes: 16 << 20}
+	bounded, err := OpenWithOptions(context.Background(), memoryRange(output.Bytes()), ReaderOptions{Manifest: ManifestReaderOptions{Limits: limits}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	limits := Limits{MaxFrameDecodedBytes: 16 << 20}
-	if _, err = OpenWithOptions(context.Background(), memoryRange(output.Bytes()), ReaderOptions{Manifest: ManifestReaderOptions{Limits: limits}}); ErrorCategory(err) != CategoryResourceLimit {
+	defer testClose(t, bounded)
+	if _, err = bounded.Entry("large"); ErrorCategory(err) != CategoryResourceLimit {
 		t.Fatal(err)
 	}
 	if _, err = NewWriter(&output, WriterOptions{FrameSize: 32 << 20, Manifest: ManifestWriterOptions{Limits: limits}}); ErrorCategory(err) != CategoryResourceLimit {
 		t.Fatal(err)
 	}
+}
+
+func TestWriterOptionalExtensionPages(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewWriter(&output, WriterOptions{Manifest: ManifestWriterOptions{
+		ExtensionPages: map[string][]any{"x-optional": {"first", []any{uint64(7)}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(context.Background(), memoryRange(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testClose(t, reader)
 }

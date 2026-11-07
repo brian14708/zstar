@@ -26,7 +26,6 @@ def test_sync_round_trip_modes_and_borrowed_streams(tmp_path):
         ArchiveWriter.from_file(path, "x")
     with zstar.Archive.from_file(path) as reader:
         assert reader.read("hello.txt", offset=6) == b"world"
-        assert reader.verify() is None
 
     output = io.BytesIO()
     with ArchiveWriter.from_file(output, "w") as writer:
@@ -159,7 +158,7 @@ def test_async_round_trip_and_filesystem_capture(tmp_path):
                 "extra.txt",
             ]
             assert await reader.read("data/file.txt") == b"hello"
-            assert await reader.verify() is None
+
         with pytest.raises(FileExistsError):
             async with await AsyncArchiveWriter.from_file(path, "x"):
                 pass
@@ -336,8 +335,7 @@ def test_async_writer_serializes_concurrent_adds_and_propagates_body_errors(tmp_
         async with await AsyncArchiveWriter.from_file(path, "x") as writer:
             await asyncio.gather(*(writer.addfile(TarInfo(f"file-{i}")) for i in range(20)))
         async with await zstar.AsyncArchive.from_file(path) as archive:
-            assert archive.entry_count == 20
-            assert await archive.verify() is None
+            assert await archive.entry_count == 20
 
         with pytest.raises(zstar.ZstarError, match="broken body"):
             async with await AsyncArchiveWriter.from_file(path, "w") as writer:
@@ -364,7 +362,6 @@ def test_writer_add_recurses_without_following_links_and_supports_owned_output(t
         assert archive.getinfo("root/link").issym()
         assert archive.getinfo("root/link").linkname == "file"
         assert _nanoseconds(archive.getinfo("root/file").pax_headers["mtime"]) == 0
-        archive.verify()
     with pytest.raises(FileExistsError):
         ArchiveWriter.from_file(output, mode="x")
 
@@ -396,7 +393,6 @@ def test_writer_nonrecursive_directory_preserves_metadata(tmp_path):
         assert entry.mode == stat.S_IMODE(metadata.st_mode)
         assert (entry.uid, entry.gid) == (metadata.st_uid, metadata.st_gid)
         assert _nanoseconds(entry.pax_headers["mtime"]) == metadata.st_mtime_ns
-        archive.verify()
 
 
 def test_writer_removes_partial_output_even_when_owned_close_fails(tmp_path, monkeypatch):
@@ -442,12 +438,11 @@ def test_capture_normalizes_metadata_sorts_physical_members_and_preserves_on_req
         return output.getvalue()
 
     data = capture()
-    data_end = int.from_bytes(data[-56:-48], "little")
+    data_end = len(data) - 44 - int.from_bytes(data[-36:-28], "little")
     decoded = _native.decode_object(data[:data_end], 4096)
     with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
         assert physical.getnames() == ["root", "root/a", "root/a-b", "root/a/file"]
     with zstar.Archive(data) as reader:
-        reader.verify()
         info = reader.getinfo("root/a-b")
         assert (info.mode, info.uid, info.gid, _nanoseconds(info.pax_headers["mtime"])) == (
             normalized_mode,
@@ -466,7 +461,6 @@ def test_capture_normalizes_metadata_sorts_physical_members_and_preserves_on_req
             metadata.st_gid,
             metadata.st_mtime_ns,
         )
-        reader.verify()
 
 
 def test_capture_deep_directories_without_python_recursion(tmp_path):
@@ -487,7 +481,6 @@ def test_capture_deep_directories_without_python_recursion(tmp_path):
             writer.add(root, "root")
         with zstar.Archive(output.getvalue()) as reader:
             assert reader.entry_count == depth + 1
-            reader.verify()
     finally:
         sys.setrecursionlimit(recursion_limit)
         while child != root:
@@ -513,12 +506,12 @@ def test_capture_merges_directory_siblings_in_utf8_path_order(tmp_path):
     with ArchiveWriter(output) as writer:
         writer.add(root, "root")
     data = output.getvalue()
-    data_end = int.from_bytes(data[-56:-48], "little")
+    data_end = len(data) - 44 - int.from_bytes(data[-36:-28], "little")
     decoded = _native.decode_object(data[:data_end], 512 * len(expected) + 1024)
     with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as physical:
         assert physical.getnames() == expected
     with zstar.Archive(data) as reader:
-        reader.verify()
+        assert reader.entry_count == len(expected)
 
 
 def test_writer_rejects_duplicates_at_finalization_without_retaining_names():
@@ -554,7 +547,6 @@ def test_writer_large_external_entry(corpus_dir):
         writer._writer.add(entry)
     with zstar.Archive(output.getvalue()) as reader:
         assert len(reader._reader.entry("file")[6]) == 65_537
-        assert reader.verify() is None
 
 
 def test_writer_preflights_impossible_inline_metadata():
@@ -581,12 +573,23 @@ def test_frame_sizes_are_caller_policy():
     encoded = output.getvalue()
     with zstar.Archive(encoded) as reader:
         assert reader.read_range("large", (17 << 20) - 1, 17 << 20) == b"x"
-        assert reader.verify() is None
-    with pytest.raises(zstar.ZstarError) as caught:
-        zstar.Archive(encoded, limits={"max_frame_decoded_bytes": 16 << 20})
+
+    with (
+        pytest.raises(zstar.ZstarError) as caught,
+        zstar.Archive(encoded, limits={"max_frame_decoded_bytes": 16 << 20}) as reader,
+    ):
+        reader.getinfo("large")
     assert caught.value.category == "resource-limit"
     with pytest.raises(zstar.ZstarError) as caught:
         ArchiveWriter(
             io.BytesIO(), frame_size=32 << 20, limits={"max_frame_decoded_bytes": 16 << 20}
         )
     assert caught.value.category == "resource-limit"
+
+
+def test_optional_extension_pages_round_trip():
+    output = io.BytesIO()
+    with ArchiveWriter(output, extension_pages={"x-optional": ["first", [7]]}):
+        pass
+    with zstar.Archive(output.getvalue()) as archive:
+        assert archive.entry_count == 0

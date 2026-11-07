@@ -26,7 +26,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<staged_writer::StagedMember>()?;
     m.add_function(wrap_pyfunction!(staged_writer::member_name, m)?)?;
     m.add_function(wrap_pyfunction!(request::put_presigned, m)?)?;
-    m.add_function(wrap_pyfunction!(s3::s3_archive_metadata, m)?)?;
     m.add_class::<sync_archive::SyncArchive>()?;
     m.add_class::<sync_archive::SyncEntries>()?;
     m.add_class::<reader::MemberCursor>()?;

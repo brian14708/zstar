@@ -166,7 +166,6 @@ impl Read for Body {
 /// finishes. Discard partial output. Borrow a remote upload sink with `&mut` if
 /// it must remain available for aborting the upload after an error.
 pub struct Builder<W> {
-    initial: Option<WriterOptions>,
     sink: Option<W>,
     output: Option<mpsc::Receiver<Output>>,
     writer: Option<BlockingBuilder<Sink>>,
@@ -198,36 +197,37 @@ fn complete(
 }
 impl<W> Builder<W> {
     fn stop(&mut self) {
-        self.initial.take();
         self.output.take();
         self.writer.take();
         self.worker.take();
     }
 }
 impl<W: AsyncWrite + Unpin> Builder<W> {
-    /// Creates a lazy builder with default [`WriterOptions`].
-    /// No runtime is needed until an async operation is polled.
-    /// Use [`Self::try_with_options`] to report initialization errors immediately.
-    pub fn new(output: W) -> Self {
-        Self::with_options(output, WriterOptions::default())
-    }
-    /// Creates a lazy builder. Initialization errors are returned by the first
-    /// append or finish operation. Construction does not start background work.
-    pub const fn with_options(output: W, options: WriterOptions) -> Self {
-        Self {
-            initial: Some(options),
-            sink: Some(output),
-            output: None,
-            writer: None,
-            worker: None,
-        }
-    }
     /// Initializes a writer and reports invalid options before returning it.
     ///
     /// # Errors
     /// Returns configuration, storage initialization, or missing-runtime errors.
     pub async fn try_with_options(output: W, options: WriterOptions) -> Result<Self> {
-        let mut builder = Self::with_options(output, options);
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Unsupported("writer requires a Tokio runtime"))?;
+        let (send, output_rx) = mpsc::channel(2);
+        let worker = handle.spawn_blocking(move || {
+            let writer = BlockingBuilder::with_options(
+                Sink(send.clone()),
+                options.frame_size,
+                options.compression_level,
+                options.manifest_options(),
+            )
+            .and_then(|writer| writer.with_workers(options.workers))
+            .and_then(|writer| writer.with_root_extensions(options.root_extensions));
+            complete(send, writer.map(Some))
+        });
+        let mut builder = Self {
+            sink: Some(output),
+            output: Some(output_rx),
+            writer: None,
+            worker: Some(worker),
+        };
         builder.ready().await?;
         Ok(builder)
     }
@@ -248,26 +248,6 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
     /// Returns the initialization errors described by [`Self::try_with_options`].
     pub async fn try_new(output: W) -> Result<Self> {
         Self::try_with_options(output, WriterOptions::default()).await
-    }
-    fn initialize(&mut self) -> Result<()> {
-        if let Some(options) = self.initial.take() {
-            let handle = tokio::runtime::Handle::try_current()
-                .map_err(|_| Error::Unsupported("writer requires a Tokio runtime"))?;
-            let (send, output_rx) = mpsc::channel(2);
-            self.output = Some(output_rx);
-            self.worker = Some(handle.spawn_blocking(move || {
-                let writer = BlockingBuilder::with_options(
-                    Sink(send.clone()),
-                    options.frame_size,
-                    options.compression_level,
-                    options.manifest_options(),
-                )
-                .and_then(|writer| writer.with_workers(options.workers))
-                .and_then(|writer| writer.with_root_extensions(options.root_extensions));
-                complete(send, writer.map(Some))
-            }));
-        }
-        Ok(())
     }
     fn start(
         &mut self,
@@ -346,7 +326,6 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         Err(Error::Unsupported("archive writer stopped"))
     }
     async fn ready(&mut self) -> Result<()> {
-        self.initialize()?;
         if self.output.is_none() {
             return Err(Error::Unsupported("archive writer failed"));
         }

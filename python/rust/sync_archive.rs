@@ -60,17 +60,9 @@ impl SyncArchive {
     fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<SyncEntries> {
         Self::projected_entries(slf, prefix, reader::MetadataProjection::Name)
     }
-    fn _open_member(
-        &self,
-        py: Python<'_>,
-        path: &str,
-        cache_bytes: usize,
-    ) -> PyResult<reader::MemberCursor> {
+    fn _open_member(&self, py: Python<'_>, path: &str) -> PyResult<reader::MemberCursor> {
         let lease = self.reader()?;
-        block_on(
-            py,
-            reader::MemberCursor::open(&lease.reader, path, cache_bytes),
-        )
+        block_on(py, reader::MemberCursor::open(&lease.reader, path))
     }
     fn _read_member(
         &self,
@@ -106,8 +98,15 @@ impl SyncArchive {
         block_on(py, lease.read_link(path))
     }
     #[getter]
-    fn entry_count(&self) -> PyResult<u64> {
-        Ok(self.reader()?.reader.entry_count())
+    fn entry_count(&self, py: Python<'_>) -> PyResult<u64> {
+        let lease = self.reader()?;
+        block_on(py, async {
+            lease
+                .reader
+                .entry_count()
+                .await
+                .map_err(crate::support::core_error)
+        })
     }
     #[pyo3(
         signature = (
@@ -120,16 +119,6 @@ impl SyncArchive {
             archive: slf.into(),
             cursor: Arc::new(tokio::sync::Mutex::new(reader::EntryIterator::new(prefix))),
         })
-    }
-    #[pyo3(
-        signature = (
-            *,
-            external = false,
-        )
-    )]
-    fn verify(&self, py: Python<'_>, external: bool) -> PyResult<()> {
-        let lease = self.reader()?;
-        block_on(py, lease.verify(external))
     }
 
     /// Open an immutable encoded byte snapshot.

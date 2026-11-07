@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from tarfile import TarInfo
 from types import TracebackType
@@ -60,7 +60,7 @@ class _Metadata(Generic[_Reader]):
 
     @property
     def root_extensions(self) -> dict[str, ExtensionValue]:
-        """Owned authenticated root extensions; pass to the output writer to preserve."""
+        """Owned validated root extensions; pass to the output writer to preserve."""
         self._check_open()
         return self._reader.root_extensions
 
@@ -76,18 +76,18 @@ class _Metadata(Generic[_Reader]):
         if self.closed:
             raise ValueError("archive closed")
 
-    @property
-    def entry_count(self) -> int:
-        self._check_open()
-        return self._reader.entry_count
-
 
 class Archive(_Metadata[_native.SyncArchive]):
-    """Synchronous indexed reader. Opening validates metadata; verify checks all content."""
+    """Synchronous indexed reader with metadata and selected-content validation."""
 
     def __init__(self, data: Buffer, **options: Unpack[ReaderOptions]) -> None:
         """Open any bytes-like snapshot; the archive keeps one private copy."""
         self._reader = _native.SyncArchive.from_bytes(data, **options)
+
+    @property
+    def entry_count(self) -> int:
+        self._check_open()
+        return self._reader.entry_count
 
     @classmethod
     def from_bytes(cls, data: Buffer, **options: Unpack[ReaderOptions]) -> Self:
@@ -199,18 +199,18 @@ class Archive(_Metadata[_native.SyncArchive]):
     def __iter__(self) -> Iterator[TarInfo]:
         return self.members()
 
-    def open(self, member: str | TarInfo, *, cache_bytes: int = 2 << 20) -> ArchiveFile:
+    def open(self, member: str | TarInfo) -> ArchiveFile:
         """Open a read-only regular-file stream without following symlinks.
 
         Missing members raise KeyError; directories raise IsADirectoryError;
         symlinks raise tarfile.ExtractError without resolving their targets.
         The stream borrows this archive and must be closed before its owner.
-        cache_bytes bounds one retained decoded source, including bookkeeping;
-        zero disables caching. Metadata and returned bytes are separate.
+        A private 2 MiB cache retains one decoded source, including bookkeeping.
+        Metadata and returned bytes are separate.
         """
         self._check_open()
         name = _name(member)
-        return ArchiveFile(self, name, self._reader._open_member(name, cache_bytes))
+        return ArchiveFile(self, name, self._reader._open_member(name))
 
     def read(
         self,
@@ -251,14 +251,6 @@ class Archive(_Metadata[_native.SyncArchive]):
         self._check_open()
         return self._reader.read_with_report(name, offset, length, resolver=resolver)
 
-    def verify(self, *, external: bool = False) -> None:
-        """Raise on invalid archives; optionally resolve all external selections.
-
-        External object hashing follows ``verify_external``.
-        """
-        self._check_open()
-        self._reader.verify(external=external)
-
     def close(self) -> None:
         self._reader.close()
 
@@ -280,6 +272,12 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
 
     def __init__(self) -> None:
         raise TypeError("use await AsyncArchive.from_file() or another from_* constructor")
+
+    @property
+    def entry_count(self) -> Awaitable[int]:
+        """Await the count after validating every metadata page."""
+        self._check_open()
+        return self._reader.entry_count
 
     async def getmetadata(self, name: str) -> EntryMetadata:
         """Return owned metadata including all entry extensions."""
@@ -397,19 +395,17 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
         return self.members()
 
     @asynccontextmanager
-    async def open(
-        self, member: str | TarInfo, *, cache_bytes: int = 2 << 20
-    ) -> AsyncGenerator[AsyncArchiveFile]:
+    async def open(self, member: str | TarInfo) -> AsyncGenerator[AsyncArchiveFile]:
         """Open a member with ``async with archive.open(name)``.
 
         Missing members raise KeyError; directories raise IsADirectoryError;
         symlinks raise tarfile.ExtractError without resolving their targets.
         The member closes on context exit; its owner stays open.
-        cache_bytes bounds one retained decoded source; zero disables caching.
+        A private 2 MiB cache retains one decoded source, including bookkeeping.
         """
         self._check_open()
         name = _name(member)
-        cursor = await self._reader._open_member(name, cache_bytes)
+        cursor = await self._reader._open_member(name)
         async with AsyncArchiveFile(self, name, cursor) as stream:
             yield stream
 
@@ -454,14 +450,6 @@ class AsyncArchive(_Metadata[_native.AsyncArchive]):
     ) -> tuple[bytes, ReadReport]:
         self._check_open()
         return await self._reader.read_with_report(name, offset, length, resolver=resolver)
-
-    async def verify(self, *, external: bool = False) -> None:
-        """Raise on invalid archives; optionally resolve all external selections.
-
-        External object hashing follows ``verify_external``.
-        """
-        self._check_open()
-        await self._reader.verify(external=external)
 
     async def close(self) -> None:
         await self._reader.close()

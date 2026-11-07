@@ -11,7 +11,7 @@ from zstar import AsyncArchiveWriter, _native
 
 
 @pytest.mark.parametrize("ranged", [False, True])
-def test_async_iteration_reads_reports_verification_and_close(ranged, inline_data, source_factory):
+def test_async_iteration_reads_reports_and_close(ranged, inline_data, source_factory):
     data = inline_data
     source = source_factory(data)
 
@@ -30,17 +30,15 @@ def test_async_iteration_reads_reports_verification_and_close(ranged, inline_dat
             assert (await archive.getinfo(first.name)).name == first.name
             with pytest.raises(KeyError):
                 await archive.getinfo("missing")
-            assert archive.entry_count == len(expected)
+            assert await archive.entry_count == len(expected)
             assert [first.name] + [entry.name async for entry in iterator] == expected
             assert [entry async for entry in iterator] == []
-            assert source.calls == (2 if ranged else 0)
+            assert source.calls == (4 if ranged else 0)  # Open plus complete metadata scan.
             assert await archive.read_many([("a-b", 0, 2), ("a-b", 1, 4)]) == [b"he", b"ello"]
             assert await archive.read("a-b", 1, 4) == b"ello"
             payload, report = await archive.read_with_report("a-b", 0, 5)
             assert payload == b"hello"
-            assert report["metadata_authenticated"] and report["data_frames_checked"]
-            await archive.verify()
-
+            assert report["metadata_validated"] and report["data_frames_checked"]
             pending = archive.members()
         assert not source.closed
         await archive.close()
@@ -55,14 +53,14 @@ def test_async_iteration_reads_reports_verification_and_close(ranged, inline_dat
     asyncio.run(exercise())
 
 
-def test_async_open_authenticates_metadata_and_verify_checks_unread_content(corpus_dir):
+def test_async_open_validates_metadata_and_reads_check_selected_content(corpus_dir):
     data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
 
     async def exercise():
         async with await zstar.AsyncArchive.from_bytes(data) as archive:
             assert (await archive.getinfo("a-b")).isfile()
             with pytest.raises(zstar.ZstarError) as caught:
-                await archive.verify()
+                await archive.read("a-b")
             assert caught.value.category == "integrity-failure"
 
     asyncio.run(exercise())
@@ -103,7 +101,6 @@ def test_async_resolvers_and_verification_policy(
             resolver=object_resolver, verify_external=verify_external
         ) as archive:
             assert await archive.read("hello.txt") == b"hello\n"
-            await archive.verify(external=True)
 
         async with await open_archive(verify_external=verify_external) as archive:
             assert await archive.read("world.txt", resolver=object_resolver) == b"world\n"

@@ -99,9 +99,7 @@ func TestRustFSNativeArchiveObjectsAndPresignedRanges(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if err := reader.Verify(ctx, zstar.VerifyExternalClosure); err != nil {
-		t.Fatal(err)
-	}
+
 	if got, err := reader.Read(ctx, "inline", 1, 3); err != nil || string(got) != "ell" {
 		t.Fatalf("inline: %q %v", got, err)
 	}
@@ -169,14 +167,14 @@ func TestRustFSNativeArchiveObjectsAndPresignedRanges(t *testing.T) {
 	if size, err := NewSource(client, bucket, emptyKey).Size(ctx); err != nil || size != 0 {
 		t.Fatalf("empty upload %d %v", size, err)
 	}
-	// The source pins ETag even if a replacement has exactly the same length.
+	// Prefetched bytes remain bound to the original snapshot after replacement.
 	changed := bytes.Clone(archiveBytes.Bytes())
 	changed[0] ^= 1
 	if _, err = client.PutObject(ctx, &awss3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(changed)}); err != nil {
 		t.Fatal(redacted(err))
 	}
-	if _, err = source.ReadRange(ctx, 0, 1); err == nil {
-		t.Fatal("replaced archive accepted")
+	if got, readErr := source.ReadRange(ctx, 0, 1); readErr != nil || !bytes.Equal(got, archiveBytes.Bytes()[:1]) {
+		t.Fatalf("cached snapshot changed: %x %v", got, readErr)
 	}
 }
 

@@ -59,7 +59,7 @@ def synchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(archive.read("hello"), bytes)
         assert_type(archive.read_many([("hello", 0, 1)]), list[bytes])
         assert_type(archive.read_with_report("hello"), tuple[bytes, ReadReport])
-        assert_type(archive.verify(), None)
+        assert_type(archive.entry_count, int)
         member = archive.open(StandardTarInfo("hello"))
         with member as file:
             assert_type(file.read(), bytes)
@@ -91,7 +91,7 @@ async def asynchronous(source: RangeSource, resolver: ObjectResolver) -> None:
         assert_type(await archive.read("hello"), bytes)
         assert_type(await archive.read_many([("hello", 0, 1)]), list[bytes])
         assert_type(await archive.read_with_report("hello"), tuple[bytes, ReadReport])
-        assert_type(await archive.verify(), None)
+        assert_type(await archive.entry_count, int)
         async with archive.open("hello") as file:
             assert_type(await file.read(), bytes)
             assert_type(await file.readinto(memoryview(bytearray(4))), int)

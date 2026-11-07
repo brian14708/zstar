@@ -6,8 +6,8 @@ The catalog proposal defines a separate document for organizing archives.
 
 | Document | Scope | Status |
 | --- | --- | --- |
-| [Core](core.md) | Archive framing, tar profile, manifest, inline extents, validation, and implementation profiles | Working draft |
-| [External content](external-content.md) | `external-content`, object extents, thin pointers, standalone references, and closure verification | Working draft; SDK support documented per package |
+| [Core](core.md) | Archive framing, tar profile, paged metadata, inline extents, validation, and implementation profiles | Working draft |
+| [External content](external-content.md) | `external-content`, object extents, thin pointers, standalone references | Working draft; SDK support documented per package |
 | [Catalog](catalog.md) | Named JSON catalogs, collection paths, CAS layers, delegation, and whiteout merging | Design proposal; not implemented |
 
 Implementations can support core alone or add optional extensions. Rust, Go,

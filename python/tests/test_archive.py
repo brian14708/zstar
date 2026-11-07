@@ -77,7 +77,6 @@ def test_tar_info_lazy_members_file_streams_and_owned_metadata(encoded_archive):
             archive.getinfo("missing")
         with pytest.raises(KeyError):
             archive.read("missing")
-        archive.verify()
 
         assert archive.read("dir/file", 6) == b"world\n"
         assert archive.read_with_report("dir/file", 6)[0] == b"world\n"
@@ -246,7 +245,7 @@ def test_main_reader_metadata_open_does_not_certify_unread_content(corpus_dir):
                 member.readinto(buffer)
             assert buffer == b"?????" and member.tell() == 0
         with pytest.raises(zstar.ZstarError):
-            archive.verify()
+            archive.read("a-b")
 
 
 def test_missing_native_extension_reports_installation_guidance(tmp_path):
@@ -282,14 +281,13 @@ def test_sync_readers_close_after_context_exception_without_closing_source(range
         pass
 
 
-def test_external_closure_verification_obeys_read_budget(object_resolver, thin_data):
+def test_external_reads_obey_read_budget(object_resolver, thin_data):
     from zstar import Archive
 
     encoded = thin_data
 
     objects = object_resolver
     archive = Archive(encoded, max_read_bytes=1, resolver=objects, verify_external=True)
-    archive.verify(external=True)
 
     assert archive.read("world.txt", 0, 1) == b"w"
     with pytest.raises(zstar.ZstarError, match="budget"):
@@ -436,7 +434,7 @@ def test_raw_s3_requires_explicit_configuration(monkeypatch):
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_projected_metadata_preserves_fields_and_skips_content(asynchronous):
     # Exercise more than one native batch and multiple extents without fetching
-    # external objects. Ordinary iteration authenticates extensions without projecting them.
+    # external objects. Ordinary iteration validates extensions without projecting them.
     output = io.BytesIO()
     expected_names = [f"f{i:04}" for i in range(130)] + ["link"]
     extents = ((2, "sha256:" + "01" * 32, 10), (3, "sha256:" + "02" * 32, 12))
@@ -593,12 +591,12 @@ def test_metadata_projection_reports_root_extension_loss(empty, asynchronous):
                     archive.getinfo("file")
 
 
-@pytest.mark.parametrize("cache_bytes,expected", [(2 << 20, 1), (0, 128), (1024, 128)])
+@pytest.mark.parametrize("size,expected", [(1 << 20, 1), (3 << 20, 128)])
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_member_stream_reuses_decoded_source(cache_bytes, expected, asynchronous):
+def test_member_stream_reuses_decoded_source(size, expected, asynchronous):
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
-        writer.write_bytes("file", b"x" * (1 << 20))
+    with zstar.ArchiveWriter(output, frame_size=4 << 20) as writer:
+        writer.write_bytes("file", b"x" * size)
 
     class Source:
         calls = 0
@@ -611,8 +609,8 @@ def test_member_stream_reuses_decoded_source(cache_bytes, expected, asynchronous
 
     async def run():
         async with await zstar.AsyncArchive.from_source(source, len(output.getvalue())) as archive:
-            source.calls = 0
-            async with archive.open("file", cache_bytes=cache_bytes) as stream:
+            async with archive.open("file") as stream:
+                source.calls = 0
                 for _ in range(128):
                     assert await stream.read(1) == b"x"
             assert source.calls == expected
@@ -621,8 +619,8 @@ def test_member_stream_reuses_decoded_source(cache_bytes, expected, asynchronous
         asyncio.run(run())
     else:
         with zstar.Archive.from_source(source, len(output.getvalue())) as archive:
-            source.calls = 0
-            with archive.open("file", cache_bytes=cache_bytes) as stream:
+            with archive.open("file") as stream:
+                source.calls = 0
                 for _ in range(128):
                     assert stream.read(1) == b"x"
             assert source.calls == expected

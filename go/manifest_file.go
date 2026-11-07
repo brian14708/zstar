@@ -11,6 +11,9 @@ import (
 // File is a logical member view. It retains bounded entry metadata and
 // borrows its manifest, which must remain open. ReadAt supports concurrent calls;
 // WriteTo streams complete selected extents without a whole-file allocation.
+// One decoded source is retained within a private 2 MiB budget. Close releases
+// the cache without closing the archive or source; dropping the handle also
+// allows its storage to be reclaimed.
 type File struct {
 	manifest       *manifest
 	entry          *Entry
@@ -18,6 +21,7 @@ type File struct {
 	verifyExternal bool
 	size           uint64
 	starts         []uint64
+	cache          memberCache
 }
 
 // OpenFile returns a concurrent random-access view of a regular member.
@@ -27,7 +31,8 @@ func (m *manifest) OpenFile(ctx context.Context, path string, resolver EncodedCo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	entry, err := m.Entry(path)
+	entryValue, err := m.entrySnapshotContext(ctx, path)
+	entry := &entryValue
 	if err != nil {
 		return nil, pathError("open", path, err)
 	}
@@ -51,6 +56,14 @@ func (m *manifest) openEntryFile(entry *Entry, resolver EncodedContentResolver, 
 	return &File{manifest: m, entry: entry, resolver: resolver, verifyExternal: verifyExternal, size: size, starts: starts}, nil
 }
 
+// Close releases the decoded cache and prevents new reads. It is idempotent
+// and does not close the archive or source. Concurrent reads may already hold
+// decoded buffers until they finish; Close does not wait for them.
+func (f *File) Close() error {
+	f.cache.close()
+	return nil
+}
+
 // Size returns the logical member length in bytes.
 func (f *File) Size() uint64 { return f.size }
 
@@ -68,7 +81,7 @@ func (f *File) ReadAtContext(ctx context.Context, output []byte, offset int64) (
 			err = pathError("read", f.entry.Path, err)
 		}
 	}()
-	if err := f.manifest.content.checkOpen(ctx); err != nil {
+	if err := f.cache.checkOpen(ctx, f.manifest.content); err != nil {
 		return 0, err
 	}
 	if offset < 0 {
@@ -88,7 +101,7 @@ func (f *File) ReadAtContext(ctx context.Context, output []byte, offset int64) (
 		return f.readAtSerial(ctx, output, first, uint64(offset), size)
 	}
 	_, _, err = f.manifest.readRanges(ctx,
-		[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, uint64(offset), size}, entry: f.entry, output: output[:int(size)]}}, f.resolver, f.verifyExternal, false)
+		[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, uint64(offset), size}, entry: f.entry, file: f, output: output[:int(size)]}}, f.resolver, f.verifyExternal, false)
 	if err != nil {
 		return 0, err
 	}
@@ -113,7 +126,7 @@ func (f *File) WriteToContext(ctx context.Context, output io.Writer) (written in
 			err = pathError("read", f.entry.Path, err)
 		}
 	}()
-	if err := f.manifest.content.checkOpen(ctx); err != nil {
+	if err := f.cache.checkOpen(ctx, f.manifest.content); err != nil {
 		return 0, err
 	}
 	if f.size > math.MaxInt64 {
@@ -133,7 +146,7 @@ func (f *File) WriteToContext(ctx context.Context, output io.Writer) (written in
 			i++
 		}
 		results, _, err := f.manifest.readRanges(ctx,
-			[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, start, end - start}, entry: f.entry}},
+			[]readSelection{{ReadRequest: ReadRequest{f.entry.Path, start, end - start}, entry: f.entry, file: f}},
 			f.resolver, f.verifyExternal, false)
 		if err != nil {
 			return written, err
@@ -148,47 +161,6 @@ func (f *File) WriteToContext(ctx context.Context, output io.Writer) (written in
 	return written, nil
 }
 
-// Verify checks full physical validity and optionally every external selected
-// range. verifyExternal controls object hashing; checksums and range/resource
-// checks always apply. No reconstructed whole-file hash is computed.
-func (m *manifest) Verify(ctx context.Context, resolver EncodedContentResolver, verifyExternal, externalClosure bool) error {
-	err := m.ValidateArchive(ctx)
-	if err != nil {
-		return err
-	}
-	if externalClosure {
-		err = m.VisitEntries(func(entry Entry) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !entry.External() {
-				return nil
-			}
-			var previous manifestChunkKey
-			var chunk *manifestContentChunk
-			for _, extent := range entry.Extents {
-				key := chunkKey(extent)
-				if chunk == nil || key != previous {
-					var err error
-					chunk, err = m.content.get(ctx, extent, resolver, verifyExternal)
-					if err != nil {
-						return err
-					}
-					previous = key
-				}
-				if _, err := chunk.selection(extent); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (f *File) readAtSerial(ctx context.Context, output []byte, first int, offset, size uint64) (int, error) {
 	var n int
 	var previous manifestChunkKey
@@ -201,7 +173,7 @@ func (f *File) readAtSerial(ctx context.Context, output []byte, first int, offse
 		key := chunkKey(extent)
 		if chunk == nil || key != previous {
 			var err error
-			chunk, err = f.manifest.content.get(ctx, extent, f.resolver, f.verifyExternal)
+			chunk, err = f.cache.get(ctx, f, extent)
 			if err != nil {
 				return n, err
 			}
@@ -232,7 +204,7 @@ func (f *File) writeToSerial(ctx context.Context, output io.Writer) (int64, erro
 		key := chunkKey(extent)
 		if chunk == nil || key != previous {
 			var err error
-			chunk, err = f.manifest.content.get(ctx, extent, f.resolver, f.verifyExternal)
+			chunk, err = f.cache.get(ctx, f, extent)
 			if err != nil {
 				return written, err
 			}

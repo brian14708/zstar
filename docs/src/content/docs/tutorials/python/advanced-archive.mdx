@@ -5,7 +5,7 @@ title: "Advanced archive creation with Python"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../python/examples/tutorial_file.py?raw";
 
-Use `ArchiveWriter` and `Archive` to create, read, and verify an archive.
+Use `ArchiveWriter` and `Archive` to create and read an archive.
 For filesystem operations, start with the
 [fsspec tutorial](/zstar/tutorials/python/first-archive/).
 
@@ -38,19 +38,11 @@ start 0 and end 5 return `Hello`.
 
 <Example source={source} lang="python" region="read" />
 
-## Verify the archive
-
-`verify()` checks the entire archive for errors, including content you have
-not read. Call it inside the `with` block, before the reader closes.
-
-<Example source={source} lang="python" region="verify" />
-
 You should see:
 
 ```text
 Hello from Zstar
 Hello
-Archive verified
 ```
 
 ## Complete example

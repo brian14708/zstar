@@ -81,9 +81,8 @@ save cache metadata, reuse the same block size, and manage the cache directory's
 disk usage. `check_files=True` checks source identity before reuse. Keep source
 objects immutable while an archive is open.
 
-Each member stream retains at most one validated decoded source within
-`member_cache_bytes` (2 MiB by default, including cache bookkeeping). Set it to
-zero to disable retention. Entry metadata and returned buffers are separate.
+Each member stream privately retains at most one validated decoded source within
+2 MiB, including cache bookkeeping. Entry metadata and returned buffers are separate.
 Sources larger than the budget are decoded without retention.
 Backends configured with `asynchronous=True` use direct async range I/O and bypass
 stream caching; use a synchronous backend or disk-cache wrapper for source caching.
@@ -150,11 +149,9 @@ byte prefix. Results are owned snapshots; changing them does not change the arch
 `read_link()` returns a symlink's exact stored target, and
 `read_range(name, start, end)` reads a half-open member range.
 
-Opening completes metadata authentication and validation; use `verify()` for
-physical archive or external-closure validation (`verify(external=True)`).
+Opening validates the directory; lookups validate selected pages and ancestors.
 External SHA-256 checking defaults to disabled; pass `verify_external=True` when
-opening to enable it. Metadata hashes, frame checksums, and extent bounds always
-remain enabled. Reports identify external objects read without hashing.
+opening to enable it. Zstandard frame checksums and extent bounds always remain enabled. Reports identify external objects read without hashing.
 Reader options include
 `concurrent_chunks`; writer options include `workers`. Public option, report,
 and storage protocol types live in `zstar.types`.
@@ -218,8 +215,8 @@ path automatically.
 Keep the archive or filesystem open across reads to reuse parsed metadata. Use
 `read_many()` or fsspec's `cat_ranges()` to share work across related ranges.
 Direct archive reads do not retain decoded content. Member streams reuse one
-validated decoded source; configure `archive.open(name, cache_bytes=2 << 20)` or
-set `cache_bytes=0` to disable retention. The async interface uses the same option.
+validated decoded source within a private 2 MiB cache. The async interface uses
+the same optimization.
 
 Filename and member iteration uses bounded native batches without constructing
 Python extent or extension objects. Prefer `names()` when only filenames are
@@ -245,8 +242,8 @@ to a writer.
 
 ## Resource limits
 
-Opening reads the complete manifest and retains an index within the metadata
-budget. Spooling metadata to disk does not reduce index memory.
+Opening retains the directory and caches entry pages on demand.
+Spooling does not reduce memory held by the directory or cached pages.
 
 Pass `limits` to bound frame and window bytes, entry bytes, extent counts, and
 pointer bytes. Zero or omission disables each additional limit; metadata and
@@ -255,7 +252,7 @@ index budgets are separate. For example,
 for your application without changing which archives are valid.
 
 Default frame and window limits are disabled, so defaults do not provide a
-finite aggregate content-memory ceiling. Peak memory includes the retained index,
+finite aggregate content-memory ceiling. Peak memory includes the directory and cached pages,
 up to `concurrent_chunks` encoded inputs, decoded sources and codec workspaces,
 member caches, and returned buffers. For example:
 
@@ -274,3 +271,18 @@ with Archive.from_file("archive.zstar", **options) as archive:
 ```
 
 The [format specification](/zstar/reference/spec/core/) defines the format and validation rules.
+
+Optional extension pages can be written with `extension_pages`, a map from `x-` group
+names to lists of CBOR values. Each value is encoded as a separate page.
+Readers skip unknown optional groups during selective reads and validate them
+during complete metadata scans.
+
+Native S3 readers discover size and snapshot identity with a suffix GET and
+retain up to 128 KiB for metadata and content reads. Small archives can therefore
+open and read with a single GET and no HEAD. This prioritizes fewer round trips
+over minimum transferred bytes; uncached ranges still use the pinned identity.
+Archive discovery uses the terminal footer; no Zstar-specific S3 object metadata
+is written or required.
+Local file readers read the footer and directory separately, then load entry
+pages on demand using positional reads. Raw-byte caching belongs to the supplied
+source or fsspec backend; the archive does not retain encoded ranges across operations.

@@ -364,10 +364,7 @@ impl HttpTransport for ReqwestTransport {
         let is_archive = body
             .get(length.saturating_sub(crate::FOOTER_SIZE)..)
             .and_then(|bytes| crate::parse_footer(bytes).ok())
-            .is_some_and(|footer| {
-                footer.toc_offset.checked_add(footer.toc_encoded_len)
-                    == (length as u64).checked_sub(crate::FOOTER_SIZE as u64)
-            });
+            .is_some_and(|footer| footer.metadata_range(length as u64).is_ok());
         let mut req = self.client.put(&request.url).body(body);
         for (key, value) in request.headers {
             req = req.header(key, value);

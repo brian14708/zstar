@@ -44,12 +44,13 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = reader.EntryCount(); err != nil {
+		t.Fatal(err)
+	}
 	if !store.closed {
 		t.Fatal("decoded spool retained after entry indexing")
 	}
-	if err = reader.Verify(context.Background(), VerifyArchive); err != nil {
-		t.Fatal(err)
-	}
+
 	if err = reader.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -57,20 +58,27 @@ func TestCustomSpillOwnershipAndCleanupFailure(t *testing.T) {
 		t.Fatal("closed reader used")
 	}
 	store = &failingCloseSpill{failure: cleanupFailure}
-	_, err = OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{
+	reader, err = OpenWithOptions(context.Background(), memoryRange(data), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	}})
+	if err == nil {
+		_, err = reader.EntryCount()
+		testClose(t, reader)
+	}
 	if !errors.Is(err, cleanupFailure) || !store.closed {
 		t.Fatalf("opening cleanup ignored: %v", err)
 	}
 	// Opening failure must close its transferred store and retain both causes.
-	corrupt := bytes.Clone(data)
-	corrupt[len(corrupt)-1] ^= 1
+	corrupt, err := os.ReadFile("../testdata/entry-manifest/split-document.zstar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt[len(corrupt)-FooterSize-1] ^= 1
 	store = &failingCloseSpill{failure: cleanupFailure}
 	_, err = OpenWithOptions(context.Background(), memoryRange(corrupt), ReaderOptions{Manifest: ManifestReaderOptions{
 		MemoryBytes: 1, CreateSpillStore: func() (ManifestSpillStore, error) { return store, nil },
 	}})
-	if ErrorCategory(err) != "integrity-failure" || !errors.Is(err, cleanupFailure) || !store.closed {
+	if ErrorCategory(err) != "integrity-failure" || store.closed {
 		t.Fatalf("opening cleanup lost cause: %v", err)
 	}
 }

@@ -245,7 +245,7 @@ fn extracts_thin_objects_without_pointer_leakage() {
 fn external_hash_policy_keeps_metadata_codec_tar_pointer_and_path_checks() {
     for fixture in [
         "data-checksum",
-        "metadata-hash",
+        "metadata-checksum",
         "tar-header",
         "tar-end",
         "pointer-mismatch",
@@ -326,16 +326,6 @@ fn external_hash_policy_keeps_metadata_codec_tar_pointer_and_path_checks() {
         .success()
     );
     assert!(fs::read_dir(outside).unwrap().next().is_none());
-    assert!(
-        !run(&[
-            Path::new("extract"),
-            &input,
-            &root.path().join("legacy-flag"),
-            Path::new("--skip-content-hash")
-        ])
-        .status
-        .success()
-    );
 }
 
 #[test]
@@ -365,7 +355,7 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
         zstar::backend::ManifestOptions::default(),
     )
     .unwrap();
-    archive.validate().unwrap();
+
     let link = archive.entry("link").unwrap().unwrap();
     assert_eq!(link.linkname.as_deref(), Some("/missing/.././target"));
     assert_eq!(link.uid, u64::from(link_meta.uid()));
@@ -389,14 +379,14 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
     use std::io::{Seek, SeekFrom, Write};
     let temp = tempfile::tempdir().unwrap();
     let bytes = BlockingBuilder::new(Vec::new()).unwrap().finish().unwrap();
-    let mut footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
-    let old_start = footer.toc_offset;
-    footer.toc_offset = (2 << 30) + old_start;
+    let footer =
+        zstar::backend::parse_footer(&bytes[bytes.len() - zstar::backend::FOOTER_SIZE..]).unwrap();
+    let old_start = footer.metadata_range(bytes.len() as u64).unwrap().start;
     let input = temp.path().join("large.zstar");
     let mut file = fs::File::create(&input).unwrap();
     file.write_all(&bytes[..old_start as usize]).unwrap();
-    file.seek(SeekFrom::Start(footer.toc_offset)).unwrap();
-    file.write_all(&bytes[old_start as usize..bytes.len() - 80])
+    file.seek(SeekFrom::Start((2 << 30) + old_start)).unwrap();
+    file.write_all(&bytes[old_start as usize..bytes.len() - zstar::backend::FOOTER_SIZE])
         .unwrap();
     file.write_all(&zstar::backend::encode_footer(&footer))
         .unwrap();
@@ -407,12 +397,6 @@ fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validit
         String::from_utf8_lossy(&inspection.stderr)
     );
     assert!(String::from_utf8_lossy(&inspection.stdout).contains("entries=0"));
-    let mut archive = BlockingArchive::open(
-        zstar::fs::LocalFileSource::open(&input).unwrap(),
-        zstar::backend::ManifestOptions::default(),
-    )
-    .unwrap();
-    assert!(archive.validate().is_err());
 }
 
 #[test]
@@ -444,13 +428,6 @@ fn capture_controls_and_destination_handle_limits_are_local_policies() {
         "{}",
         String::from_utf8_lossy(&packed.stderr)
     );
-    let bytes = fs::read(&archive).unwrap();
-    let mut parsed = BlockingArchive::open(
-        SliceReader::new(&bytes),
-        zstar::backend::ManifestOptions::default(),
-    )
-    .unwrap();
-    parsed.validate().unwrap();
     let limited = root.path().join("limited");
     let result = run(&[
         Path::new("extract"),

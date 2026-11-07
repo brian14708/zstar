@@ -3,7 +3,7 @@
 # dependencies = ["zstar-py>=0.0.1"]
 # ///
 
-"""Write an archive to a file, read its contents, and verify it."""
+"""Write an archive to a file, read its contents."""
 
 from zstar import Archive, ArchiveWriter
 
@@ -23,10 +23,6 @@ def main() -> None:
         print(content.decode(), end="")
         print(selected.decode())
         # endregion read
-        # region verify
-        archive.verify()
-        print("Archive verified")
-        # endregion verify
 
 
 if __name__ == "__main__":

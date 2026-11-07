@@ -11,7 +11,6 @@ import pytest
 import zstar
 from zstar import _native
 from zstar._fsspec import ZstarFileSystem
-from zstar._native import s3_archive_metadata
 
 
 @pytest.mark.skipif(not os.getenv("ZSTAR_S3_ENDPOINT"), reason="requires local RustFS")
@@ -41,20 +40,14 @@ def test_native_s3_and_presigned_archive_and_external_objects(monkeypatch):
     try:
         keys.append("thin.zstar")
         thin = (root / "entry-manifest/thin.zstar").read_bytes()
-        client.put_object(
-            Bucket=bucket, Key=keys[-1], Body=thin, Metadata=s3_archive_metadata(thin)
-        )
-        assert client.head_object(Bucket=bucket, Key=keys[-1])["Metadata"] == s3_archive_metadata(
-            thin
-        )
+        client.put_object(Bucket=bucket, Key=keys[-1], Body=thin)
+        assert client.head_object(Bucket=bucket, Key=keys[-1])["Metadata"] == {}
         for path in (root / "entry-manifest/objects").glob("*.zst"):
             keys.append(f"objects/{path.name}")
             client.put_object(Bucket=bucket, Key=keys[-1], Body=path.read_bytes())
         portable = bytes(_native.pack_file("hello", b"hello RustFS"))
         keys.append("inline.zstar")
-        client.put_object(
-            Bucket=bucket, Key=keys[-1], Body=portable, Metadata=s3_archive_metadata(portable)
-        )
+        client.put_object(Bucket=bucket, Key=keys[-1], Body=portable)
         url = client.generate_presigned_url(
             "get_object", Params={"Bucket": bucket, "Key": "inline.zstar"}, ExpiresIn=60
         )
@@ -69,7 +62,7 @@ def test_native_s3_and_presigned_archive_and_external_objects(monkeypatch):
             secret_access_key="zstar-test-secret",
         ) as native:
             assert native.read("hello", 6, 6) == b"RustFS"
-            assert native.verify() is None
+
         with zstar.Archive.from_s3(
             bucket,
             "thin.zstar",
@@ -130,6 +123,7 @@ def test_native_s3_and_presigned_archive_and_external_objects(monkeypatch):
             }
             for path, expected in expected_files.items():
                 assert await native.read(path) == expected
+            assert await native.entry_count == 3
             external = expected_files["hello.txt"]
             assert await native.read_many(
                 [("hello.txt", 1, 4), ("hello.txt", 0, len(external)), ("hello.txt", 0, 0)]
@@ -152,7 +146,7 @@ def test_native_s3_and_presigned_archive_and_external_objects(monkeypatch):
 
             refreshed = await zstar.AsyncArchive.from_url(provider=get_provider)
             assert await refreshed.read("hello") == b"hello RustFS"
-            assert refreshes == [("GET", False), ("GET", True)] * 4
+            assert refreshes == [("GET", False), ("GET", True)] * 5
             for key, body in [("uploaded.zstar", portable), ("empty.bin", b"")]:
                 keys.append(key)
 
@@ -425,7 +419,7 @@ def test_fsspec_s3_writer_commit_and_abort():
             original.close()
         with zstar.Archive(encoded) as archive:
             assert archive.read("dir/data") == b"hello"
-            assert archive.verify() is None
+
         with (
             pytest.raises(RuntimeError, match="abort"),
             fsspec.filesystem("zstar", fo=location, mode="w", target_options=options) as fs,

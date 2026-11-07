@@ -39,7 +39,6 @@ func FuzzIndexedArchive(f *testing.F) {
 				}
 			}
 		}
-		_ = reader.Verify(ctx, VerifyArchive) //nolint:errcheck // Malformed inputs may fail; this campaign checks bounded execution and panics.
 	})
 }
 

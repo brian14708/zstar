@@ -3,7 +3,7 @@ use crate::{Error, Result, decode_frame_into};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::ops::Range;
 
-pub const FOOTER_SIZE: usize = 80;
+pub const FOOTER_SIZE: usize = 44;
 pub const FOOTER_MAGIC: u32 = 0x184D_2A5F;
 pub const TOC_MAGIC: u32 = 0x184D_2A5E;
 
@@ -59,68 +59,84 @@ pub const fn checked_range(offset: u64, length: u64, size: u64) -> Result<Range<
     Ok(offset..offset + length)
 }
 
+/// Lengths stored in the fixed terminal footer. Metadata positions are derived from archive size.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Footer {
-    pub toc_offset: u64,
     pub toc_encoded_len: u64,
     pub toc_decoded_len: u64,
-    pub toc_sha256: [u8; 32],
+    pub directory_encoded_len: u64,
+    pub directory_decoded_len: u64,
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
+impl Footer {
+    /// Derive and validate the metadata region for the complete encoded archive size.
+    ///
+    /// # Errors
+    /// Returns an error for empty metadata, underflow, or an empty data region.
+    pub fn metadata_range(&self, source_size: u64) -> Result<Range<u64>> {
+        let end = source_size
+            .checked_sub(FOOTER_SIZE as u64)
+            .ok_or(Error::MalformedFooter("manifest coverage"))?;
+        let start = end
+            .checked_sub(self.toc_encoded_len)
+            .filter(|start| *start > 0)
+            .ok_or(Error::MalformedFooter("manifest coverage"))?;
+        if self.directory_encoded_len <= 8
+            || self.directory_encoded_len > self.toc_encoded_len
+            || self.directory_decoded_len == 0
+            || self.directory_decoded_len > self.toc_decoded_len
+        {
+            return Err(Error::MalformedFooter("invalid TOC bounds"));
+        }
+        Ok(start..end)
+    }
+}
+
+/// Parse and validate the fixed 44-byte terminal footer.
+///
+/// # Errors
+/// Returns an error for an invalid signature, payload size, or metadata lengths.
 #[expect(
     clippy::missing_panics_doc,
-    reason = "Unwraps enforce internal invariants established before this operation."
+    reason = "Fixed-length slices are established by the footer size check."
 )]
-/// Parse and validate the fixed 80-byte terminal footer.
 pub fn parse_footer(bytes: &[u8]) -> Result<Footer> {
     if bytes.len() != FOOTER_SIZE {
-        return Err(Error::MalformedFooter("footer must be 80 bytes"));
+        return Err(Error::MalformedFooter("footer must be 44 bytes"));
     }
-    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != FOOTER_MAGIC
-        || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != 72
+    if bytes[..4] != FOOTER_MAGIC.to_le_bytes() || &bytes[40..] != b"Z*01" {
+        return Err(Error::NotZstar);
+    }
+    if bytes[4..8] != 36_u32.to_le_bytes() {
+        return Err(Error::MalformedFooter("footer payload length"));
+    }
+    let footer = Footer {
+        toc_encoded_len: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        toc_decoded_len: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        directory_encoded_len: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+        directory_decoded_len: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+    };
+    if footer.directory_encoded_len <= 8
+        || footer.directory_encoded_len > footer.toc_encoded_len
+        || footer.directory_decoded_len == 0
+        || footer.directory_decoded_len > footer.toc_decoded_len
     {
-        return Err(Error::NotZstar);
-    }
-    if &bytes[8..16] != b"ZSTAR001" {
-        return Err(Error::NotZstar);
-    }
-    if u32::from_le_bytes(bytes[16..20].try_into().unwrap()) != 1 {
-        return Err(Error::UnsupportedVersion("footer"));
-    }
-    if bytes[20..24] != [0; 4] {
-        return Err(Error::MalformedFooter("reserved field"));
-    }
-    let toc_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    let toc_encoded_len = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    let toc_decoded_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-    if toc_offset == 0 || toc_encoded_len <= 8 || toc_decoded_len == 0 {
         return Err(Error::MalformedFooter("invalid TOC bounds"));
     }
-    let mut digest = [0; 32];
-    digest.copy_from_slice(&bytes[48..80]);
-    Ok(Footer {
-        toc_offset,
-        toc_encoded_len,
-        toc_decoded_len,
-        toc_sha256: digest,
-    })
+    Ok(footer)
 }
 
+/// Encode the fixed 44-byte terminal footer. Validate coverage with [`Footer::metadata_range`].
 #[must_use]
 pub fn encode_footer(footer: &Footer) -> [u8; FOOTER_SIZE] {
     let mut out = [0u8; FOOTER_SIZE];
-    out[0..4].copy_from_slice(&FOOTER_MAGIC.to_le_bytes());
-    out[4..8].copy_from_slice(&72u32.to_le_bytes());
-    out[8..16].copy_from_slice(b"ZSTAR001");
-    out[16..20].copy_from_slice(&1u32.to_le_bytes());
-    out[24..32].copy_from_slice(&footer.toc_offset.to_le_bytes());
-    out[32..40].copy_from_slice(&footer.toc_encoded_len.to_le_bytes());
-    out[40..48].copy_from_slice(&footer.toc_decoded_len.to_le_bytes());
-    out[48..80].copy_from_slice(&footer.toc_sha256);
+    out[..4].copy_from_slice(&FOOTER_MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&36_u32.to_le_bytes());
+    out[8..16].copy_from_slice(&footer.toc_encoded_len.to_le_bytes());
+    out[16..24].copy_from_slice(&footer.toc_decoded_len.to_le_bytes());
+    out[24..32].copy_from_slice(&footer.directory_encoded_len.to_le_bytes());
+    out[32..40].copy_from_slice(&footer.directory_decoded_len.to_le_bytes());
+    out[40..].copy_from_slice(b"Z*01");
     out
 }
 
@@ -172,5 +188,38 @@ impl RangeReader for SliceReader<'_> {
             self.len(),
         )?;
         Ok(self.bytes[range.start as usize..range.end as usize].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+
+    #[test]
+    fn compact_footer_preserves_u64_lengths_and_derives_bounds() {
+        let footer = Footer {
+            toc_encoded_len: (1_u64 << 32) + 9,
+            toc_decoded_len: (1_u64 << 40) + 1,
+            directory_encoded_len: 100,
+            directory_decoded_len: 200,
+        };
+        let encoded = encode_footer(&footer);
+        assert_eq!(encoded.len(), 44);
+        assert_eq!(&encoded[..8], &[0x5f, 0x2a, 0x4d, 0x18, 36, 0, 0, 0]);
+        assert_eq!(&encoded[40..], b"Z*01");
+        assert_eq!(parse_footer(&encoded).unwrap(), footer);
+        let size = footer.toc_encoded_len + FOOTER_SIZE as u64 + 123;
+        assert_eq!(footer.metadata_range(size).unwrap(), 123..size - 44);
+        for size in [0, 43, 44, footer.toc_encoded_len + 44, u64::MAX] {
+            let result = footer.metadata_range(size);
+            assert_eq!(result.is_ok(), size == u64::MAX);
+        }
+        let overflow = Footer {
+            toc_encoded_len: u64::MAX,
+            toc_decoded_len: 1,
+            directory_encoded_len: 9,
+            directory_decoded_len: 1,
+        };
+        assert!(overflow.metadata_range(u64::MAX).is_err());
     }
 }

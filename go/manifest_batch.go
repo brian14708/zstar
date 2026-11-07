@@ -19,11 +19,11 @@ type ReadRequest struct {
 }
 
 // ReadReport describes selected content only. Successful reads always
-// authenticate metadata and check archive data-frame checksums; they never
+// validate the directory, selected pages and ancestors, and check data-frame
+// checksums; they never
 // establish that unread tar headers, pointer JSON or end markers are valid.
 type ReadReport struct {
-	MetadataAuthenticated        bool     `json:"metadata_authenticated"`
-	FullArchiveValidated         bool     `json:"full_archive_validated"`
+	MetadataValidated            bool     `json:"metadata_validated"`
 	DataFramesChecked            []uint64 `json:"data_frames_checked"`
 	ExternalObjectsSHA256Checked []string `json:"external_objects_sha256_checked"`
 	ExternalObjectsUnchecked     []string `json:"external_objects_unchecked"`
@@ -39,6 +39,7 @@ type manifestReadJob struct {
 	extent   Extent
 	copies   []manifestReadCopy
 	verified bool
+	file     *File
 }
 
 // ReadMany validates every range and the aggregate output/copy budgets before
@@ -73,6 +74,7 @@ type readSelection struct {
 	ReadRequest
 	entry  *Entry
 	output []byte
+	file   *File
 }
 
 func (m *manifest) readMany(ctx context.Context, requests []ReadRequest, resolver EncodedContentResolver, verifyExternal, wantReport bool) ([][]byte, ReadReport, error) {
@@ -101,7 +103,7 @@ func (m *manifest) readRanges(ctx context.Context, requests []readSelection, res
 		var entry Entry
 		if request.entry == nil {
 			var err error
-			entry, err = m.entrySnapshot(request.Path)
+			entry, err = m.entrySnapshotContext(ctx, request.Path)
 			if err != nil {
 				return nil, ReadReport{}, err
 			}
@@ -149,7 +151,7 @@ func (m *manifest) readRanges(ctx context.Context, requests []readSelection, res
 				if !exists {
 					job = len(jobs)
 					byChunk[key] = job
-					jobs = append(jobs, manifestReadJob{extent: extent})
+					jobs = append(jobs, manifestReadJob{extent: extent, file: request.file})
 				}
 				a, b := max(position, request.Offset), min(next, end)
 				jobs[job].copies = append(jobs[job].copies, manifestReadCopy{output: i, source: extent.Offset + a - position, destination: a - request.Offset, length: b - a, extentOffset: extent.Offset, extentSize: extent.Size})
@@ -167,11 +169,13 @@ func (m *manifest) readRanges(ctx context.Context, requests []readSelection, res
 			out[i] = make([]byte, int(request.Length))
 		}
 	}
-	extents := make([]Extent, len(jobs))
-	for i, job := range jobs {
-		extents[i] = job.extent
-	}
-	if err := m.content.readMany(ctx, extents, resolver, verifyExternal, func(index int, chunk *manifestContentChunk) error {
+	if err := m.content.readMany(ctx, len(jobs), func(ctx context.Context, index int) (*manifestContentChunk, error) {
+		job := &jobs[index]
+		if job.file != nil {
+			return job.file.cache.get(ctx, job.file, job.extent)
+		}
+		return m.content.get(ctx, job.extent, resolver, verifyExternal)
+	}, func(index int, chunk *manifestContentChunk) error {
 		return copyReadJob(&jobs[index], out, chunk)
 	}); err != nil {
 		return nil, ReadReport{}, err
@@ -179,7 +183,7 @@ func (m *manifest) readRanges(ctx context.Context, requests []readSelection, res
 
 	var report ReadReport
 	if wantReport {
-		report.MetadataAuthenticated = true
+		report.MetadataValidated = true
 		report.DataFramesChecked = []uint64{}
 		report.ExternalObjectsSHA256Checked, report.ExternalObjectsUnchecked = []string{}, []string{}
 		for _, job := range jobs {

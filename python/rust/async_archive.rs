@@ -5,7 +5,7 @@ use super::reader::{Lease, Session, async_reader_options as reader_options};
 use super::request::FailureSlot;
 
 /// Async indexed archive over bytes, local sources, HTTP, or S3.
-/// Open authenticates metadata; use `verify` to check physical content.
+/// Open validates metadata; reads validate selected content.
 #[pyclass(module = "zstar._native", frozen)]
 pub struct AsyncArchive {
     session: Session,
@@ -60,20 +60,11 @@ impl AsyncArchive {
     fn _iter_names(slf: PyRef<'_, Self>, prefix: Option<String>) -> PyResult<AsyncEntries> {
         Self::projected_entries(slf, prefix, super::reader::MetadataProjection::Name)
     }
-    fn _open_member<'py>(
-        &self,
-        py: Python<'py>,
-        path: String,
-        cache_bytes: usize,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn _open_member<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease()?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             lease
-                .run(super::reader::MemberCursor::open(
-                    &lease.reader,
-                    &path,
-                    cache_bytes,
-                ))
+                .run(super::reader::MemberCursor::open(&lease.reader, &path))
                 .await
         })
     }
@@ -119,19 +110,6 @@ impl AsyncArchive {
                 .await
         })
     }
-    #[pyo3(
-        signature = (
-            *,
-            external = false,
-        )
-    )]
-    /// Verify physical frames and tar members, optionally including external objects.
-    fn verify<'py>(&self, py: Python<'py>, external: bool) -> PyResult<Bound<'py, PyAny>> {
-        let lease = self.lease()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            lease.run(lease.verify(external)).await
-        })
-    }
     /// Awaitable: owned entry metadata, or None if the path is absent.
     /// Never blocks the calling thread (or event loop) on the runtime.
     fn entry<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
@@ -146,8 +124,19 @@ impl AsyncArchive {
         super::manifest::extensions_to_py(py, lease.reader.root_extensions())
     }
     #[getter]
-    fn entry_count(&self) -> PyResult<u64> {
-        Ok(self.lease()?.reader.entry_count())
+    fn entry_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let lease = self.lease()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            lease
+                .run(async {
+                    lease
+                        .reader
+                        .entry_count()
+                        .await
+                        .map_err(crate::support::core_error)
+                })
+                .await
+        })
     }
     /// Lazily yield owned entry tuples in path order with async iteration.
     #[pyo3(

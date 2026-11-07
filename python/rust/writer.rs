@@ -127,6 +127,7 @@ impl EntryArchiveWriter {
             create_spill_store = None,
             workers = 0,
             root_extensions = None,
+            extension_pages = None,
         )
     )]
     #[expect(
@@ -145,8 +146,20 @@ impl EntryArchiveWriter {
         create_spill_store: Option<Py<PyAny>>,
         workers: usize,
         root_extensions: Option<&Bound<'_, PyDict>>,
+        extension_pages: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let limits = super::reader::limits(limits)?;
+        let extension_pages = extension_pages
+            .into_iter()
+            .flat_map(PyDictMethods::iter)
+            .map(|(key, value)| {
+                let values = value
+                    .try_iter()?
+                    .map(|value| from_py(&value?, 0))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok((key.extract()?, values))
+            })
+            .collect::<PyResult<std::collections::BTreeMap<String, Vec<ciborium::Value>>>>()?;
         let writer = BlockingBuilder::with_options(
             Sink(output),
             frame_size,
@@ -155,6 +168,7 @@ impl EntryArchiveWriter {
                 limits,
                 memory_bytes,
                 block_target,
+                extension_pages,
                 spool_budget: Arc::new(zstar::SpoolBudget::new(max_spool_bytes)),
                 create_spill_store: spill_factory(py, create_spill_store)?,
                 ..Default::default()

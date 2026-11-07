@@ -175,7 +175,14 @@ async fn native_s3_presigned_ranges_objects_and_multipart() {
     upload.abort().await.unwrap();
     assert!(store.head(&aborted).await.is_err());
 
-    // Replacing an archive with the same length must invalidate pinned ranges.
+    let empty_path = Path::from("empty-source");
+    store.put(&empty_path, Bytes::new().into()).await.unwrap();
+    let empty = S3RangeSource::new(store.clone(), empty_path.clone());
+    assert_eq!(empty.size().await.unwrap(), 0);
+    assert!(empty.read_range(0..0).await.unwrap().is_empty());
+    store.delete(&empty_path).await.unwrap();
+
+    // Prefetched bytes remain bound to the original snapshot after replacement.
     let pinned = S3RangeSource::new(store.clone(), path.clone());
     assert_eq!(pinned.size().await.unwrap(), archive.len() as u64);
     let mut replacement = archive.to_vec();
@@ -184,10 +191,7 @@ async fn native_s3_presigned_ranges_objects_and_multipart() {
         .put(&path, Bytes::from(replacement).into())
         .await
         .unwrap();
-    assert!(matches!(
-        pinned.read_range(0..1).await,
-        Err(zstar::Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
-    ));
+    assert_eq!(pinned.read_range(0..1).await.unwrap(), archive.slice(..1));
 
     for key in [
         path,

@@ -77,22 +77,12 @@ impl std::fmt::Debug for ReaderOptions {
             .finish()
     }
 }
-/// Selects whether verification also resolves external objects.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum VerificationScope {
-    /// Verifies metadata and every physical frame and tar member.
-    #[default]
-    Archive,
-    /// Also resolves and validates every external-object selection.
-    ExternalClosure,
-}
 /// Checks completed by a selective read; does not certify the whole archive.
 #[derive(Clone, Debug, Default)]
 pub struct ReadReport {
-    /// Whether manifest authentication completed.
-    pub metadata_authenticated: bool,
-    /// Selective reads do not claim physical tar validation.
-    pub full_archive_validated: bool,
+    /// Whether directory, selected entry pages, and ancestor validation completed.
+    /// This does not claim validation of unrelated metadata pages.
+    pub metadata_validated: bool,
     /// Encoded offsets of the data frames checked.
     pub data_frames_checked: Vec<u64>,
     /// Decoded object hashes checked against their addresses.
@@ -197,38 +187,13 @@ impl<R: AsyncRangeReader + ?Sized> MetadataSource<'_, R> {
     }
 }
 
-struct VerificationSource<R: AsyncRangeReader + ?Sized> {
-    source: Arc<R>,
-    size: u64,
-    handle: tokio::runtime::Handle,
-    cancel: tokio::sync::watch::Receiver<bool>,
-}
-impl<R: AsyncRangeReader + ?Sized> crate::RangeReader for VerificationSource<R> {
-    fn len(&self) -> u64 {
-        self.size
-    }
-    fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>> {
-        if *self.cancel.borrow() {
-            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
-        }
-        self.handle.block_on(async {
-            tokio::select! {
-                biased;
-                _ = self.cancel.changed() => Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into()),
-                bytes = self.source.read_range(range) => bytes.map(|bytes| bytes.to_vec()),
-            }
-        })
-    }
-}
-
 /// An indexed archive backed by an immutable [`AsyncRangeReader`].
 ///
-/// Opening authenticates the complete manifest and retains a sorted index in
-/// O(N) memory. Clones share the source, index, and concurrency limits.
-/// Selected content is validated before it is returned. Use [`Self::verify`]
-/// to check the physical archive or its external-object closure.
+/// Opening validates the metadata directory and loads entry pages on demand.
+/// Clones share the source, metadata cache, and concurrency limits.
+/// Selected content is validated before it is returned.
 ///
-/// Dropping a read or verification future cancels pending transport I/O.
+/// Dropping a read future cancels pending transport I/O.
 /// CPU jobs that have already started retain their permits until completion.
 ///
 /// # Metadata integrity
@@ -245,12 +210,11 @@ impl<R: AsyncRangeReader + ?Sized> crate::RangeReader for VerificationSource<R> 
 pub struct Archive<R: AsyncRangeReader + ?Sized> {
     source: Arc<R>,
     manifest: Arc<ManifestReader>,
+    paged: Option<Arc<crate::paged_archive::PagedState<R>>>,
     options: ReaderOptions,
     semaphore: Arc<Semaphore>,
     metadata_semaphore: Arc<Semaphore>,
     flights: Arc<Flights>,
-    metadata_digest: [u8; 32],
-    data_end: u64,
 }
 impl Archive<Bytes> {
     #[expect(
@@ -267,12 +231,11 @@ impl<R: AsyncRangeReader + ?Sized> Clone for Archive<R> {
         Self {
             source: self.source.clone(),
             manifest: self.manifest.clone(),
+            paged: self.paged.clone(),
             options: self.options.clone(),
             semaphore: self.semaphore.clone(),
             metadata_semaphore: self.metadata_semaphore.clone(),
             flights: self.flights.clone(),
-            metadata_digest: self.metadata_digest,
-            data_end: self.data_end,
         }
     }
 }
@@ -288,10 +251,12 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub(crate) fn resolver(&self) -> Option<&dyn ObjectResolver> {
         self.options.resolver.as_deref()
     }
-    /// Returns the number of entries in the authenticated manifest.
-    #[must_use]
-    pub fn entry_count(&self) -> u64 {
-        self.manifest.root().entry_count
+    /// Scans metadata pages and returns the derived member count.
+    ///
+    /// # Errors
+    /// Returns errors from any metadata page or the complete namespace.
+    pub async fn entry_count(&self) -> Result<u64> {
+        Ok(self.full_manifest().await?.root().entry_count)
     }
     /// Maximum bytes returned by a single allocating read operation.
     #[must_use]
@@ -390,8 +355,9 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         }
         // Constructing a large seek index is CPU work, like cloning its metadata.
         let archive = self.clone();
-        self.metadata(move |_| crate::File::new(archive, entry))
+        tokio::task::spawn_blocking(move || crate::File::new(archive, entry))
             .await
+            .map_err(worker_error)?
     }
     /// Owned stream of sorted entry handles. Skipping a handle performs no content I/O.
     /// Pin the stream to use [`futures_util::TryStreamExt::try_next`], or consume it with stream
@@ -399,12 +365,12 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     pub fn entries(
         &self,
     ) -> impl stream::FusedStream<Item = Result<crate::File<R>>> + Send + 'static {
-        let state = (
-            self.clone(),
-            self.manifest.cursor(),
-            std::collections::VecDeque::new(),
-        );
+        let state = (self.clone(), None, std::collections::VecDeque::new());
         stream::try_unfold(state, |(archive, cursor, mut pending)| async move {
+            let cursor = match cursor {
+                Some(cursor) => cursor,
+                None => archive.cursor().await?,
+            };
             let (cursor, entry) = if let Some(entry) = pending.pop_front() {
                 (cursor, entry)
             } else {
@@ -416,92 +382,42 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                 (cursor, entry)
             };
             let file = archive.file(entry).await?;
-            Ok(Some((file, (archive, cursor, pending))))
+            Ok(Some((file, (archive, Some(cursor), pending))))
         })
         .fuse()
-    }
-    #[expect(
-        clippy::items_after_statements,
-        reason = "Keep local helpers next to the operation that uses them."
-    )]
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "Unwraps enforce internal invariants established before this operation."
-    )]
-    /// Verifies the complete physical archive and the requested external scope.
-    /// External object hashing follows [`ReaderOptions::verify_external`].
-    ///
-    /// Cancellation drops pending transport futures; worker permits remain held
-    /// until any already running frame decode completes.
-    pub async fn verify(&self, scope: VerificationScope) -> Result<()> {
-        let (cancel, receiver) = tokio::sync::watch::channel(false);
-        struct Cancel(tokio::sync::watch::Sender<bool>);
-        impl Drop for Cancel {
-            fn drop(&mut self) {
-                let _ = self.0.send(true);
-            }
-        }
-        let _cancel = Cancel(cancel);
-        let source = VerificationSource {
-            source: self.source.clone(),
-            size: self.source.size().await?,
-            handle: tokio::runtime::Handle::current(),
-            cancel: receiver,
-        };
-        let manifest = self.manifest.clone();
-        let options = self.options.manifest_options();
-        let data_end = self.data_end;
-        let digest = self.metadata_digest;
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Unsupported("reader closed"))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            crate::backend::BlockingArchive::from_manifest(
-                source, manifest, data_end, options, digest,
-            )
-            .validate()
-        })
-        .await
-        .map_err(worker_error)??;
-        if scope == VerificationScope::ExternalClosure {
-            let entries = self.entries();
-            futures_util::pin_mut!(entries);
-            while let Some(file) = futures_util::TryStreamExt::try_next(&mut entries).await? {
-                if !file.metadata().is_external() {
-                    continue;
-                }
-                let mut previous: Option<(Key, Bytes)> = None;
-                for extent in &file.metadata().extents {
-                    let key = Key::of(extent);
-                    if previous.as_ref().is_none_or(|(cached, _)| cached != &key) {
-                        previous = Some((
-                            key.clone(),
-                            self.content(&key, extent.encoded_size, self.resolver())
-                                .await?,
-                        ));
-                    }
-                    let raw = &previous.as_ref().unwrap().1;
-                    crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    /// Opens and authenticates an immutable source using the supplied policies.
+    /// Opens and validates an immutable source using the supplied policies.
     pub async fn open_with_options(source: Arc<R>, options: ReaderOptions) -> Result<Self> {
+        let paged =
+            crate::paged_archive::PagedState::open_with_options(source.clone(), options.clone())
+                .await?;
+        let root = paged.directory().root.clone();
+        let mut archive = Self::from_directory(
+            source,
+            ManifestReader::from_entries(root, Vec::new(), false)?,
+            options,
+        );
+        archive.paged = Some(Arc::new(paged));
+        Ok(archive)
+    }
+    pub(crate) async fn load_full_manifest(
+        source: Arc<R>,
+        options: ReaderOptions,
+    ) -> Result<Arc<ManifestReader>> {
+        Ok(Self::open_indexed(source, options).await?.manifest)
+    }
+    async fn full_manifest(&self) -> Result<Arc<ManifestReader>> {
+        match &self.paged {
+            Some(paged) => paged.full_manifest().await,
+            None => Ok(self.manifest.clone()),
+        }
+    }
+    async fn open_indexed(source: Arc<R>, options: ReaderOptions) -> Result<Self> {
         if !(1..=1024).contains(&options.concurrent_chunks) {
             return Err(Error::Budget("invalid content concurrency"));
         }
@@ -509,47 +425,19 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         if size < crate::FOOTER_SIZE as u64 {
             return Err(Error::NotZstar);
         }
-        let mut prefetched = None;
-        if let Some(hint) = source.manifest_range().await?
-            && hint.start > 0
-            && hint.end == size - 80
-            && hint.start < hint.end
-            && hint.end - hint.start > 8
-            && hint.end - hint.start <= options.metadata.max_encoded_bytes
-            // Keep speculative hint reads within one bounded metadata window.
-            && size - hint.start <= 1 << 20
-        {
-            let bytes = source.read_range(hint.start..size).await?;
-            if bytes.len() as u64 != size - hint.start {
-                return Err(Error::MalformedToc("short hinted metadata range".into()));
-            }
-            let end = bytes.len() - crate::FOOTER_SIZE;
-            if let Ok(footer) = crate::parse_footer(&bytes[end..])
-                && footer.toc_offset == hint.start
-                && footer.toc_encoded_len == hint.end - hint.start
-            {
-                prefetched = Some((footer, bytes.slice(..end)));
-            }
-        }
-        let (footer, buffer) = match prefetched {
-            Some(result) => result,
-            None => (
-                crate::parse_footer(&source.read_range(size - 80..size).await?)?,
-                Bytes::new(),
-            ),
-        };
-        let metadata_end = footer
-            .toc_offset
-            .checked_add(footer.toc_encoded_len)
-            .ok_or(Error::MalformedFooter("manifest coverage"))?;
+        let footer = crate::parse_footer(
+            &source
+                .read_range(size - crate::FOOTER_SIZE as u64..size)
+                .await?,
+        )?;
+        let buffer = Bytes::new();
+        let metadata_range = footer.metadata_range(size)?;
         let mut ranges = MetadataSource {
             source: source.as_ref(),
-            end: metadata_end,
-            start: footer.toc_offset,
+            end: metadata_range.end,
+            start: metadata_range.start,
             buffer,
         };
-        let metadata_digest = footer.toc_sha256;
-        let data_end = footer.toc_offset;
         let mut ingest = ManifestIngest::new(footer, size, Spool::new(options.manifest_options()))?;
         while !ingest.complete() {
             let at = ingest.position();
@@ -571,19 +459,33 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         Ok(Self {
             source,
             manifest: Arc::new(manifest),
+            paged: None,
             semaphore: Arc::new(Semaphore::new(options.concurrent_chunks)),
             metadata_semaphore: Arc::new(Semaphore::new(2)),
             flights: Arc::new(Mutex::new(HashMap::new())),
             options,
-            metadata_digest,
-            data_end,
         })
+    }
+    pub(crate) fn from_directory(
+        source: Arc<R>,
+        manifest: ManifestReader,
+        options: ReaderOptions,
+    ) -> Self {
+        Self {
+            source,
+            manifest: Arc::new(manifest),
+            paged: None,
+            semaphore: Arc::new(Semaphore::new(options.concurrent_chunks)),
+            metadata_semaphore: Arc::new(Semaphore::new(2)),
+            flights: Arc::new(Mutex::new(HashMap::new())),
+            options,
+        }
     }
     async fn metadata<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&ManifestReader) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let manifest = self.manifest.clone();
+        let manifest = self.full_manifest().await?;
         let permit = self
             .metadata_semaphore
             .clone()
@@ -606,6 +508,9 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     )]
     /// Returns owned metadata, or `None` if the path is absent.
     pub async fn entry(&self, path: &str) -> Result<Option<Entry>> {
+        if let Some(paged) = &self.paged {
+            return paged.entry(path).await;
+        }
         if let EntryLookup::Ready(entry) = self.cached_entry(path) {
             return Ok(entry);
         }
@@ -658,9 +563,6 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .ok_or_else(|| Error::MissingEntry(path.into()))?
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
-    }
-    pub(crate) fn cursor_owner(&self) -> Weak<ManifestReader> {
-        Arc::downgrade(&self.manifest)
     }
     pub(crate) fn owns_cursor(&self, owner: &std::sync::Weak<ManifestReader>) -> bool {
         std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&self.manifest))
@@ -737,10 +639,8 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .map_err(|_| Error::Unsupported("reader closed"))?;
         let encoded = match key {
             Key::Archive(at, size) => {
-                let encoded = self
-                    .source
-                    .read_range(*at..at.checked_add(*size).ok_or(Error::Range)?)
-                    .await?;
+                let range = *at..at.checked_add(*size).ok_or(Error::Range)?;
+                let encoded = self.source.read_range(range).await?;
                 if encoded.len() as u64 != *size {
                     return Err(Error::MalformedFrame("short archive frame".into()));
                 }
@@ -767,7 +667,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             {
                 crate::verify_sha256(&raw, hash)?;
             }
-            let raw = DecodedBody::from_vec(raw);
+            let raw = DecodedBody::compact(raw);
             Ok::<_, Error>(raw)
         })
         .await
@@ -782,18 +682,43 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .map(|r| (r.path.to_owned(), r.offset, r.length))
             .collect();
         let budget = self.options.max_read_bytes;
-        self.metadata(move |manifest| {
+        let selected = match &self.paged {
+            Some(paged) => Some(
+                paged
+                    .selected_manifests(
+                        &requests
+                            .iter()
+                            .map(|(path, offset, length)| ReadRequest {
+                                path,
+                                offset: *offset,
+                                length: *length,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .await?,
+            ),
+            None => None,
+        };
+        let manifest = self.manifest.clone();
+        tokio::task::spawn_blocking(move || {
             build_plan(
                 requests
                     .iter()
                     .map(|(path, offset, length)| (path.as_str(), *offset, *length)),
                 budget,
-                |path| Ok(manifest.range_entry(path)),
+                |path| {
+                    let page = selected
+                        .as_ref()
+                        .and_then(|pages| pages.get(path))
+                        .unwrap_or(&manifest);
+                    Ok(page.range_entry(path))
+                },
             )
         })
         .await
+        .map_err(worker_error)?
     }
-    // Handles already own authenticated metadata; do not look up their paths
+    // Handles already own validated metadata; do not look up their paths
     // again when a logical selection crosses extent boundaries.
     pub(crate) fn read_entry_range(
         &self,
@@ -801,6 +726,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         ends: &[u64],
         offset: u64,
         length: u64,
+        cache: Arc<crate::file::DecodedCache>,
     ) -> impl std::future::Future<Output = Result<Bytes>> + Send + use<R> {
         let plan = build_plan(
             std::iter::once((entry.path.as_str(), offset, length)),
@@ -810,7 +736,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let archive = self.clone();
         async move {
             let mut outputs = archive
-                .execute_plan(plan?, archive.resolver(), None)
+                .execute_plan(plan?, archive.resolver(), None, Some(&cache))
                 .await?;
             Ok(outputs.pop().unwrap())
         }
@@ -846,7 +772,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         resolver: Option<&dyn ObjectResolver>,
     ) -> Result<(Bytes, ReadReport)> {
         let mut report = ReadReport {
-            metadata_authenticated: true,
+            metadata_validated: true,
             ..Default::default()
         };
         let mut outputs = self
@@ -914,16 +840,18 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
                     },
                     resolver,
                     report,
+                    None,
                 )
                 .await;
         }
-        self.execute_plan(plan, resolver, report).await
+        self.execute_plan(plan, resolver, report, None).await
     }
     async fn execute_plan(
         &self,
         plan: Plan,
         resolver: Option<&dyn ObjectResolver>,
         mut report: Option<&mut ReadReport>,
+        cache: Option<&crate::file::DecodedCache>,
     ) -> Result<Vec<Bytes>> {
         let mut outputs: Vec<_> = plan
             .sizes
@@ -931,9 +859,16 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .map(|size| BytesMut::zeroed(*size))
             .collect();
         let mut jobs = stream::iter(plan.groups.into_iter().map(|(key, group)| async move {
-            let raw = self.content(&key, group.hint, resolver).await?;
+            let raw = if let Some(raw) = cache.and_then(|cache| cache.get(&key)) {
+                raw
+            } else {
+                self.content(&key, group.hint, resolver).await?
+            };
             for copy in &group.copies {
                 validate_copy(copy, raw.len())?;
+            }
+            if let Some(cache) = cache {
+                cache.retain(key.clone(), &raw);
             }
             Ok::<_, Error>((key, group, raw))
         }))
@@ -1083,9 +1018,11 @@ mod tests {
     }
     impl Source {
         fn new(bytes: Vec<u8>) -> Self {
-            let data_end = crate::parse_footer(&bytes[bytes.len() - 80..])
+            let data_end = crate::parse_footer(&bytes[bytes.len() - crate::FOOTER_SIZE..])
                 .unwrap()
-                .toc_offset;
+                .metadata_range(bytes.len() as u64)
+                .unwrap()
+                .start;
             Self {
                 bytes: bytes.into(),
                 data_end,
@@ -1116,7 +1053,7 @@ mod tests {
         )]
         async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if range.start < self.data_end {
+            if range.start < self.data_end && range.end <= self.data_end {
                 self.data_calls.fetch_add(1, Ordering::SeqCst);
                 self.active.fetch_add(1, Ordering::SeqCst);
                 let _active = Active(&self.active);
@@ -1134,7 +1071,7 @@ mod tests {
         let reader = Archive::open_with_options(source.clone(), ReaderOptions::default())
             .await
             .unwrap();
-        assert_eq!(source.calls.load(Ordering::SeqCst), 2); // footer + read-ahead metadata
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2); // Footer and directory.
         let requests = [
             ReadRequest {
                 path: "a",
@@ -1192,8 +1129,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(raw, b"hello".as_slice());
-        assert!(report.metadata_authenticated);
-        assert!(!report.full_archive_validated);
+        assert!(report.metadata_validated);
         assert_eq!(report.data_frames_checked.len(), 1);
         let mut cursor = reader.cursor().await.unwrap();
         let mut names = Vec::new();
@@ -1461,7 +1397,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn mandatory_checksums_and_authenticated_metadata_cannot_be_skipped() {
+    async fn mandatory_checksums_and_validated_metadata_cannot_be_skipped() {
         let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/data-checksum.zstar");
         let reader = Archive::open_with_options(
             Arc::new(Source::new(bytes.to_vec())),
@@ -1476,7 +1412,8 @@ mod tests {
             reader.read_range("a-b", 0..5).await,
             Err(Error::Integrity)
         ));
-        let bytes = include_bytes!("../../../testdata/entry-manifest/invalid/metadata-hash.zstar");
+        let bytes =
+            include_bytes!("../../../testdata/entry-manifest/invalid/metadata-checksum.zstar");
         assert!(
             Archive::open_with_options(
                 Arc::new(Source::new(bytes.to_vec())),

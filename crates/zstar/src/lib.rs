@@ -46,13 +46,17 @@ mod file;
 #[cfg(feature = "async")]
 mod io;
 #[cfg(feature = "async")]
-pub use archive::{Archive, ObjectResolver, ReadReport, ReaderOptions, VerificationScope};
+mod range_cache;
+#[cfg(feature = "async")]
+pub use archive::{Archive, ObjectResolver, ReadReport, ReaderOptions};
 #[cfg(feature = "async")]
 pub use builder::{Builder, Header, WriterOptions};
 #[cfg(feature = "async")]
 pub use file::{File, FileCursor};
 #[cfg(feature = "async")]
 pub use io::{AsyncRangeReader, MAX_BATCH_REQUESTS, ReadRequest};
+#[cfg(feature = "async")]
+pub use range_cache::{CachedRangeReader, RangeCacheOptions, RangeCacheStats};
 mod parallel;
 mod primitives;
 #[cfg(test)]
@@ -335,3 +339,9 @@ mod tests {
         assert!(decode_bounded(&encoded, raw.len() - 1).is_err());
     }
 }
+
+#[cfg(feature = "async")]
+pub(crate) use manifest_io::ManifestDirectory;
+
+#[cfg(feature = "async")]
+mod paged_archive;

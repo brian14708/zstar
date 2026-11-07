@@ -33,7 +33,7 @@ struct MemberState {
     position: Mutex<u64>,
 }
 impl MemberCursor {
-    pub(crate) async fn open(reader: &Reader, path: &str, cache_bytes: usize) -> PyResult<Self> {
+    pub(crate) async fn open(reader: &Reader, path: &str) -> PyResult<Self> {
         let entry = reader
             .entry(path)
             .await
@@ -59,8 +59,7 @@ impl MemberCursor {
         let cursor = reader
             .open_cursor(path)
             .await
-            .map_err(crate::support::core_error)?
-            .with_cache_bytes(cache_bytes);
+            .map_err(crate::support::core_error)?;
         Ok(Self {
             size: cursor.size(),
             inner: Arc::new(MemberState {
@@ -591,8 +590,7 @@ pub fn batch_requests(requests: &Bound<'_, PyAny>) -> PyResult<Vec<(String, u64,
 
 pub fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo3::types::PyDict>> {
     let result = pyo3::types::PyDict::new(py);
-    result.set_item("metadata_authenticated", report.metadata_authenticated)?;
-    result.set_item("full_archive_validated", report.full_archive_validated)?;
+    result.set_item("metadata_validated", report.metadata_validated)?;
     result.set_item("data_frames_checked", report.data_frames_checked)?;
     result.set_item(
         "external_objects_sha256_checked",
@@ -753,14 +751,6 @@ impl State {
                 .map(|bytes| PyBytes::new(py, bytes).unbind())
                 .collect()
         }))
-    }
-    pub async fn verify(&self, external: bool) -> PyResult<()> {
-        let scope = if external {
-            zstar::VerificationScope::ExternalClosure
-        } else {
-            zstar::VerificationScope::Archive
-        };
-        self.reader.verify(scope).await.map_err(core_error)
     }
     pub async fn read_link(&self, path: &str) -> PyResult<String> {
         self.reader.read_link(path).await.map_err(core_error)

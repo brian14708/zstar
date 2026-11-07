@@ -72,7 +72,6 @@ def test_external_hash_policy_keeps_codec_validation(
         if operation == "materialize":
             encoded = _native.materialize(thin_data, objects=objects, verify_external=verify)
             with zstar.Archive(encoded) as archive:
-                assert archive.verify() is None
                 return archive.read("hello.txt")
         destination = tmp_path / "destination"
         _native.extract(thin_data, destination, objects=objects, verify_external=verify)
@@ -89,14 +88,12 @@ def test_external_hash_policy_keeps_codec_validation(
 
 
 @pytest.mark.parametrize(
-    "fixture", ["metadata-hash", "data-checksum", "tar-header", "tar-end", "pointer-mismatch"]
+    "fixture", ["metadata-checksum", "data-checksum", "tar-header", "tar-end", "pointer-mismatch"]
 )
-def test_filesystem_hash_opt_out_keeps_physical_and_metadata_validation(
+def test_extraction_hash_opt_out_keeps_physical_and_metadata_validation(
     tmp_path, fixture, corpus_dir
 ):
     source = (corpus_dir / "invalid" / f"{fixture}.zstar").read_bytes()
-    with pytest.raises(ValueError):
-        _native.materialize(source, objects=corpus_dir / "objects", verify_external=False)
     if os.name == "posix":
         with pytest.raises(ValueError):
             _native.extract(

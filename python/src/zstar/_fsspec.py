@@ -423,8 +423,8 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     Supplied streams are owned and must remain immutable. Loading
     is lazy; concurrent requests share one load, and close drains admitted work.
 
-    Member streams retain one decoded source within ``member_cache_bytes``
-    (2 MiB by default, including cache bookkeeping); zero disables retention.
+    Member streams privately retain one decoded source within 2 MiB, including
+    cache bookkeeping.
     Entry metadata and returned buffers are separate. Local downloads reject
     destination symlinks and require POSIX descriptor-relative no-follow I/O.
     Downloads copy bytes and reject symlink members; they do not restore metadata.
@@ -449,11 +449,12 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         asynchronous: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
         member_spool_bytes: int = 8 << 20,
-        member_cache_bytes: int = 2 << 20,
         writer_options: WriterOptions | None = None,
         reader_options: FileSystemReaderOptions | None = None,
         **kwargs: object,
     ) -> None:
+        if "member_cache_bytes" in kwargs:
+            raise TypeError("member_cache_bytes is no longer configurable")
         if "resolver" in kwargs:
             raise TypeError("use external=filesystem; custom resolvers belong to the low-level API")
         super().__init__(asynchronous=asynchronous, loop=loop, **kwargs)
@@ -472,13 +473,6 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         self.fo: str | PathLike[str] | BinaryIO = fo
         self.target_protocol: str | None = target_protocol
         self.mode: str = mode
-        if (
-            isinstance(member_cache_bytes, bool)
-            or not isinstance(member_cache_bytes, int)
-            or member_cache_bytes < 0
-        ):
-            raise ValueError("member_cache_bytes must be a nonnegative integer")
-        self.member_cache_bytes = member_cache_bytes
         self.member_spool_bytes = member_spool_bytes
         self._reader_options = cast(FileSystemReaderOptions, dict(reader_options or {}))
         if "resolver" in self._reader_options:
@@ -805,7 +799,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         if not member:
             raise IsADirectoryError(path)
         archive = await self._get_archive()
-        context = archive.open(member, cache_bytes=self.member_cache_bytes)
+        context = archive.open(member)
         try:
             stream = await context.__aenter__()
         except KeyError:

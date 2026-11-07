@@ -1,37 +1,29 @@
 use std::ops::Deref;
+#[cfg(not(feature = "async"))]
 use std::sync::Arc;
 
+/// Immutable decoded storage with no spare vector capacity retained.
 #[derive(Clone, Debug)]
-pub enum DecodedBody {
-    Shared(Arc<[u8]>),
+pub struct DecodedBody {
     #[cfg(feature = "async")]
-    Async {
-        raw: bytes::Bytes,
-    },
+    raw: bytes::Bytes,
+    #[cfg(not(feature = "async"))]
+    raw: Arc<[u8]>,
 }
 impl DecodedBody {
-    #[cfg(feature = "async")]
-    pub(crate) fn from_vec(raw: Vec<u8>) -> Self {
-        Self::Async { raw: raw.into() }
-    }
     pub(crate) fn compact(raw: Vec<u8>) -> Self {
-        Self::Shared(raw.into())
+        Self {
+            raw: raw.into_boxed_slice().into(),
+        }
     }
     #[cfg(feature = "async")]
     pub(crate) fn into_bytes(self) -> bytes::Bytes {
-        match self {
-            Self::Shared(raw) => bytes::Bytes::from_owner(raw),
-            Self::Async { raw, .. } => raw,
-        }
+        self.raw
     }
 }
 impl Deref for DecodedBody {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        match self {
-            Self::Shared(raw) => raw,
-            #[cfg(feature = "async")]
-            Self::Async { raw, .. } => raw,
-        }
+        &self.raw
     }
 }

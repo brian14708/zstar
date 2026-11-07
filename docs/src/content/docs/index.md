@@ -27,6 +27,7 @@ Use [Python](sdks/python/) with sync, async, or fsspec APIs; [Rust](sdks/rust/)
 with async readers and writers; or [Go](sdks/go/) with Go streams. All three
 support local files, HTTP ranges, and S3.
 The SDKs implement the core format and the optional external-content extension.
+Opening validates the directory; reads fetch and validate selected metadata pages.
 
 ## Explore the reference
 

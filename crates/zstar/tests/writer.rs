@@ -36,8 +36,6 @@ fn empty_symlink_targets_are_rejected_before_writing() {
         SliceReader::new(&bytes),
         zstar::backend::ManifestOptions::default(),
     )
-    .unwrap()
-    .validate()
     .unwrap();
 }
 #[expect(
@@ -105,7 +103,7 @@ fn long_paths_exact_link_text_and_wide_metadata_survive_physical_validation() {
         zstar::backend::ManifestOptions::default(),
     )
     .unwrap();
-    reader.validate().unwrap();
+
     assert_eq!(reader.read_link("link").unwrap(), target);
     let e = reader.entry(&path).unwrap().unwrap();
     assert_eq!((e.uid, e.gid, e.mtime_ns), (u64::MAX, u64::MAX, i64::MIN));
@@ -214,35 +212,6 @@ fn interrupted_short_payload_reads_work_and_callbacks_can_stop() {
     ));
     assert_eq!(calls, 1);
 }
-#[test]
-fn pax_headers_split_at_unaligned_frame_boundaries_remain_exact() {
-    for frame in [513, 523, 777] {
-        let mut writer = BlockingBuilder::with_options(
-            Vec::new(),
-            frame,
-            3,
-            zstar::backend::ManifestOptions::default(),
-        )
-        .unwrap();
-        let mut link = Entry::file("link");
-        link.kind = EntryKind::Symlink;
-        link.linkname = Some("雪".repeat(70));
-        writer.add_metadata(link).unwrap();
-        let mut file = Entry::file("雪".repeat(70));
-        file.uid = u64::MAX;
-        file.mtime_ns = i64::MIN;
-        writer
-            .add_file(file, 4097, &mut vec![42; 4097].as_slice())
-            .unwrap();
-        let bytes = writer.finish().unwrap();
-        let mut reader = BlockingArchive::open(
-            SliceReader::new(&bytes),
-            zstar::backend::ManifestOptions::default(),
-        )
-        .unwrap();
-        reader.validate().unwrap();
-    }
-}
 
 #[test]
 fn late_parents_and_reverse_insertion_keep_tar_order_and_sort_manifest() {
@@ -262,7 +231,7 @@ fn late_parents_and_reverse_insertion_keep_tar_order_and_sort_manifest() {
         zstar::backend::ManifestOptions::default(),
     )
     .unwrap();
-    reader.validate().unwrap();
+
     let mut physical = Vec::new();
     reader
         .visit_payloads(|e, _| {
@@ -297,7 +266,6 @@ fn writer_accepts_more_than_65536_inline_extents() {
     assert_eq!(entry.extents.len(), 65_537);
     assert_eq!(entry.size().unwrap(), size);
     assert_eq!(reader.read("large", size - 1, 1, None, false).unwrap(), [7]);
-    reader.validate().unwrap();
 }
 
 #[test]
@@ -322,8 +290,6 @@ fn large_external_entries_and_standalone_references_round_trip() {
         SliceReader::new(&bytes),
         zstar::backend::ManifestOptions::default(),
     )
-    .unwrap()
-    .validate()
     .unwrap();
 }
 
@@ -377,7 +343,7 @@ fn frame_sizes_are_caller_policy() {
     )
     .unwrap();
     assert_eq!(reader.read("large", size - 1, 1, None, false).unwrap(), [9]);
-    reader.validate().unwrap();
+
     let options = zstar::backend::ManifestOptions {
         limits: zstar::Limits {
             max_frame_decoded_bytes: 16 << 20,
@@ -400,4 +366,23 @@ fn frame_sizes_are_caller_policy() {
         BlockingBuilder::with_options(Vec::new(), 32 << 20, 1, options),
         Err(Error::Budget(_))
     ));
+}
+
+#[test]
+fn optional_extension_pages_round_trip() {
+    let mut options = zstar::backend::ManifestOptions::default();
+    options.extension_pages.insert(
+        "x-optional".into(),
+        vec![
+            ciborium::Value::Text("first".into()),
+            ciborium::Value::Array(vec![ciborium::Value::Integer(7.into())]),
+        ],
+    );
+    let writer = BlockingBuilder::with_options(Vec::new(), 4096, 3, options).unwrap();
+    let bytes = writer.finish().unwrap();
+    BlockingArchive::open(
+        SliceReader::new(&bytes),
+        zstar::backend::ManifestOptions::default(),
+    )
+    .unwrap();
 }

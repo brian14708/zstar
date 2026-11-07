@@ -5,8 +5,7 @@ title: "Create your first archive with Rust"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../crates/zstar/examples/tutorial_file.rs?raw";
 
-Create `example.zstar` containing `example.txt`, read the file and a byte range,
-and verify the archive. Running the example again replaces the archive.
+Create `example.zstar` containing `example.txt`, read the file and a byte range. Running the example again replaces the archive.
 
 ## Set up
 
@@ -41,19 +40,11 @@ Open the archive with `AsyncLocalFileSource`. `read()` returns the whole member;
 
 <Example source={source} lang="rust" region="read" />
 
-## Verify the archive
-
-`verify(VerificationScope::Archive)` checks every frame and tar member,
-including content you have not read.
-
-<Example source={source} lang="rust" region="verify" />
-
 You should see:
 
 ```text
 Hello from Zstar
 Hello
-Archive verified
 ```
 
 ## Complete example

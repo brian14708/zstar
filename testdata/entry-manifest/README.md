@@ -3,16 +3,16 @@
 `manifest.json` describes shared Rust, Go, and Python conformance checks.
 
 The `archives` object maps relative archive paths to one `sha256` and a list of
-operation `cases`. `schema_version` identifies the test schema;
-`wire_version` identifies the archive format version.
+`cases`. `schema_version` identifies the test schema; `wire_version` identifies
+the archive format version.
 
-Each case has a unique `name` and an `operation`. An omitted `expected_error`
-means success. Optional fields specify read requests, expected content files,
-symlink targets, external objects, resource limits, and verification results.
-Paths are relative to this directory.
+Each case has a unique `name`. A `request` selects a file range; without one,
+the case validates metadata. `range_result_hex` stores expected bytes as hex,
+including an empty string for empty results. An omitted `expected_error` means
+success. Optional `objects`, `verify_external`, and `limits` configure the reader.
+Artifact paths are relative to this directory.
 
-Keep metadata and full-archive checks separate: some corruptions are deliberately
-accepted by metadata-only validation and rejected by full archive validation.
+Metadata and selective-read cases exercise the checks required by each operation.
 
 The `limits/many-extents.zstar` fixture contains 65,537 external one-byte selections
 of the same `x` object. `limits/entry-byte-limit.zstar` uses 110,400 selections
@@ -26,14 +26,20 @@ include checksums and tar streams have exactly two terminal zero records.
 
 Checksum-mismatch cases for metadata, archive data, and external objects require
 `integrity-failure`. Missing checksums and malformed frame encodings retain their
-structural failure categories. Valid checksummed and checksum-optional metadata
-and object fixtures exercise the corresponding positive paths across all SDKs.
+structural failure categories. Metadata checksums are mandatory; checksum-free metadata fixtures are rejected.
+External-object checksums remain optional. Archives use the 44-byte `Z*01`
+footer; fixture SHA-256 values identify the complete encoded fixture files.
 
-Manifest headers use `requires`. The empty and thin archives cover empty and
-nonempty declarations; `invalid/missing-requires.zstar` omits the field. The
-`legacy-required-features` cases reject the obsolete key both alone and alongside
-`requires`.
+Manifest directories use `requires`. The empty and thin archives cover empty and
+nonempty declarations; `invalid/missing-requires.zstar` omits the field.
+Unknown directory fields are rejected unless prefixed with `x-`.
 
-Pointer fixtures cover malformed fields, manifest agreement, JSON whitespace
-without a final newline, and rejection of non-JSON and empty payloads.
-Empty-payload cases exercise metadata, selective-read, and full validation scopes.
+The `pages/` fixtures cover directory range accounting, page schemas, cross-page
+ancestors, optional extension pages, and corruption outside a selected read.
+Opening validates the directory; the metadata operation scans every page.
+
+Pointer fixtures cover metadata and selective reads of external extents.
+
+Footer cases cover signature and payload errors, zero and inconsistent lengths,
+checked subtraction, truncation, and trailing bytes.
+Metadata-only validation does not establish the validity of the preceding data region.

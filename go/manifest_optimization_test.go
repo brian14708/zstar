@@ -3,7 +3,6 @@ package zstar
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"math"
 	"reflect"
@@ -51,11 +50,12 @@ func TestCanonicalSequenceAcrossStorageBoundaries(t *testing.T) {
 
 type manifestCountedRange struct {
 	memoryRange
-	calls, maxRange int64
+	calls, maxRange, bytes int64
 }
 
 func (s *manifestCountedRange) ReadRange(ctx context.Context, at, size int64) ([]byte, error) {
 	s.calls++
+	s.bytes += size
 	if size > s.maxRange {
 		s.maxRange = size
 	}
@@ -107,9 +107,7 @@ func TestManifestWriterSnapshotsEntryAndRootExtensions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer testClose(t, m)
-	if err = m.ValidateArchive(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+
 	root := m.RootExtensions()
 	if mustTestValue[[]byte](t, root["x-bytes"])[0] != 7 {
 		t.Fatal("root not snapshotted")
@@ -174,104 +172,5 @@ func TestDirectManifestTupleIntegerBoundaries(t *testing.T) {
 				t.Fatalf("noncanonical extent integer %d (%v)", value, err)
 			}
 		}
-	}
-}
-
-func TestManifestPayloadMappingsAndUnorderedCoverage(t *testing.T) {
-	ctx := context.Background()
-	var output bytes.Buffer
-	w, err := newEntryArchiveWriter(&output, WriterOptions{FrameSize: 512, Manifest: ManifestWriterOptions{MemoryBytes: 1}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := bytes.Repeat([]byte{7}, 3000)
-	if err = w.Add(ctx, Entry{Path: "file", Mode: 420}, uint64(len(body)), bytes.NewReader(body)); err != nil {
-		t.Fatal(err)
-	}
-	if err = w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	m, err := openManifest(ctx, memoryRange(output.Bytes()), ManifestReaderOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer testClose(t, m)
-	if err := m.ValidateArchive(ctx); err != nil {
-		t.Fatalf("physical validation: %v", err)
-	}
-	// Build tar manually in arbitrary order; empty members make duplicates
-	// impossible to detect through inline mapping alone.
-	for _, paths := range [][]string{{"b", "a"}, {"b", "b"}} {
-		var raw, archive bytes.Buffer
-		for _, path := range paths {
-			header, err := memberHeader(Header{Path: path, Type: TypeFile, Mode: 420})
-			if err != nil {
-				t.Fatal(err)
-			}
-			raw.Write(header)
-		}
-		raw.Write(make([]byte, 1024))
-		codec, err := newEntryArchiveWriter(&archive, WriterOptions{FrameSize: 2048, Manifest: ManifestWriterOptions{}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err = codec.append(raw.Bytes()); err != nil {
-			t.Fatal(err)
-		}
-		if err = codec.flush(); err != nil {
-			t.Fatal(err)
-		}
-		testClose(t, codec.codec)
-		checkCleanup(t, codec.frames.close())
-		checkCleanup(t, codec.records.close())
-		metadata, err := newManifestWriter(&archive, codec.encoded, ManifestWriterOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, path := range []string{"a", "b"} {
-			if err = metadata.AddEntry(Entry{Path: path, Mode: 420}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err = metadata.Close(); err != nil {
-			t.Fatal(err)
-		}
-		m, err := openManifest(ctx, memoryRange(archive.Bytes()), ManifestReaderOptions{MemoryBytes: 1})
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = m.ValidateArchive(ctx)
-		testClose(t, m)
-		if (err == nil) != (paths[1] == "a") {
-			t.Fatalf("coverage %v: %v", paths, err)
-		}
-	}
-}
-
-func TestObservedRankSortBoundedMultipleRuns(t *testing.T) {
-	s := manifestSpool{options: (ManifestReaderOptions{MemoryBytes: 1}).defaults()}
-	defer func() { checkCleanup(t, s.close()) }()
-	buffer := make([]byte, 0, 64<<10)
-	for rank := uint64(30000); rank > 0; rank-- {
-		buffer = binary.LittleEndian.AppendUint64(buffer, rank-1)
-		if len(buffer) == cap(buffer) {
-			if err := s.append(buffer); err != nil {
-				t.Fatal(err)
-			}
-			buffer = buffer[:0]
-		}
-	}
-	if err := s.append(buffer); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateObservedRanks(context.Background(), &s, 30000); err != nil {
-		t.Fatal(err)
-	}
-	// Duplicate the last rank while retaining the exact physical count.
-	if _, err := s.file.WriteAt(make([]byte, 8), 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateObservedRanks(context.Background(), &s, 30000); ErrorCategory(err) != "tar-toc-mismatch" {
-		t.Fatal(err)
 	}
 }

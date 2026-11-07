@@ -5,8 +5,7 @@ title: "Create your first archive with Go"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../go/examples/tutorial_file/main.go?raw";
 
-Create `example.zstar` containing `example.txt`, read the file and a byte range,
-and verify the archive. Running the example again replaces the archive.
+Create `example.zstar` containing `example.txt`, read the file and a byte range. Running the example again replaces the archive.
 
 ## Set up
 
@@ -35,20 +34,11 @@ and byte count; offset 0 and length 5 return `Hello`.
 
 <Example source={source} lang="go" region="read" />
 
-## Verify the archive
-
-`Verify(ctx, zstar.VerifyArchive)` checks the entire physical archive for
-errors, including content you have not read. This example keeps all content
-inline; use `zstar.VerifyExternalClosure` to also resolve external content.
-
-<Example source={source} lang="go" region="verify" />
-
 You should see:
 
 ```text
 Hello from Zstar
 Hello
-Archive verified
 ```
 
 ## Complete example

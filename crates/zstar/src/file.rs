@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
+// Private per-member decoded-source retention, including bookkeeping.
+const DECODED_CACHE_BYTES: usize = 2 << 20;
+
 type Load = Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>;
 
 // Immutable entry metadata and extent interpretation shared by both handles.
@@ -17,13 +20,35 @@ struct FileSelection {
     entry: Entry,
     ends: Vec<u64>,
     size: u64,
-    cache_bytes: usize,
-    cache: Arc<Mutex<Option<CachedSource>>>,
+    cache: Arc<DecodedCache>,
 }
 struct CachedSource {
-    owner: Weak<crate::ManifestReader>,
     key: Key,
     bytes: Bytes,
+}
+// The handle fixes archive identity and verification policy for this cache.
+#[derive(Default)]
+pub struct DecodedCache(Mutex<Option<CachedSource>>);
+impl DecodedCache {
+    pub(crate) fn get(&self, key: &Key) -> Option<Bytes> {
+        let mut cache = self.0.lock().unwrap();
+        if cache.as_ref().is_some_and(|cached| &cached.key == key) {
+            cache.as_ref().map(|cached| cached.bytes.clone())
+        } else {
+            *cache = None;
+            None
+        }
+    }
+
+    pub(crate) fn retain(&self, key: Key, bytes: &Bytes) {
+        let bookkeeping = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
+        if bytes.len().saturating_add(bookkeeping) <= DECODED_CACHE_BYTES {
+            *self.0.lock().unwrap() = Some(CachedSource {
+                key,
+                bytes: bytes.clone(),
+            });
+        }
+    }
 }
 impl FileSelection {
     fn new(entry: Entry) -> Result<Self> {
@@ -41,8 +66,7 @@ impl FileSelection {
             entry,
             ends,
             size,
-            cache_bytes: 2 << 20,
-            cache: Arc::new(Mutex::new(None)),
+            cache: Arc::new(DecodedCache::default()),
         })
     }
 
@@ -83,43 +107,22 @@ impl FileSelection {
                     &self.ends,
                     offset,
                     length as u64,
+                    self.cache.clone(),
                 )));
             }
             let extent = first.clone();
             let archive = archive.clone();
             let cache = self.cache.clone();
-            let cache_bytes = self.cache_bytes;
             Ok(Box::pin(async move {
                 let key = Key::of(&extent);
-                let cached = {
-                    let mut cache = cache.lock().unwrap();
-                    if cache.as_ref().is_some_and(|cached| {
-                        archive.owns_cursor(&cached.owner) && cached.key == key
-                    }) {
-                        cache.as_ref().map(|cached| cached.bytes.clone())
-                    } else {
-                        *cache = None;
-                        None
-                    }
-                };
-                let raw = if let Some(raw) = cached {
+                let raw = if let Some(raw) = cache.get(&key) {
                     raw
                 } else {
                     let raw = archive
                         .content(&key, extent.encoded_size, archive.resolver())
                         .await?;
                     crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
-                    if raw.len().saturating_add(
-                        std::mem::size_of::<Mutex<Option<CachedSource>>>()
-                            + 2 * std::mem::size_of::<usize>(),
-                    ) <= cache_bytes
-                    {
-                        *cache.lock().unwrap() = Some(CachedSource {
-                            owner: archive.cursor_owner(),
-                            key,
-                            bytes: raw.clone(),
-                        });
-                    }
+                    cache.retain(key, &raw);
                     raw
                 };
                 crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
@@ -139,22 +142,14 @@ impl FileSelection {
 /// Authenticated random-access member selection created by [`Archive::open_cursor`].
 ///
 /// The caller supplies the live archive for each operation. Positional reads
-/// borrow the cursor immutably and can run concurrently.
+/// borrow the cursor immutably and can run concurrently. Each cursor privately
+/// retains one decoded source within a 2 MiB budget; dropping it releases the cache.
+/// Separate handles do not share completed decoded caches.
 pub struct FileCursor {
     owner: Weak<crate::ManifestReader>,
     selection: FileSelection,
 }
 impl FileCursor {
-    /// Sets the retained decoded-source budget, including cache bookkeeping.
-    /// The default is 2 MiB. Zero disables retention. Entry metadata and
-    /// returned buffers are separate; larger sources are decoded without retention.
-    #[must_use]
-    pub fn with_cache_bytes(mut self, bytes: usize) -> Self {
-        self.selection.cache_bytes = bytes;
-        self.selection.cache = Arc::new(Mutex::new(None));
-        self
-    }
-
     /// Returns the logical payload length in bytes.
     #[must_use]
     pub const fn size(&self) -> u64 {
@@ -205,15 +200,6 @@ pub struct File<R: AsyncRangeReader + ?Sized> {
     pending: Option<(u64, Load)>,
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
-    /// Sets the decoded-source cache budget; see [`FileCursor::with_cache_bytes`].
-    #[must_use]
-    pub fn with_cache_bytes(mut self, bytes: usize) -> Self {
-        self.pending = None;
-        self.selection.cache_bytes = bytes;
-        self.selection.cache = Arc::new(Mutex::new(None));
-        self
-    }
-
     pub(crate) fn new(archive: Archive<R>, entry: Entry) -> Result<Self> {
         let selection = FileSelection::new(entry)?;
         Ok(Self {
@@ -305,5 +291,59 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncSeek for File<R> {
     }
     fn poll_complete(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<u64>> {
         Poll::Ready(Ok(self.position))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Builder;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountedSource {
+        bytes: Bytes,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl AsyncRangeReader for CountedSource {
+        async fn size(&self) -> Result<u64> {
+            self.bytes.size().await
+        }
+        async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.bytes.read_range(range).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_extent_reads_reuse_handle_cache_and_validate_every_selection() {
+        let mut builder = Builder::try_new(Vec::new()).await.unwrap();
+        builder.append_bytes("file", b"abcdef").await.unwrap();
+        let source = Arc::new(CountedSource {
+            bytes: builder.finish().await.unwrap().into(),
+            calls: AtomicUsize::new(0),
+        });
+        let archive = Archive::open(source.clone()).await.unwrap();
+        let mut cursor = archive.open_cursor("file").await.unwrap();
+        let mut entry = cursor.selection.entry.clone();
+        assert_eq!(entry.extents.len(), 1);
+        let mut second = entry.extents[0].clone();
+        entry.extents[0].size = 3;
+        second.offset += 3;
+        second.size -= 3;
+        entry.extents.push(second);
+        cursor.selection = FileSelection::new(entry).unwrap();
+        source.calls.store(0, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(cursor.read(&archive, 2, 2).await.unwrap(), b"cd"[..]);
+        }
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+        cursor.selection.entry.extents[1].offset = u64::MAX;
+        assert!(matches!(
+            cursor.read(&archive, 3, 1).await,
+            Err(Error::Range)
+        ));
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     }
 }

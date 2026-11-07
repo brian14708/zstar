@@ -35,7 +35,7 @@ proptest! {
         }
         let encoded = writer.finish().unwrap();
         let mut reader = BlockingArchive::open(SliceReader::new(&encoded), zstar::backend::ManifestOptions::default()).unwrap();
-        reader.validate().unwrap();
+
         for (choice, offset, length) in picks {
             if files.is_empty() { break; }
             let index = choice % files.len();
@@ -55,7 +55,7 @@ proptest! {
         writer.add_metadata(e).unwrap();
         let encoded = writer.finish().unwrap();
         let mut reader = BlockingArchive::open(SliceReader::new(&encoded), zstar::backend::ManifestOptions::default()).unwrap();
-        reader.validate().unwrap();
+
         prop_assert_eq!(reader.read_link("link").unwrap(), target);
     }
     #[test]
@@ -74,7 +74,7 @@ proptest! {
         if let Some(at) = truncate { encoded.truncate(at % (len + 1)); }
         if let Ok(mut reader) = BlockingArchive::open(SliceReader::new(&encoded), ManifestOptions { max_decoded_bytes: 65536, ..Default::default() }) {
             let _ = reader.read("payload", 0, 255, None, true);
-            let _ = reader.validate();
+
         }
     }
 }

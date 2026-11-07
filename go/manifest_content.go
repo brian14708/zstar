@@ -245,18 +245,17 @@ func (s *manifestContentState) checkOpen(ctx context.Context) error {
 
 // readMany owns bounded content execution. consume is
 // called concurrently and must release the chunk when it returns; decoded
-// content is not retained after each selected source has been copied.
-func (s *manifestContentState) readMany(ctx context.Context, extents []Extent, resolver EncodedContentResolver, verify bool, consume func(int, *manifestContentChunk) error) error {
+// content retention belongs to the caller's load function.
+func (s *manifestContentState) readMany(ctx context.Context, count int, load func(context.Context, int) (*manifestContentChunk, error), consume func(int, *manifestContentChunk) error) error {
 	work, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	var wg sync.WaitGroup
 	queue := make(chan int)
-	workers := min(cap(s.slots), len(extents))
+	workers := min(cap(s.slots), count)
 	for range workers {
 		wg.Go(func() {
 			for index := range queue {
-				extent := extents[index]
-				chunk, err := s.get(work, extent, resolver, verify)
+				chunk, err := load(work, index)
 				if err == nil {
 					err = consume(index, chunk)
 				}
@@ -268,7 +267,7 @@ func (s *manifestContentState) readMany(ctx context.Context, extents []Extent, r
 		})
 	}
 send:
-	for i := range extents {
+	for i := range count {
 		select {
 		case queue <- i:
 		case <-work.Done():

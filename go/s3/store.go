@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"math"
 	"math/bits"
+	"slices"
 	"strings"
 	"sync"
 
@@ -65,18 +66,17 @@ func redacted(err error) error {
 	return errors.New("zstar s3: storage request failed")
 }
 
-// Source pins size and ETag/version from the first HEAD, then performs exact
+// Source pins size and ETag/version from a bounded suffix GET, then performs exact
 // conditional ranges. Reuse it for one immutable archive reader.
 type Source struct {
-	client                       SourceClient
-	bucket, key                  string
-	maxRange                     int64
-	mu                           sync.Mutex
-	known                        bool
-	size                         int64
-	etag, version                *string
-	manifestOffset, manifestSize uint64
-	hasManifest                  bool
+	client        SourceClient
+	bucket, key   string
+	maxRange      int64
+	mu            sync.Mutex
+	known         bool
+	size          int64
+	etag, version *string
+	tail          []byte
 }
 
 // NewSource creates a read-only source that pins size and ETag or version on
@@ -88,8 +88,9 @@ func NewSource(client SourceClient, bucket, key string) *Source {
 // WithMaxRangeBytes configures the source before use; it is not concurrency safe.
 func (s *Source) WithMaxRangeBytes(limit int64) *Source { s.maxRange = limit; return s }
 
-// Size pins and returns the immutable object length using a credentialed HEAD.
-func (s *Source) Size(ctx context.Context) (int64, error) {
+// Size pins the object length and identity while prefetching up to 128 KiB.
+// Cached bytes serve metadata and content reads without additional requests.
+func (s *Source) Size(ctx context.Context) (size int64, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -101,35 +102,70 @@ func (s *Source) Size(ctx context.Context) (int64, error) {
 	if s.client == nil {
 		return 0, errors.New("zstar s3: nil client")
 	}
+	suffix := min(s.maxRange, int64(128<<10))
+	if suffix <= 0 {
+		return 0, errors.New("zstar s3: local range budget")
+	}
+	result, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: new(s.bucket), Key: new(s.key), Range: new(fmt.Sprintf("bytes=-%d", suffix)),
+	})
+	if err != nil {
+		// Empty S3 objects reject byte ranges. A HEAD fallback must confirm zero bytes.
+		if api, ok := errors.AsType[smithy.APIError](err); ok && api.ErrorCode() == "InvalidRange" {
+			return s.emptySize(ctx)
+		}
+		return 0, redacted(err)
+	}
+	if result == nil || result.Body == nil {
+		return 0, errors.New("zstar s3: missing response body")
+	}
+	defer func() {
+		if closeErr := result.Body.Close(); closeErr != nil {
+			s.known, s.tail = false, nil
+			size = 0
+			err = errors.Join(err, fmt.Errorf("zstar s3: close response: %w", redacted(closeErr)))
+		}
+	}()
+	if result.ContentLength != nil && *result.ContentLength == 0 {
+		return s.emptySize(ctx)
+	}
+	var first, last int64
+	if _, scanErr := fmt.Sscanf(aws.ToString(result.ContentRange), "bytes %d-%d/%d", &first, &last, &size); scanErr != nil ||
+		size <= 0 || first != max(int64(0), size-suffix) || last != size-1 ||
+		aws.ToString(result.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", first, last, size) ||
+		result.ContentLength == nil || *result.ContentLength != size-first {
+		return 0, errors.New("zstar s3: invalid suffix range")
+	}
+	if aws.ToString(result.ETag) == "" && (aws.ToString(result.VersionId) == "" || aws.ToString(result.VersionId) == "null") {
+		return 0, errors.New("zstar s3: object has no immutable identity")
+	}
+	raw, err := readExact(result.Body, int(size-first))
+	if err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.size, s.etag, s.version, s.tail = size, result.ETag, result.VersionId, raw
+	s.known = true
+	return size, nil
+}
+
+// emptySize handles stores that reject ranges or use a nonstandard range header
+// for empty objects. It runs with mu held and never accepts a nonempty HEAD.
+func (s *Source) emptySize(ctx context.Context) (int64, error) {
 	meta, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{Bucket: new(s.bucket), Key: new(s.key)})
 	if err != nil {
 		return 0, redacted(err)
 	}
-	if meta == nil || meta.ContentLength == nil || *meta.ContentLength < 0 {
-		return 0, errors.New("zstar s3: invalid object metadata")
+	if meta == nil || meta.ContentLength == nil || *meta.ContentLength != 0 {
+		return 0, errors.New("zstar s3: suffix range rejected")
 	}
-	s.size = *meta.ContentLength
-	s.etag = meta.ETag
-	s.version = meta.VersionId
-	if aws.ToString(s.etag) == "" && (aws.ToString(s.version) == "" || aws.ToString(s.version) == "null") {
+	if aws.ToString(meta.ETag) == "" && (aws.ToString(meta.VersionId) == "" || aws.ToString(meta.VersionId) == "null") {
 		return 0, errors.New("zstar s3: object has no immutable identity")
 	}
-	s.manifestOffset, s.manifestSize, s.hasManifest = parseManifestPosition(meta.Metadata)
-	s.known = true
-	return s.size, nil
-}
-
-// ManifestRange returns the location hint from the same pinned HEAD as Size.
-func (s *Source) ManifestRange(ctx context.Context) (offset, encodedSize uint64, present bool, err error) {
-	size, err := s.Size(ctx)
-	if err != nil {
-		return 0, 0, false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	usable := s.hasManifest && s.manifestOffset <= uint64(size) &&
-		uint64(size)-s.manifestOffset <= uint64(max(s.maxRange, 0))
-	return s.manifestOffset, s.manifestSize, usable, nil
+	s.size, s.etag, s.version, s.known = 0, meta.ETag, meta.VersionId, true
+	return 0, nil
 }
 
 // ReadRange returns an exact conditional range from the pinned object.
@@ -151,6 +187,12 @@ func (s *Source) ReadRange(ctx context.Context, offset, length int64) (data []by
 	if length > s.maxRange || uint64(length) >= uint64(math.MaxInt) {
 		return nil, errors.New("zstar s3: local range budget")
 	}
+	tailStart := size - int64(len(s.tail))
+	if offset >= tailStart {
+		return slices.Clone(s.tail[offset-tailStart : offset-tailStart+length]), nil
+	}
+	requestedLength := length
+	length = min(length, tailStart-offset)
 	result, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: new(s.bucket), Key: new(s.key), Range: new(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)), IfMatch: s.etag, VersionId: s.version})
 	if err != nil {
 		return nil, redacted(err)
@@ -174,6 +216,12 @@ func (s *Source) ReadRange(ctx context.Context, offset, length int64) (data []by
 	}
 	if err = ctx.Err(); err != nil {
 		return nil, err
+	}
+	if requestedLength > length {
+		out := make([]byte, requestedLength)
+		copy(out, raw)
+		copy(out[len(raw):], s.tail[:offset+requestedLength-tailStart])
+		return out, nil
 	}
 	return raw, nil
 }

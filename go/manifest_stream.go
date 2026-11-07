@@ -10,6 +10,14 @@ import (
 	"sync"
 )
 
+// sequentialBufferBytes bounds operation-local transport buffers.
+func sequentialBufferBytes(limits Limits) uint64 {
+	if limits.MaxFrameEncodedBytes != 0 {
+		return min(1<<20, limits.MaxFrameEncodedBytes)
+	}
+	return 1 << 20
+}
+
 // A sequential bounded range buffer amortizes remote metadata requests. take
 // returns owned bytes because subsequent reads can replace the read-ahead.
 type manifestRangeStream struct {

@@ -1,4 +1,8 @@
-testdata/entry-manifest/contents/** -text
+# Normalize text files and keep checkouts consistent across platforms.
+* text=auto eol=lf
+
+# Preserve fixture bytes and avoid textual diffs or merges for binary data.
+*.zstar binary
 
 # Unified diffs use a space to represent empty context lines.
 patches/*.patch whitespace=-blank-at-eol

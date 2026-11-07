@@ -1,9 +1,7 @@
 package zstar
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -332,9 +330,7 @@ type ManifestReaderOptions struct {
 	MaxEntries uint64
 	// ConcurrentChunks bounds fetch/decode/hash work, including canceled calls.
 	ConcurrentChunks int
-	// ReadAheadBytes bounds sequential transport buffers (default 1 MiB).
-	ReadAheadBytes uint64
-	DisableDisk    bool
+	DisableDisk      bool
 	// SpoolBudget is shared by all derived spools. Nil creates a 4 GiB quota
 	// for this reader; an explicit pointer can share it across owners.
 	SpoolBudget *SpoolBudget
@@ -358,6 +354,8 @@ type ManifestWriterOptions struct {
 	MemoryBytes, MaxEncodedBytes, MaxDecodedBytes uint64
 	CompressionLevel                              int
 	RootExtensions                                Extensions
+	// ExtensionPages contains optional independently compressed x- groups.
+	ExtensionPages map[string][]any
 	// BlockTarget is a target of at least 512 bytes, default 64 KiB.
 	BlockTarget      int
 	DisableDisk      bool
@@ -369,6 +367,7 @@ type manifestOptions struct {
 	ManifestReaderOptions
 	CompressionLevel int
 	RootExtensions   Extensions
+	ExtensionPages   map[string][]any
 	BlockTarget      int
 }
 
@@ -380,6 +379,7 @@ func (o ManifestWriterOptions) defaults() manifestOptions {
 	}).defaults()
 	result.CompressionLevel = o.CompressionLevel
 	result.RootExtensions = o.RootExtensions
+	result.ExtensionPages = o.ExtensionPages
 	if o.BlockTarget != 0 {
 		result.BlockTarget = o.BlockTarget
 	}
@@ -390,7 +390,7 @@ func (o manifestOptions) writerOptions() ManifestWriterOptions {
 	return ManifestWriterOptions{
 		Limits: o.Limits, MemoryBytes: o.MemoryBytes, MaxEncodedBytes: o.MaxEncodedBytes,
 		MaxDecodedBytes: o.MaxDecodedBytes, CompressionLevel: o.CompressionLevel,
-		RootExtensions: o.RootExtensions, BlockTarget: o.BlockTarget,
+		RootExtensions: o.RootExtensions, ExtensionPages: o.ExtensionPages, BlockTarget: o.BlockTarget,
 		DisableDisk: o.DisableDisk, SpoolBudget: o.SpoolBudget,
 		CreateSpillStore: o.CreateSpillStore,
 	}
@@ -403,9 +403,6 @@ func (o ManifestReaderOptions) defaults() manifestOptions {
 func (o manifestOptions) defaults() manifestOptions {
 	if o.SpoolBudget == nil {
 		o.SpoolBudget = NewSpoolBudget(4 << 30)
-	}
-	if o.ReadAheadBytes == 0 {
-		o.ReadAheadBytes = 1 << 20
 	}
 	if o.ConcurrentChunks == 0 {
 		o.ConcurrentChunks = 8
@@ -619,10 +616,11 @@ func (s *manifestSpool) close() error {
 	return errors.Join(err, removeErr)
 }
 
-// Manifest authenticates and validates the complete sequence before exposing entries.
+// Manifest checks and validates the complete sequence before exposing entries.
 // Manifest exposes low-level metadata and content operations with per-call policy.
 // Prefer Reader for an archive with one fixed resolver and verification policy.
 type manifest struct {
+	paged          *pagedState
 	mu             sync.Mutex
 	closed         bool
 	spool          manifestSpool
@@ -632,11 +630,10 @@ type manifest struct {
 	rootExtensions Extensions
 	source         RangeReader
 	maxRead        uint64
-	readAhead      uint64
 	content        *manifestContentState
 }
 
-// openManifest authenticates and validates metadata using the supplied budgets.
+// openManifest checks and validates metadata using the supplied budgets.
 // The caller owns the immutable source, which must support concurrent reads.
 // The opening context is used only during open; subsequent operations supply
 // their own contexts. Close releases SDK storage without closing the source.
@@ -645,9 +642,6 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 		return nil, errors.New("zstar: nil source")
 	}
 	options := config.defaults()
-	if options.Limits.MaxFrameEncodedBytes != 0 && options.ReadAheadBytes > options.Limits.MaxFrameEncodedBytes {
-		return nil, rejected(CategoryResourceLimit, "read-ahead exceeds configured frame budget")
-	}
 	if options.ConcurrentChunks < 1 || options.ConcurrentChunks > 256 {
 		return nil, errors.New("zstar: concurrent chunks must be in [1, 256]")
 	}
@@ -658,49 +652,25 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 	if err != nil {
 		return nil, err
 	}
-	if n < 80 {
+	if n < FooterSize {
 		return nil, rejected(CategoryNotZstar, "source size")
 	}
-	var footer Footer
-	var prefetched []byte
-	if hinted, ok := source.(ManifestRangeSource); ok {
-		offset, size, present, hintErr := hinted.ManifestRange(ctx)
-		if hintErr != nil {
-			return nil, hintErr
-		}
-		if present && offset > 0 && offset <= uint64(n-80) && size > 8 &&
-			size == uint64(n-80)-offset && size <= options.MaxEncodedBytes &&
-			uint64(n)-offset <= options.ReadAheadBytes {
-			raw, readErr := source.ReadRange(ctx, int64(offset), n-int64(offset))
-			if readErr != nil {
-				return nil, readErr
-			}
-			if uint64(len(raw)) != uint64(n)-offset {
-				return nil, rejected(CategoryMalformedTOC, "short hinted metadata range")
-			}
-			candidate, parseErr := ParseFooter(raw[len(raw)-80:])
-			if parseErr == nil && candidate.ManifestOffset == offset && candidate.ManifestEncodedSize == size {
-				footer, prefetched = candidate, raw[:len(raw)-80]
-			}
-		}
+	fb, err := source.ReadRange(ctx, n-FooterSize, FooterSize)
+	if err != nil {
+		return nil, err
 	}
-	if prefetched == nil {
-		fb, readErr := source.ReadRange(ctx, n-80, 80)
-		if readErr != nil {
-			return nil, readErr
-		}
-		footer, err = ParseFooter(fb)
-		if err != nil {
-			return nil, err
-		}
+	footer, err := ParseFooter(fb)
+	if err != nil {
+		return nil, err
 	}
-	if footer.ManifestOffset > uint64(n-80) || footer.ManifestEncodedSize != uint64(n-80)-footer.ManifestOffset {
-		return nil, rejected(CategoryMalformedFooter, "metadata coverage")
+	metadataOffset, _, rangeErr := footer.ManifestRange(uint64(n))
+	if rangeErr != nil {
+		return nil, rangeErr
 	}
 	if footer.ManifestEncodedSize > options.MaxEncodedBytes || footer.ManifestDecodedSize > options.MaxDecodedBytes {
 		return nil, rejected(CategoryResourceLimit, "manifest size")
 	}
-	m := &manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: footer.ManifestOffset, source: source, maxRead: options.MaxReadBytes, readAhead: options.ReadAheadBytes}
+	m := &manifest{spool: manifestSpool{options: decodedSpoolOptions(options)}, start: metadataOffset, source: source, maxRead: options.MaxReadBytes}
 	m.content = newManifestContentState(options, source)
 	defer func() {
 		if err != nil {
@@ -710,14 +680,14 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 	}()
 	decoder := frameDecoder{limits: options.Limits}
 	defer decoder.close()
-	hash := sha256.New()
 	var decoded uint64
+	var physical []pageReference
 	if footer.ManifestDecodedSize > uint64(^uint(0)>>1) {
 		return nil, rejected(CategoryResourceLimit, "manifest exceeds address space")
 	}
-	end := footer.ManifestOffset + footer.ManifestEncodedSize
-	input := manifestRangeStream{ctx: ctx, source: source, at: footer.ManifestOffset, end: end, readAhead: options.ReadAheadBytes, buffer: prefetched}
-	for at := footer.ManifestOffset; at < end; {
+	end := metadataOffset + footer.ManifestEncodedSize
+	input := manifestRangeStream{ctx: ctx, source: source, at: metadataOffset, end: end, readAhead: sequentialBufferBytes(options.Limits), buffer: nil}
+	for at := metadataOffset; at < end; {
 		if end-at < 8 {
 			return nil, rejected(CategoryMalformedTOC, "metadata header")
 		}
@@ -742,6 +712,9 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 		if uint64(len(encoded)) != size {
 			return nil, rejected(CategoryMalformedTOC, "short metadata")
 		}
+		if len(encoded) < 5 || encoded[4]&4 == 0 {
+			return nil, rejected(CategoryMalformedTOC, "missing metadata checksum")
+		}
 		raw, e := decoder.decode(encoded, 0, min(addressLimit(options.Limits.MaxFrameDecodedBytes), int(options.MaxDecodedBytes-decoded)), addressLimit(options.Limits.MaxFrameEncodedBytes))
 		if e != nil {
 			return nil, categorized(CategoryMalformedTOC, e)
@@ -749,8 +722,8 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 		if len(raw) == 0 || uint64(len(raw)) > footer.ManifestDecodedSize-decoded {
 			return nil, rejected(CategoryMalformedTOC, "decoded metadata size")
 		}
+		physical = append(physical, pageReference{offset: at - metadataOffset, encoded: 8 + size, decoded: uint64(len(raw))})
 		decoded += uint64(len(raw))
-		hash.Write(raw)
 		if e = m.spool.append(raw); e != nil {
 			return nil, e
 		}
@@ -759,18 +732,11 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 	if decoded != footer.ManifestDecodedSize {
 		return nil, rejected(CategoryMalformedTOC, "decoded manifest length")
 	}
-	if !bytes.Equal(hash.Sum(nil), footer.ManifestSHA256[:]) {
-		return nil, rejected(CategoryIntegrityFailure, "manifest hash")
-	}
-	sequence := sequenceReader{spool: &m.spool, limit: manifestHeaderMax}
-	value, e := sequence.next()
+	directory, pages, e := validatePageDirectory(&m.spool, physical, footer)
 	if e != nil {
-		return nil, categorized(CategoryMalformedTOC, e)
+		return nil, e
 	}
-	root, e := schemaMap(value, []string{"version", "requires"}, nil)
-	if e != nil {
-		return nil, categorized(CategoryMalformedTOC, e)
-	}
+	root := directory
 	m.rootExtensions = Extensions{}
 	for key, value := range root {
 		if key, ok := key.(string); ok && strings.HasPrefix(key, "x-") {
@@ -801,7 +767,7 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 		}
 		m.requires = append(m.requires, s)
 	}
-	sequence.limit = options.Limits.MaxEntryBytes
+	sequence := pageEntryReader{spool: &m.spool, pages: pages}
 	var retained uint64
 	for {
 		value, e := sequence.next()
@@ -879,6 +845,9 @@ func openManifest(ctx context.Context, source RangeReader, config ManifestReader
 // Close cancels content loads and releases retained metadata and SDK storage.
 // It leaves the caller-owned source and resolver open.
 func (m *manifest) Close() error {
+	if m.paged != nil {
+		m.paged.Close()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
@@ -903,6 +872,21 @@ func (m *manifest) Entry(path string) (*Entry, error) {
 // without cloning extents and attributes that never escape to the caller.
 // Copying the header avoids retaining the complete entries slice after Close.
 func (m *manifest) entrySnapshot(path string) (Entry, error) {
+	return m.entrySnapshotContext(context.Background(), path)
+}
+
+func (m *manifest) entrySnapshotContext(ctx context.Context, path string) (Entry, error) {
+	if m.paged != nil {
+		entry, err := m.paged.Entry(ctx, path)
+		if err != nil {
+			return Entry{}, pathError("stat", path, err)
+		}
+		return *entry, nil
+	}
+	return m.indexedEntrySnapshot(path)
+}
+
+func (m *manifest) indexedEntrySnapshot(path string) (Entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -932,21 +916,6 @@ func cloneEntry(entry Entry) Entry {
 		entry.Linkname = new(*entry.Linkname)
 	}
 	return entry
-}
-
-func (m *manifest) entryRank(path string) (*Entry, uint64, error) {
-	if m.closed {
-		return nil, 0, fs.ErrClosed
-	}
-	if !validPath(path) {
-		return nil, 0, nil
-	}
-	i, found := slices.BinarySearchFunc(m.entries, path, compareEntryPath)
-	if !found {
-		return nil, 0, nil
-	}
-	owned := cloneEntry(m.entries[i])
-	return &owned, uint64(i), nil
 }
 
 // VisitEntries invokes callbacks without holding the metadata lock. It retains
@@ -987,7 +956,7 @@ func (m *manifest) Read(ctx context.Context, path string, offset, size uint64, r
 
 func (e Entry) String() string { return fmt.Sprintf("%s (%d)", e.Path, e.Type) }
 
-// RootExtensions returns owned application metadata from the authenticated root.
+// RootExtensions returns owned application metadata from the validated root.
 func (m *manifest) RootExtensions() Extensions {
 	m.mu.Lock()
 	defer m.mu.Unlock()

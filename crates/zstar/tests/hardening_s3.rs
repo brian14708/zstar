@@ -215,7 +215,7 @@ async fn archive_source_rejects_empty_etag_and_null_version() {
     let source = S3RangeSource::new(store.clone(), path);
     assert!(source.size().await.is_err());
     assert!(source.read_range(0..1).await.is_err());
-    assert_eq!(store.gets.load(Ordering::SeqCst), 0);
+    assert_eq!(store.gets.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -264,83 +264,9 @@ async fn blob_put_skips_upload_when_content_addressed_object_exists() {
 }
 
 #[tokio::test]
-async fn manifest_metadata_hints_save_a_get_without_changing_validation() {
-    use object_store::{Attribute, Attributes, PutOptions};
-    use zstar::s3::{MANIFEST_POSITION_METADATA_KEY, VERSION_METADATA_KEY, archive_attributes};
-    let bytes = Bytes::from_static(include_bytes!(
-        "../../../testdata/entry-manifest/inline.zstar"
-    ));
-    let footer = zstar::backend::parse_footer(&bytes[bytes.len() - 80..]).unwrap();
-    let good = archive_attributes(&footer, bytes.len() as u64).unwrap();
-    for (position, version, expected) in [
-        (None, None, 2),
-        (
-            Some(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
-            None,
-            1,
-        ),
-        (Some("0:1".into()), None, 2),
-        (Some("+1:123".into()), None, 2),
-        (Some("18446744073709551616:10".into()), None, 2),
-        (Some("1:18446744073709551615".into()), None, 2),
-        (
-            Some(format!("{}:{}", footer.toc_offset, footer.toc_encoded_len)),
-            Some("2"),
-            2,
-        ),
-        // Plausible coverage but stale start: candidate footer fails agreement,
-        // so opening retries through the standard footer path.
-        (
-            Some(format!(
-                "{}:{}",
-                footer.toc_offset - 1,
-                footer.toc_encoded_len + 1
-            )),
-            None,
-            3,
-        ),
-    ] {
-        let store = Arc::new(TestStore::default());
-        let path = Path::from("hint.zstar");
-        let mut attributes = Attributes::new();
-        if let Some(position) = position {
-            attributes.insert(
-                Attribute::Metadata(MANIFEST_POSITION_METADATA_KEY.into()),
-                position.into(),
-            );
-        }
-        if let Some(version) = version {
-            attributes.insert(
-                Attribute::Metadata(VERSION_METADATA_KEY.into()),
-                version.into(),
-            );
-        }
-        store
-            .put_opts(
-                &path,
-                bytes.clone().into(),
-                PutOptions {
-                    attributes,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let archive = zstar::Archive::open(Arc::new(S3RangeSource::new(store.clone(), path)))
-            .await
-            .unwrap();
-        assert_eq!(store.heads.load(Ordering::SeqCst), 1);
-        assert_eq!(store.gets.load(Ordering::SeqCst), expected);
-        assert_eq!(archive.read("a-b").await.unwrap(), b"hello"[..]);
-    }
-    assert_eq!(good.len(), 5);
-    assert!(archive_attributes(&footer, bytes.len() as u64 + 1).is_err());
-}
-
-#[tokio::test]
-async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_hashes() {
+async fn completed_archive_put_uses_content_headers_and_preserves_validation() {
     use object_store::{Attribute, GetOptions};
-    use zstar::s3::{MANIFEST_POSITION_METADATA_KEY, put_archive};
+    use zstar::s3::put_archive;
     let bytes = Bytes::from_static(include_bytes!(
         "../../../testdata/entry-manifest/inline.zstar"
     ));
@@ -360,7 +286,7 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
         )
         .await
         .unwrap();
-    assert_eq!(head.attributes.len(), 5);
+    assert_eq!(head.attributes.len(), 2);
     assert_eq!(
         head.attributes
             .get(&Attribute::ContentType)
@@ -378,8 +304,8 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
     assert!(head.attributes.get(&Attribute::ContentEncoding).is_none());
     assert!(
         head.attributes
-            .get(&Attribute::Metadata(MANIFEST_POSITION_METADATA_KEY.into()))
-            .is_some()
+            .iter()
+            .all(|(key, _)| !matches!(key, Attribute::Metadata(_)))
     );
     let source = Arc::new(S3RangeSource::new(store.clone(), path.clone()));
     let result = zstar::Archive::open_with_options(
@@ -394,9 +320,9 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
     )
     .await;
     assert!(matches!(result, Err(Error::Budget(_))));
-    assert_eq!(store.gets.load(Ordering::SeqCst), 1); // Footer only: oversized hint wasn't fetched.
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1); // Discovery GET only; no extra metadata request.
     let mut corrupted = bytes.to_vec();
-    let last = corrupted.len() - 1;
+    let last = corrupted.len() - zstar::backend::FOOTER_SIZE - 1;
     corrupted[last] ^= 1;
     put_archive(store.as_ref(), &path, corrupted.into())
         .await
@@ -414,4 +340,61 @@ async fn completed_archive_put_writes_metadata_and_hints_preserve_budgets_and_ha
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn suffix_prefetch_reuses_ranges_and_pins_uncached_reads() {
+    let store = Arc::new(TestStore::default());
+    let path = Path::from("bounded-source");
+    store
+        .inner
+        .put(&path, Bytes::from_static(b"0123456789").into())
+        .await
+        .unwrap();
+    let source = Arc::new(S3RangeSource::new(store.clone(), path.clone()).with_max_range_bytes(4));
+    let reads = (0..8).map(|_| {
+        let source = source.clone();
+        tokio::spawn(async move { source.read_range(8..10).await.unwrap() })
+    });
+    for read in futures_util::future::join_all(reads).await {
+        assert_eq!(read.unwrap(), b"89"[..]);
+    }
+    assert_eq!(source.size().await.unwrap(), 10);
+    assert_eq!(store.heads.load(Ordering::SeqCst), 0);
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(source.read_range(4..8).await.unwrap(), b"4567"[..]);
+    assert_eq!(store.gets.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        source.read_range(0..5).await,
+        Err(Error::Budget(_))
+    ));
+    store
+        .inner
+        .put(&path, Bytes::from_static(b"abcdefghij").into())
+        .await
+        .unwrap();
+    assert_eq!(source.read_range(8..10).await.unwrap(), b"89"[..]);
+    assert!(source.read_range(0..2).await.is_err());
+}
+
+#[tokio::test]
+async fn suffix_prefetch_rejects_malformed_and_unbounded_responses() {
+    for response in [
+        Response::Partial,
+        Response::Short,
+        Response::Oversized,
+        Response::BackendError,
+    ] {
+        let store = Arc::new(TestStore {
+            response: Some(response),
+            ..Default::default()
+        });
+        let path = Path::from("bad-suffix");
+        store
+            .inner
+            .put(&path, Bytes::from_static(b"archive").into())
+            .await
+            .unwrap();
+        assert!(S3RangeSource::new(store, path).size().await.is_err());
+    }
 }

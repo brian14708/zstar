@@ -1,6 +1,6 @@
 # Zstar external-content draft
 
-**Status:** working draft; see SDK READMEs for support.
+**Status:** working draft; see SDK READMEs for supported operations.
 
 This optional extension to [Zstar core draft](core.md) defines the
 `external-content` required feature, external extent sources, thin archive
@@ -17,9 +17,12 @@ The informative [CAS storage appendix](#appendix-cas-storage) explains this mode
 
 ## Declaration and extents
 
-`external-content` MUST occur in `requires` exactly when any entry
-uses object sources. A file's extents MUST be entirely archive-backed or
-entirely external. Directories, symlinks, and empty files retain empty extents;
+`external-content` MUST occur in the manifest directory's `requires` exactly
+when any entry uses object sources. Directory validation checks feature support;
+each decoded entry page checks that object sources have the declaration.
+Complete metadata validation checks the global “exactly when” agreement. A
+file's extents MUST be entirely archive-backed or entirely external.
+Directories, symlinks, and empty files retain empty extents;
 empty files remain inline. Core-only implementations MAY reject this feature.
 Supporting readers MUST understand object addresses and decoded selections.
 
@@ -110,15 +113,15 @@ literal even if their bytes are valid pointer JSON. Physical tar member size is
 the serialized JSON byte length, not the reconstructed file size.
 A zero-byte physical pointer payload is invalid even when its tar size and
 padding are otherwise valid. Metadata-only and selective reads do not parse
-physical pointer payloads; full archive validation MUST parse every one.
+physical pointer payloads.
 
-Full archive validation compares each parsed chunk with the corresponding
-manifest object extent: `size`, `source`, `encoded_size`, and defaulted `offset`
-must agree exactly, including chunk order and count. Validation does not require
+Each pointer chunk MUST agree exactly with the corresponding manifest object
+extent in `size`, `source`, `encoded_size`, and defaulted `offset`, including
+chunk order and count. Validation does not require
 canonical JSON bytes. A fetched object's current encoded length must not replace
 its stored advisory hint during comparison.
 
-Pointer decoders and full archive validators MUST reject non-JSON payloads.
+Pointer decoders MUST reject non-JSON payloads.
 
 ## External object resolution
 
@@ -150,8 +153,8 @@ Each representation MUST satisfy the [core frame
 requirements](core.md#zstandard-frame-requirements) for independent Zstandard
 sources, including framing, dictionary, reserved-bit, content-size, and
 resource-budget rules. Its checksum is optional, but MUST be valid when
-present. Unlike archive data frames, external representations do not require
-checksums.
+present. Unlike archive data and metadata frames, external representations do
+not require Zstandard checksums.
 
 ## External identity and verification
 
@@ -184,28 +187,23 @@ profile](core.md#reader-implementation-profile).
 ## Validation and conformance
 
 A conformant thin archive satisfies core and this extension even when
-referenced objects are unavailable. A **complete external closure** supplies
-valid, complete raw objects for every external extent. Implementations declare
-supported classes:
+referenced objects are unavailable. Implementations declare supported classes:
 
 | Class | Additional behavior |
 | --- | --- |
 | Thin writer | Emit a conformant archive and declare `external-content` exactly when object extents occur. |
-| Metadata reader | Check declaration agreement, object extent schema, and checked logical sizes; no object fetch is required. |
-| Selective reader | Validate each complete fetched object and its complete declared selections before returning requested bytes, under the selected hash policy. |
-| Full archive validator | Parse every external pointer and compare all tuple values with entry extents; no external fetch is required. |
+| Directory reader | Check support for the declaration; no entry-page or object fetch is required. |
+| Metadata reader | Check global declaration agreement, object extent schema, and checked logical sizes across every entry page; no object fetch is required. |
+| Selective reader | Apply core selected-page and ancestor checks, check selected object extents against the declaration, and validate each complete fetched object and its selections before returning requested bytes, under the selected hash policy. |
 | External resolver/reconstructor | Supply or consume complete bounded encoded objects, validate selected raw objects, and reconstruct selections in order under the selected hash policy. |
-| External-closure validator | Perform full archive validation and resolve every external selection. |
 
-A zero-length valid file read fetches no objects but still authenticates and
-validates the complete manifest. External-closure validation with SHA-256
-verification disabled still checks framing and bounds, but MUST NOT claim a
-verified closure. Full archive validation does not establish external
-availability, verified closure, or content authenticity. Implementations MUST
-distinguish missing objects, malformed encodings, integrity failures, transport
-failures, and local resource rejections, and MUST NOT claim checks they did not
-complete. Validation APIs MAY return only success or an error; the selected
-scope and hash policy determine which checks success establishes.
+A zero-length valid file read fetches no objects but still validates the
+directory, selected entry page, and ancestors under core's selective rules;
+it does not require checking unrelated entry or extension pages. Implementations
+MUST distinguish missing objects, malformed encodings, integrity failures,
+transport failures, and local resource rejections, and MUST NOT claim checks
+they did not complete. The selected hash policy determines whether a successful
+read establishes content-address binding.
 
 ## Security and retention
 
@@ -290,7 +288,7 @@ bytes, and encoded-size hints are advisory.
 
 For an archive stored as an object, object bytes are the complete `.tar.zst`
 file. Changing internal compression changes its address. The archive footer
-hashes decoded manifest metadata, not the complete archive.
+stores metadata lengths and no cryptographic digest.
 
 ### Lookup and verification
 

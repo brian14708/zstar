@@ -1,13 +1,13 @@
-//! Write an archive to a file, read its contents, and verify it.
+//! Write an archive to a file, read its contents.
 use std::sync::Arc;
 use zstar::fs::AsyncLocalFileSource;
-use zstar::{Archive, Builder, VerificationScope};
+use zstar::{Archive, Builder};
 
 #[tokio::main]
 async fn main() -> zstar::Result<()> {
     // region create
     let output = tokio::fs::File::create("example.zstar").await?;
-    let mut builder = Builder::new(output);
+    let mut builder = Builder::try_new(output).await?;
     builder
         .append_bytes("example.txt", b"Hello from Zstar\n")
         .await?;
@@ -26,9 +26,5 @@ async fn main() -> zstar::Result<()> {
     println!("{}", String::from_utf8_lossy(&selected));
     // endregion read
 
-    // region verify
-    archive.verify(VerificationScope::Archive).await?;
-    println!("Archive verified");
-    // endregion verify
     Ok(())
 }

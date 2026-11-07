@@ -605,33 +605,19 @@ impl<R: RangeReader> BlockingArchive<R> {
     pub fn manifest(&self) -> &ManifestReader {
         &self.manifest
     }
-    #[cfg(feature = "async")]
-    pub(crate) const fn from_manifest(
-        source: R,
-        manifest: std::sync::Arc<ManifestReader>,
-        data_end: u64,
-        options: ManifestOptions,
-        _metadata: [u8; 32],
-    ) -> Self {
-        Self {
-            source,
-            manifest,
-            data_end,
-            options,
-        }
-    }
 
     pub fn open(mut source: R, options: ManifestOptions) -> Result<Self> {
         let len = source.len();
-        if len < 80 {
+        if len < crate::FOOTER_SIZE as u64 {
             return Err(Error::NotZstar);
         }
-        let footer = crate::parse_footer(&source.read_range(len - 80..len)?)?;
+        let footer =
+            crate::parse_footer(&source.read_range(len - crate::FOOTER_SIZE as u64..len)?)?;
         let manifest = ManifestReader::open(&mut source, &footer, options.clone())?;
         Ok(Self {
             source,
             manifest: std::sync::Arc::new(manifest),
-            data_end: footer.toc_offset,
+            data_end: footer.metadata_range(len)?.start,
             options,
         })
     }
@@ -999,9 +985,6 @@ impl<R: RangeReader> BlockingArchive<R> {
         }
         Ok(())
     }
-    pub fn validate(&mut self) -> Result<()> {
-        self.visit_payloads(|_, _| Ok(()))
-    }
 }
 
 fn normalized_extents(extents: &[Extent]) -> impl Iterator<Item = Extent> + '_ {
@@ -1230,7 +1213,7 @@ mod tests {
             .unwrap();
         assert_eq!(&decoded[decoded.len() - 1024..], &[0; 1024]);
         assert!(reader.read("c", 10_001, 0, None, true).is_err());
-        reader.validate().unwrap();
+
         let mut streaming = Vec::new();
         reader
             .open_file("c", None, true)
@@ -1271,7 +1254,7 @@ mod tests {
         let mut reader =
             BlockingArchive::open(crate::SliceReader::new(bytes), ManifestOptions::default())
                 .unwrap();
-        reader.validate().unwrap();
+
         let mut objects = Objects {
             encoded: crate::encode_frame(b"hello\nworld\n", 3).unwrap(),
             calls: 0,
@@ -1310,49 +1293,6 @@ mod tests {
                 .is_err()
         );
         assert!(writer.finish().is_err());
-    }
-    #[test]
-    fn sequential_validation_falls_back_for_unordered_tar_and_rejects_bad_members() {
-        fn archive(paths: &[&str]) -> Vec<u8> {
-            let mut tar = Vec::new();
-            for path in paths {
-                let header =
-                    crate::tar_encode::member_header_full(path, 0, 420, b'0', "", 0, 0, 0).unwrap();
-                tar.extend(header);
-            }
-            tar.extend([0; 1024]);
-            let mut compressor = zstd::bulk::Compressor::new(3).unwrap();
-            compressor
-                .set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))
-                .unwrap();
-            let mut encoded = compressor.compress(&tar).unwrap();
-            let mut manifest = ManifestEncoder::new(
-                Vec::new(),
-                encoded.len() as u64,
-                3,
-                ManifestOptions::default(),
-            );
-            for path in ["a", "b"] {
-                manifest.add_entry(Entry::file(path)).unwrap();
-            }
-            let (metadata, _) = manifest.finish(vec![], BTreeMap::default()).unwrap();
-            encoded.extend(metadata);
-            encoded
-        }
-        for paths in [["a", "b"], ["b", "a"]] {
-            let bytes = archive(&paths);
-            let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
-                    .unwrap();
-            reader.validate().unwrap();
-        }
-        for paths in [&["a"][..], &["a", "a"], &["b", "b"], &["a", "b", "c"]] {
-            let bytes = archive(paths);
-            let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&bytes), ManifestOptions::default())
-                    .unwrap();
-            assert!(reader.validate().is_err(), "accepted {paths:?}");
-        }
     }
     #[expect(
         clippy::items_after_statements,
@@ -1393,7 +1333,6 @@ mod tests {
             crate::manifest::decode_pointer(&encode_pointer(&entry.extents).unwrap()).unwrap(),
             entry.extents
         );
-        reader.validate().unwrap();
     }
 
     #[test]
@@ -1415,10 +1354,6 @@ mod tests {
         let serial = encode(0);
         for workers in [1, 2, 4] {
             assert_eq!(encode(workers), serial);
-            let mut reader =
-                BlockingArchive::open(crate::SliceReader::new(&serial), ManifestOptions::default())
-                    .unwrap();
-            reader.validate().unwrap();
         }
     }
 

@@ -29,19 +29,17 @@ describes custom storage, ownership, cancellation, and resource policies.
 ## SDK capabilities
 
 Rust, Go, and Python implement the core archive format and the optional
-external-content extension. They validate metadata on open and selected sources
-and extents during reads.
+external-content extension. They validate the metadata directory on open and selected
+entry pages, ancestors, sources, and extents during reads.
 
 | Operation | Rust | Go | Python |
 | --- | --- | --- | --- |
-| Full physical archive validation | `verify(Archive)` | `Verify(VerifyArchive)` | `verify()` |
-| External closure validation | `verify(ExternalClosure)` | `Verify(VerifyExternalClosure)` | `verify(external=True)` |
 | External SHA-256 opt-in | `verify_external` | `VerifyExternalHash` | `verify_external` |
 | Filesystem restoration | Unix, with metadata report | No | fsspec byte downloads; links rejected |
 
-External SHA-256 checking defaults to disabled. Metadata digests, frame
-checksums, and extent bounds are always checked. Selective reads do not
-establish full physical validity, and these checks establish consistency rather
+External SHA-256 checking defaults to disabled. Metadata validation, Zstandard frame
+checksums, and extent bounds are always checked.
+Selective reads do not establish full physical validity, and these checks establish consistency rather
 than publisher authenticity. See each SDK's configuration guide for resource
 budgets.
 

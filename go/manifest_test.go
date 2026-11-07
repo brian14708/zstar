@@ -55,9 +55,9 @@ func TestManifestBlocksSpillHashAndSearch(t *testing.T) {
 		t.Fatalf("iteration: %d %v", count, err)
 	}
 	bad := bytes.Clone(output.Bytes())
-	bad[len(bad)-1] ^= 1
+	bad[len(bad)-FooterSize-1] ^= 1
 	if _, err = openManifest(context.Background(), memoryRange(bad), ManifestReaderOptions{}); err == nil {
-		t.Fatal("bad manifest hash accepted")
+		t.Fatal("bad metadata checksum accepted")
 	}
 }
 
@@ -405,6 +405,45 @@ func TestSortingReleasesSpillsAfterSuccessAndFailure(t *testing.T) {
 			}
 			if budget.Used() != 0 {
 				t.Fatal("sort quota retained")
+			}
+		})
+	}
+}
+
+func TestEntryExtensionNestingAtPageDepth(t *testing.T) {
+	for _, depth := range []int{60, 61} {
+		t.Run(strconv.Itoa(depth), func(t *testing.T) {
+			var value any = true
+			for range depth {
+				value = []any{value}
+			}
+			var output bytes.Buffer
+			output.WriteByte(0)
+			writer, err := newManifestWriter(&output, 1, ManifestWriterOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer testClose(t, writer)
+			err = writer.AddEntry(Entry{Path: "file", Attributes: Extensions{"x-depth": value}})
+			if depth == 61 {
+				if ErrorCategory(err) != CategoryResourceLimit {
+					t.Fatalf("over-nested entry: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := Open(context.Background(), memoryRange(output.Bytes()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer testClose(t, reader)
+			if _, err = reader.Entry("file"); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

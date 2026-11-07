@@ -97,9 +97,9 @@ reports that the object is missing or the transport failed. Before exposing a
 result derived from an object, catalog operations MUST verify its complete hash
 or reuse bytes with proof of prior complete verification. The first archive
 lookup therefore requires the whole object; later indexed reads may use a
-verified cache. Checking only the footer and manifest does not verify the archive
-address. An adapter using the external-content resolver must decode the outer
-Zstandard representation to obtain object bytes.
+verified cache. Checking the footer, directory, or even complete metadata does
+not verify the archive address. An adapter using the external-content resolver
+must decode the outer Zstandard representation to obtain object bytes.
 
 Readers MUST detect a cycle when an address repeats along the active delegation
 chain. Reusing an address in separate branches is valid. Implementations must
@@ -226,7 +226,6 @@ a new snapshot; old layers remain retained while reachable from any root.
 | --- | --- |
 | Catalog reader/writer | Validate or emit the complete local JSON schema and nonoverlapping path namespace. |
 | View resolver | Resolve pinned delegations and layers, verify archive identities, merge entries, and select the base path. |
-| Closure validator | Validate every reachable catalog/archive and external payload at the declared hash-verification level. |
 | Publisher | Publish dependencies before atomically updating a name with a revision precondition. |
 
 Conformance to one class does not imply conformance to another.
@@ -239,12 +238,11 @@ provide consistency, not publisher authenticity or access control.
 
 Catalog structure validation parses the document and validates all local entries
 without fetching references. View resolution additionally verifies the required
-object hashes, validates layer metadata and whiteout constraints, and merges the
-requested collection. Full closure validation traverses all reachable catalogs
-and layers, fully validates every archive, and resolves all external payloads.
-A closure is hash-verified only if its external payloads also pass
-external-content SHA-256 verification. Readers MUST report only checks they have
-completed. Reading one collection does not validate unrelated delegations or
+object hashes, completes core metadata validation for participating layers,
+validates their whiteout constraints, and merges the requested collection.
+Directory-only or selective page validation is insufficient to establish a
+layer's complete namespace and whiteout effects. Readers MUST report only checks
+they have completed. Reading one collection does not validate unrelated delegations or
 payloads.
 
 ### Implementation plan

@@ -1,11 +1,11 @@
 //! Create an archive, read a range, and seek through a retained file handle.
 use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use zstar::{Archive, Builder, Header, VerificationScope};
+use zstar::{Archive, Builder, Header};
 
 #[tokio::main]
 async fn main() -> zstar::Result<()> {
-    let mut builder = Builder::new(Vec::new());
+    let mut builder = Builder::try_new(Vec::new()).await?;
     builder
         .append_data(Header::file("hello.txt", 5), b"hello".as_slice())
         .await?;
@@ -20,6 +20,6 @@ async fn main() -> zstar::Result<()> {
     let mut tail = String::new();
     file.read_to_string(&mut tail).await?;
     println!("Read after seeking: {tail}");
-    archive.verify(VerificationScope::Archive).await?;
+
     Ok(())
 }

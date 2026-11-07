@@ -35,7 +35,7 @@ def test_external_chunks_and_lossless_metadata_rewrite():
     output = io.BytesIO()
     with Archive.from_bytes(data, resolver=objects, verify_external=True) as archive:
         assert archive.read_many([ReadRequest(path="hello", offset=1, length=3)]) == [b"bcd"]
-        assert archive.verify(external=True) is None
+
         metadata = archive.getmetadata("hello")
         with (
             ArchiveWriter(output, root_extensions=archive.root_extensions) as writer,
@@ -46,7 +46,6 @@ def test_external_chunks_and_lossless_metadata_rewrite():
         assert rewritten.root_extensions == {"x-root": {"value": b"root"}}
         assert rewritten.getmetadata("hello").extensions == {"x-entry": (1, True)}
         assert rewritten.read("hello") == b"abcdef"
-        rewritten.verify()
     assert not output.closed
 
 
@@ -85,7 +84,6 @@ def test_async_sources_and_resolvers_run_on_owning_loop():
         ) as archive:
             assert await archive.read("hello") == b"abcdef"
             assert (await archive.getmetadata("hello")).extensions == {"x-entry": (1, True)}
-            await archive.verify(external=True)
 
     asyncio.run(exercise())
 
@@ -171,7 +169,6 @@ def test_async_writer_streams_and_external_objects():
         async with await AsyncArchive.from_bytes(sink.data, resolver=objects) as reader:
             assert await reader.read("body") == b"body"
             assert await reader.read("external") == b"abcdef"
-            await reader.verify(external=True)
 
     asyncio.run(exercise())
 

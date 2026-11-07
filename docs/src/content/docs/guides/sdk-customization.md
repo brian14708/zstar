@@ -44,6 +44,11 @@ Cache encoded ranges by archive snapshot and representation. An external digest
 does not fix compressed bytes or compressed length. Never promote unchecked
 content into hash-verified content merely because the address matches.
 
+Rust's [`CachedRangeReader`](/zstar/guides/rust/configuration/#cache-range-sources)
+and Go's [`NewCachedRangeReader`](/zstar/guides/go/configuration/#cache-range-sources)
+provide bounded caching, shared fetches, and optional forward read-ahead around
+their range-reader interfaces.
+
 Archive `read_many` / Go `ReadMany` groups repeated sources and bounds concurrency.
 Resolvers can implement caching, retries, and instrumentation around individual
 requests.
@@ -66,10 +71,9 @@ not become a lifetime deadline. `io/fs` and plain `io.Reader` methods use a
 background context; use `ReadContext` or `ReadAtContext` for remote deadlines.
 A caller-owned blocking `io.ReaderAt` cannot be interrupted by a context.
 
-Rust source futures must cancel pending work when dropped. Constructing a
-`Builder` is lazy and requires no runtime. Async writing requires Tokio;
-`Builder::try_new` and `try_with_options` report initialization errors before
-returning. Legacy `new` and `with_options` report them at the first operation.
+Rust source futures must cancel pending work when dropped. Async writing and
+builder initialization require Tokio. `Builder::try_new` and
+`try_with_options` report initialization errors before returning.
 Append failures/cancellation poison the writer; discard partial output.
 
 Python async source/resolver methods declared with `async def` run on the event
@@ -126,11 +130,10 @@ Go content controls belong in `ReaderOptions.Manifest`:
 options := zstar.ReaderOptions{
     Manifest: zstar.ManifestReaderOptions{ConcurrentChunks: 4, MaxReadBytes: 8 << 20},
 }
-streamOptions := zstar.StreamOptions{DisableCache: true}
 ```
 
 `OpenStream` is the ordinary sequential interface; `OpenFile` is for
-random access. Use `Verify` with `VerifyArchive` or `VerifyExternalClosure`.
+random access.
 
 Python distinguishes synchronous `ReaderOptions` from `AsyncReaderOptions`;
 synchronous readers reject coroutine-based sources/resolvers before scheduling
@@ -200,25 +203,27 @@ normal credential-provider behavior.
 | Per-source frame/window and entry/extent/pointer limits | Disabled | Disables that additional limit |
 | Content concurrency | 8 | Go selects default; Rust/Python require a positive value |
 | Returned allocating read | 64 MiB | Rust/Python allow zero bytes; Go selects default |
-| Retained entry index | 1 GiB | Rust/Python allow zero bytes; Go selects default |
 | Entry count cap | No additional cap | No additional cap |
 | Metadata encoded/decoded budgets | 4 GiB each | Rust/Python allow zero bytes; Go selects default |
 | Metadata in-memory spool threshold | 8 MiB | Rust/Python spill immediately; Go selects default |
 | Spool quota | 4 GiB | An explicit zero-byte quota disallows retention; Go nil selects default |
-| Member decoded-source cache | 2 MiB | Rust/Python disable; Go selects default |
+| Member decoded-source cache | 2 MiB, private | Not configurable |
 | Compression workers | Serial | Serial |
 
-Go `StreamOptions.DisableCache` explicitly disables caching. Rust/Python member
-cache sizes include bookkeeping, so a source equal to the nominal budget may
-not fit. A spill quota does not bound the retained index, source buffers, or
-codec workspace. Custom spill factories do not guarantee bounded total memory.
+Decoded caches belong to retained member handles and are released on drop or
+close. Separate handles have independent completed caches; ordinary archive reads
+share active loads without retaining completed frames. Member cache sizes include
+bookkeeping, so a source equal to the nominal budget may not fit. Raw-byte caching and prefetching belong to caller-supplied sources
+and backends; archives do not retain encoded ranges across operations. A spill
+quota does not bound the directory and cached pages, source buffers, or codec
+workspace. Custom spill factories do not guarantee bounded total memory.
 
 A useful content profile is four concurrent chunks, 64 MiB encoded/decoded/window
 limits per source, and an 8 MiB allocating-read limit. Configure metadata/index
 and spool budgets separately for the expected entry count. This is a local
 resource policy and may reject otherwise conformant archives.
 
-Peak memory includes the retained index, metadata buffers, up to the configured
+Peak memory includes the directory and cached pages, metadata buffers, up to the configured
 number of encoded/decoded sources and codec workspaces, all member caches, and
 all caller-retained results. There is no single aggregate process-memory cap;
 multiple open readers multiply their reader-local budgets. Limit reader count,

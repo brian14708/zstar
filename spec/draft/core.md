@@ -1,6 +1,6 @@
 # Zstar core draft
 
-**Status:** working draft.
+**Status:** working draft, wire version 1.
 
 This specification defines Zstar's self-contained indexed archive format: a tar
 stream in independent Zstandard frames, with deterministic CBOR metadata.
@@ -24,22 +24,23 @@ Implementations declare which conformance classes they support:
 | Class | Minimum behavior |
 | --- | --- |
 | Portable writer | Emit a conformant archive with only archive-backed file extents. |
-| Metadata reader / full metadata validator | Authenticate all decoded metadata, validate the complete deterministic CBOR sequence, schema, namespace and required features. |
-| Selective reader | Perform metadata-reader checks and validate each selected complete source and extent before returning its requested bytes. |
-| Full archive validator | Perform full metadata validation and validate every physical frame, tar member, payload mapping and end record, plus declared extension checks. |
+| Directory reader | Validate the footer and complete manifest directory, including required features and all declared page ranges. |
+| Metadata reader / full metadata validator | Perform directory-reader checks and validate every metadata page, the complete namespace, global ordering, and required-feature agreement. |
+| Selective reader | Perform directory-reader checks, validate selected entry pages and ancestor entries, and validate each selected complete source and extent before returning requested bytes. |
 | Filesystem capturer/restorer | Follow the normative [filesystem profile](#filesystem-capture-and-restoration-profile), in addition to the applicable writer/reader classes. |
 
 Core-only implementations MAY reject extension features. Implementations that
 accept a required feature MUST apply its specification in addition to core.
-Unknown required features MUST be rejected before interpreting affected
-entries.
+Unknown required features MUST be rejected while validating the directory,
+before any indexed entry use.
 
 An operation establishes only the checks it completes. Metadata validation and
-selective reads do not establish full archive validity. Full archive validation
-does not establish content authenticity or availability of extension
-dependencies. Implementations MUST NOT claim checks they did not complete.
+selective reads do not establish full archive validity, content authenticity,
+or availability of extension dependencies. Implementations MUST NOT claim checks
+they did not complete.
 Rejection requirements apply to the structures and dependencies being
-validated; selective readers need not inspect unrelated tar regions.
+validated; selective readers need not inspect unrelated entry pages, optional
+extension pages, or tar regions.
 
 ## Conventions
 
@@ -53,11 +54,12 @@ Integers are unsigned 64-bit unless otherwise specified; `mtime_ns` is signed
 arithmetic, rounding, and cumulative sums MUST be checked for overflow before
 allocation, addressing, or slicing.
 
-Byte positions use three coordinates:
+Byte positions use four coordinates:
 
 | Coordinate | Origin and use |
 | --- | --- |
-| Encoded archive position | Byte zero of the archive; footer manifest offsets and integer extent sources use this coordinate. |
+| Encoded archive position | Byte zero of the archive; derived manifest offsets and integer extent sources use this coordinate. |
+| Metadata-relative position | Metadata start `T`; entry-page and extension-page offsets use this coordinate. |
 | Decoded tar position | Byte zero of the concatenated data-frame output; member headers, payloads and physical coverage use this coordinate. |
 | Decoded source selection | Byte zero of one complete decoded frame or object; an extent's optional `offset` uses this coordinate. |
 
@@ -73,8 +75,10 @@ The result MUST fit the address space and format limits.
 
 ```text
 [independent Zstandard data frames encoding one tar stream]
-[metadata skippable frames containing segments of a compressed CBOR sequence]
-[80-byte terminal skippable-frame footer]
+[entry-page skippable wrappers in increasing path order]
+[optional extension-page skippable wrappers]
+[manifest-directory skippable wrapper]
+[44-byte terminal skippable-frame footer]
 ```
 
 Data frames occupy every byte before the metadata region. The metadata region
@@ -83,7 +87,7 @@ frames or gaps are permitted.
 
 #### Zstandard frame requirements
 
-Each data frame or compressed metadata segment contains exactly one
+Each data frame or metadata wrapper payload contains exactly one
 independently decodable Zstandard frame. Skippable frames, concatenated frames,
 trailing bytes, and external dictionaries are forbidden within a source range.
 Dictionary IDs MUST be absent or zero.
@@ -98,9 +102,10 @@ and host address-space limitations are implementation limitations, not wire
 maxima. Metadata payload lengths must additionally fit their uint32 wrapper
 field.
 
-Data frames require checksums. Metadata checksums and all content-size fields
-are optional; when present they MUST be valid. A declared content size MUST
-equal the actual decoded length. Every frame MUST use standard magic
+Data and metadata frames MUST include valid Zstandard content checksums. There
+is no separate metadata, page, or directory checksum field. All content-size
+fields are optional; when present they MUST be valid. A declared content size
+MUST equal the actual decoded length. Every frame MUST use standard magic
 `0xFD2FB528` and RFC 8878 reserved-bit, block, and frame encodings. The
 Frame_Header_Descriptor reserved bit (bit 3) MUST be zero. Readers MUST ignore
 its unused bit (bit 4), as RFC 8878 specifies.
@@ -115,53 +120,65 @@ encoding those 1024 zero bytes.
 
 #### Footer
 
-The footer is exactly 80 bytes. Integer fields are unsigned little-endian;
-offsets are absolute encoded archive positions.
+The footer is exactly 44 bytes and ends at EOF. Integer fields are unsigned
+little-endian. Its terminal signature identifies this core wire layout.
 
 | Offset | Bytes | Value |
 | --- | --- | --- |
 | 0 | 4 | Skippable magic `0x184D2A5F` |
-| 4 | 4 | Payload length: 72 |
-| 8 | 8 | ASCII `ZSTAR001` |
-| 16 | 4 | Profile version: 1 |
-| 20 | 4 | Reserved: zero |
-| 24 | 8 | Start of the manifest region |
-| 32 | 8 | Total encoded manifest region length, including every wrapper |
-| 40 | 8 | Sum of decoded CBOR segment lengths |
-| 48 | 32 | SHA-256 of concatenated decoded CBOR segment bytes, in physical order |
+| 4 | 4 | Payload length: 36 |
+| 8 | 8 | Total encoded metadata region length, including every wrapper |
+| 16 | 8 | Sum of actual decoded payload lengths of all metadata wrappers |
+| 24 | 8 | Encoded directory length, including its wrapper |
+| 32 | 8 | Decoded directory length |
+| 40 | 4 | ASCII `Z*01` (literal bytes `5A 2A 30 31`) |
 
-For archive length `N`, manifest offset `T`, and region length `L`, require `N
->= 80`, `T > 0`, `L > 8`, and `T + L = N - 80`, using checked arithmetic.
-Reject incorrect magic, reserved values, versions, or digests, and any
-inconsistent fields or bounds.
+For archive length `N`, total encoded metadata length `L`, and encoded directory
+length `R`, derive metadata start `T = N - 44 - L` and directory start
+`Q = N - 44 - R` using checked subtraction. Require `N >= 44`, `T > 0`,
+`L >= R > 8`, and nonzero declared directory and total decoded lengths. The
+directory immediately precedes the footer. Reject incorrect magic, payload
+length, signature, inconsistent lengths, or bounds. Trailing bytes and
+concatenated archives are invalid. Readers MUST reject unsupported terminal
+signatures.
 
 #### Metadata region
 
-Metadata wrappers exactly cover the manifest region. Each wrapper has an 8-byte
-header followed immediately by one Zstandard payload. Its header fields are
-little-endian uint32: magic `0x184D2A5E` and the encoded payload length.
+Metadata wrappers exactly cover `[T, N - 44)`. Each wrapper has an 8-byte header
+followed immediately by one Zstandard payload. Header fields are little-endian
+uint32: magic `0x184D2A5E` and encoded payload length. Zero-length payloads are
+invalid. Encoded page and directory lengths include these 8 bytes and MUST equal
+`8 + payload_length` when the wrapper is read.
 
-Apply local aggregate and per-frame budgets before fetching. Each segment must
-fit its uint32 wrapper length. Decode and hash all segments in physical order,
-checking the aggregate decoded length and SHA-256 against the footer before
-using the manifest. The decoded sequence follows the [manifest
-rules](#entry-oriented-manifest).
+Every wrapper decodes to exactly one complete deterministic CBOR value; no
+value or entry crosses a wrapper boundary. Entry pages occupy the region first,
+in increasing path order, followed by extension pages, then the directory.
+The [paged manifest](#paged-manifest) specifies each payload and its references.
+The directory lists every page exactly once. No unlisted wrappers, gaps,
+overlap, or references into the content region, directory, or footer are allowed.
+
+Apply local encoded, decoded, item, and codec budgets before fetching or
+allocating. Every fetched page used by an operation MUST be completely decoded
+and validated, including its Zstandard frame checksum. A selective reader MAY
+leave unselected pages unread. Declared decoded lengths permit budget and aggregate
+consistency checks; only decoding establishes each page's actual length.
 
 #### Recognition and media type
 
-Readers MUST validate the terminal footer and manifest before recognizing a
-file as Zstar. A filename extension or media type is insufficient. V1 uses
-`application/zstd`; generic `application/octet-stream` is acceptable. No Zstar
-media type is registered. Ordinary Zstandard/tar tools can decode the tar
-stream but do not interpret the index. Thin-content resolution follows the
-[external-content extension](external-content.md).
+Readers MUST validate the terminal footer and complete directory before
+recognizing a file as this Zstar profile. Recognition does not establish
+complete metadata or physical archive validity. A filename extension or media
+type is insufficient. Use `application/zstd`; generic
+`application/octet-stream` is acceptable. No Zstar media type is registered.
+Ordinary Zstandard/tar tools decode the tar stream and skip metadata wrappers.
+Thin-content resolution follows the [external-content extension](external-content.md).
 
 ### Tar profile
 
 Use POSIX ustar with at most one nonempty local PAX header (`x`) immediately
 before a member. Supported member types are regular file (`0` or NUL),
-directory (`5`), and symlink (`2`). V1 excludes global PAX headers, hard links,
-sparse files, devices, FIFOs, xattrs, and all other types. Writers MUST reject
+directory (`5`), and symlink (`2`). This profile excludes global PAX headers,
+hard links, sparse files, devices, FIFOs, xattrs, and all other types. Writers MUST reject
 unsupported input or explicitly convert it at the caller's request; readers
 MUST reject unsupported encodings.
 
@@ -237,75 +254,149 @@ Archive-path component restrictions do not apply to symlink targets.
 Lookup returns the entry at the exact archive path without following symlinks.
 A read-link operation returns that entry's stored symlink target (`linkname`);
 it MUST reject entries of other kinds. File reads MUST reject directory and
-symlink entries. Automatic symlink resolution is outside v1.
+symlink entries. Automatic symlink resolution is outside this profile.
 
-### Entry-oriented manifest
+### Paged manifest
 
-The [manifest schema](#manifest-schema) defines sequence, entry, and extent
-structures. This section defines encoding and cross-field rules.
+The manifest consists of entry pages, optional extension pages, and one flat
+directory. The [manifest schema](#manifest-schema) defines their CBOR structures.
+Pages are independently usable decoding/cache units. There is no recursive
+index, enclosing CBOR sequence, or global content-frame or object table.
 
-The metadata region encodes a deterministic CBOR sequence (RFC 8742). Every
-item uses RFC 8949 core deterministic encoding. Emit exactly one header map,
-followed by zero or more entry tuples:
+#### Directory and page references
+
+The directory is a deterministic CBOR map with required fields `version`,
+`requires`, and `pages`. Version is exactly 1. `pages` is an array of entry-page
+descriptors in increasing path and physical-offset order:
 
 ```text
-{"version": 1, "requires": [...], "x-...": ...}
-entry
-entry
-...
+[last_path, offset, encoded_length, decoded_length, ?attributes]
 ```
 
-An empty manifest contains only the header. Entries MUST be strictly sorted by
-UTF-8 path bytes across the entire sequence; physical tar order may differ. The
-sequence has no enclosing array, entry count, end marker, pages, page
-references, or global frame or object tables. Readers derive the entry count
-and may build a lookup index while parsing, but MUST NOT use it until the
-complete sequence is authenticated and validated.
+`offset` is relative to metadata start `T`. `encoded_length` includes the
+wrapper and is greater than 8; `decoded_length` is positive. `last_path` is a
+valid archive path and the exact largest path in that page. Separators MUST be
+strictly increasing in UTF-8 byte order. The optional nonempty `attributes` map
+contains only `x-` extension fields; omit it when empty. A descriptor has exactly
+four elements, or five when attributes are present; unknown trailing elements
+are forbidden.
 
-Each [metadata wrapper](#metadata-region) contains a frame that decodes to a
-nonempty sequence segment. Segment boundaries MAY split any item, including its
-CBOR header. Readers MUST parse incrementally across segments and reject
-malformed or truncated items, a missing or repeated header, enclosing arrays,
-scalars in place of entries, and trailing items or bytes that do not form valid
-entry tuples.
+The directory MAY also contain `extension-pages`, a nonempty map from extension
+names beginning with `x-` to nonempty arrays of page references. An extension
+page reference has no path separator:
 
-The footer's decoded length and SHA-256 cover all decoded segments concatenated
-in physical order; there are no per-segment hashes. Readers MUST authenticate
-and validate the entire sequence before indexed reads. Aggregate metadata and
-parser limits are local policy. The wrapper length does not bound the decoded
-sequence or individual items.
+```text
+[offset, encoded_length, decoded_length, ?attributes]
+```
 
-The CDDL `manifest` group describes consecutive sequence items. Schema tools
-that require one value may validate a temporary `[manifest]` array; this array
-is never encoded on the wire.
+Its length, offset, and optional attribute rules are the same as for entry-page
+descriptors. Extension pages follow all entry pages. Their physical order MUST
+match the deterministic encoded-key order of extension groups, then array order
+within each group. Omit an empty `extension-pages` map. Other directory fields
+MUST begin with `x-`. Archive-wide metadata belongs in these directory fields;
+page-local metadata belongs in the page or reference attributes.
 
-Use preferred integer and length widths, definite lengths, and text-keyed maps
-whose keys are sorted by deterministic encoded key bytes. Reject duplicate
-keys, trailing item bytes, tags, floats, null, indefinite lengths, and
+Starting at relative offset zero, walk entry-page descriptors, then extension
+page references in the order above. Each offset MUST equal the preceding
+encoded end, and the final end MUST equal `Q - T`. This rule validates declared
+coverage without visiting pages and rejects gaps, aliases, and overlap. The
+checked sum of every declared page decoded length plus the footer's decoded
+directory length MUST equal the footer's total decoded length. The actual
+decoded directory length MUST equal its footer field. Empty archives use an
+empty `pages` array; optional extension pages MAY still be present. Without
+extension pages, an empty manifest contains only the directory.
+
+The `requires` array is bytewise sorted and unique. The [lexical
+grammar](#lexical-grammar) defines its feature names: 1..128 ASCII bytes,
+starting with a lowercase letter, followed by lowercase letters, digits, or
+`.` or `-` paired with a following letter or digit. Leading, trailing, and
+adjacent separators are forbidden. Unknown required features MUST be rejected
+before indexed entry use. Each extension specifies declaration agreement and
+validation at the scopes below.
+
+#### Entry pages and lookup
+
+Each entry page is a deterministic CBOR map:
+
+```text
+{"entries": [entry, ...], "x-...": ...}
+```
+
+`entries` is required and nonempty. Other fields MUST begin with `x-`. This map
+provides an extension point without CBOR tags, page-type codes, or positional
+fields appended to the page. Its role is determined by its directory reference.
+Unknown optional page fields MAY be ignored after validating their CBOR values.
+
+Entries MUST be strictly sorted by UTF-8 path bytes within and across pages;
+physical tar order may differ. When page `i` is decoded, its final path MUST
+equal descriptor `i`'s `last_path`. Every path in it MUST exceed descriptor
+`i-1`'s `last_path`, if any. The decoded length and wrapper length MUST match the
+reference. Readers MUST validate the complete page, including every entry's
+local schema and extension declaration agreement, before using any of its
+entries. Cross-page ancestor checks are required for entries actually selected;
+complete namespace validation is a separate scope.
+
+For an exact path, binary-search the directory for the first `last_path` at
+least equal to it. If there is none, the path is absent from that indexed view;
+otherwise decode and search that page. A selected entry's proper ancestors
+MUST be looked up and verified as explicit directories before the entry or
+its bytes are returned. Page fetches SHOULD be batched and deduplicated.
+Lookup does not follow symlinks. Iteration advances through descriptors in
+order, and MAY yield validated entries before a later page fails.
+
+Entry count is derived by scanning entry pages; it is not a stored directory
+or page-reference field. Page boundaries have no namespace semantics. In
+particular, `a!` may sort between directory `a` and descendant `a/b`; checking
+only the preceding entry is insufficient to validate ancestors.
+
+Writers SHOULD target 64 KiB decoded entry pages, cutting only between complete
+entries and including map/container overhead. This is a recommended target, not
+a wire maximum. An oversized entry MAY occupy a page alone, subject to local
+resource limits and the wrapper payload ceiling. The full selected entry,
+including its extent list, MUST be validated before using any extent.
+
+#### Extension pages
+
+An extension page decodes to one `extension-value` under the CBOR rules below.
+Its group's published specification defines its payload schema and the relation
+between its `x-` group name and any required-feature declaration. A standard
+logical extension-page identifier is `[group_name, page_index]`, where the index
+is zero-based within that group's directory array. Extensions SHOULD use these
+identifiers instead of embedding physical offsets in opaque fields; their
+consumers MUST check group existence and index bounds before following them.
+
+Optional extension pages MUST be safely ignorable without changing core entry
+lookup, namespace, logical bytes, or required validation. Any extension page,
+page field, or reference attribute needed to interpret an entry correctly MUST
+be governed by a declared required feature. Unknown optional groups remain
+listed in directory coverage and declared-length checks; selective readers
+need not fetch them. Complete metadata validation MUST decode every extension
+page, check its Zstandard frame checksum, and validate its base CBOR value, even for an
+unknown optional group, but does not establish unknown extension semantics.
+
+An extension that introduces references or dependency chains MUST specify
+validation, cycle handling, and budgets. Only pages actually needed by a selected
+operation need be fetched in selective mode. Extensions MUST NOT redefine the
+core reference coordinates, framing, checksums, or entry-page routing fields.
+Such changes require a new core version. Extension pages are metadata and MUST
+NOT be used as core archive-extent content sources.
+
+#### Deterministic CBOR
+
+Each directory and page uses RFC 8949 core deterministic encoding. Use preferred
+integer and length widths, definite lengths, and text-keyed maps whose keys are
+sorted by deterministic encoded key bytes. Reject duplicate keys, trailing
+bytes after the one payload value, tags, floats, null, indefinite lengths, and
 unsupported simple values. Negative integers fit int64; nonnegative integers
 fit uint64. Omit optional fields whose values equal their defaults. These
-restrictions apply recursively to extension values.
+restrictions apply recursively to extension values, including unknown optional
+extensions. No self-describing or custom CBOR tag is required or permitted.
 
 Implementations MUST use bounded or iterative traversal to prevent stack
-exhaustion. A local nesting budget of 64 is a suitable default. Each sequence
-item starts at depth zero; each array element, map key, or map value increases
+exhaustion. A local nesting budget of 64 is a suitable default. Each payload
+value starts at depth zero; each array element, map key, or map value increases
 depth by one. Exceeding a configured nesting or item budget is a local resource
-rejection. The schema and metadata wrapper length requirements still apply.
-
-#### Header fields and namespace
-
-The header requires `version` and `requires`. Version is 1. Only `x-`
-extension fields may be added. Entry count is derived from the subsequent
-tuples; `entries`, `entry_count`, `index`, and root wrappers are forbidden. See
-[Extensions and versions](#extensions-and-versions) for extension rules.
-
-The [lexical grammar](#lexical-grammar) defines `required-feature`. A name is
-1..128 ASCII bytes. It starts with a lowercase letter, followed by lowercase
-letters, digits, or `.` or `-` paired with a following letter or digit.
-Leading, trailing, and adjacent separators are forbidden. The array is bytewise
-sorted and unique. Unknown required features are rejected. Each supported
-extension defines agreement between its feature declaration and entry
-semantics.
+rejection. Schema and wrapper-length requirements still apply.
 
 #### Entries
 
@@ -389,9 +480,8 @@ gaps or trailing physical bytes.
 For an inline extent selecting frame `i`, its decoded interval is `[D_i +
 offset, D_i + offset + size)`. In logical order, those intervals MUST cover
 exactly that member's physical payload, without reordering, overlap, gaps, or
-another member's bytes. Full archive validation establishes this mapping.
-Selective reads check metadata and fetched-source bounds without establishing
-physical membership.
+another member's bytes. Selective reads check metadata and fetched-source bounds
+without establishing physical membership.
 
 Aggregate logical content is the sum of each regular file's logical size,
 including any content reused through extensions. It is not a stored field.
@@ -399,56 +489,96 @@ Implementations using bounded integers MUST detect and report counter overflow.
 
 ### Extensions and versions
 
-Footer profile and manifest versions are both exactly 1. Reject other versions.
-Extensions define their own version markers.
+The footer signature is `Z*01` and the directory version is exactly 1. Reject
+other core versions. Extensions define their own version markers; independent
+formats such as standalone external references need not share the core number.
 
-Core maps accept extension fields only in the manifest header and entry
-attributes, where the CDDL permits them. Required features may extend other
-structures as explicitly defined by their specifications; the core schema below
-covers archives without those extensions. Extension field names are valid CBOR
-text beginning with `x-`, with no suffix restriction. Values obey the CBOR
-rules above. Maps within extension values use text keys under their published
-schema; those keys need not start with `x-`. Readers MAY ignore optional
-extensions; semantics required for correct interpretation MUST be declared in
-`requires`. Unknown unprefixed fields and unknown required feature
-names are rejected. Writer extension-preservation requirements are in the
-[writer API contract](#writer-api-contract-normative-profile). Extension and
-required-feature names SHOULD use collision-resistant namespaces. Incompatible
-core semantics require a new version/profile.
+Core extension points are directory fields, entry-page fields, page-reference
+attributes, entry attributes, and named extension-page groups. Extension field
+and group names are valid CBOR text beginning with `x-`, with no suffix
+restriction. Values obey the CBOR rules above. Maps within extension values use
+text keys under their published schema; those keys need not start with `x-`.
+Unknown unprefixed fields, unknown trailing tuple elements, and unknown required
+features MUST be rejected.
+
+Readers MAY ignore optional extensions after the base checks applicable to the
+operation. Optional extensions MUST NOT change core interpretation, lookup,
+content, or safety checks. Required features may extend entry or extent schemas
+as explicitly defined by their specifications; the base CDDL covers archives
+without those schema extensions. Required extensions MUST keep core directory
+coverage and entry routing unambiguous, and MUST define agreement checks at
+selective and complete scopes. Merely storing data in an `x-` field or extension
+page does not declare required semantics.
+
+For example, an optional search index may use an `x-search` page group as an
+accelerator while ordinary entry lookup remains correct without it. A future
+paged-extent representation that changes how file bytes are located must declare
+its required feature and define how entry attributes reference the extent pages.
+Neither requires changing the footer or appending positional descriptor fields.
+
+Extension and feature names SHOULD use collision-resistant namespaces. Writer
+preservation requirements are in the [writer API contract](#writer-api-contract-normative-profile).
+Incompatible core framing or directory semantics require a new core version.
 
 ## Validation and failures
 
 ### Validation and selective reads
 
-Metadata readers MUST validate footer structure and bounds, the complete
-manifest decoded length and hash, deterministic CBOR, sequence schema, the
-complete namespace, global ordering, and required-feature agreement before
-using indexed ranges. Selective readers MUST also validate selected source
-frames and extent bounds. Implementations MUST reject unsupported versions,
-unknown required semantics, malformed data, overflows, and digest mismatches. A
-failed Zstar check MUST NOT silently fall back to unverified tar extraction.
-Source snapshots, cache provenance, and ownership follow the [reader
-profile](#reader-implementation-profile).
+Directory readers MUST validate footer bounds, the directory
+frame's Zstandard checksum,
+actual directory decoded length, deterministic CBOR and schema, all required
+features, sorted page separators, and declared coverage and aggregate lengths
+before indexed use. This does not establish the contents of unread pages.
 
-A failed required check stops the operation.
+Selective readers MUST additionally validate every selected entry page, each
+selected entry's explicit directory ancestors, and any required extension-page
+dependencies. Before returning requested content, they MUST validate selected
+complete sources and extent bounds. Local page checks include schema and
+feature agreement for all entries in a fetched page; complete cross-page
+namespace checks apply only at the complete metadata scope.
 
-| Check | Metadata | Selective read | Full archive |
+Complete metadata validation MUST scan all referenced pages in physical order,
+check every Zstandard frame checksum and actual length, validate every entry's
+schema, global
+ordering and namespace, and complete required-feature agreement. It MUST also
+apply supported optional-extension checks and all declared required-extension
+checks. Unknown optional extension pages receive base CBOR validation only.
+The directory's exact contiguous coverage makes this a linear page scan;
+no recursive node traversal or visited-page set is required.
+
+Reject unsupported versions, unknown required semantics, malformed data,
+overflows, and digest mismatches within the operation's scope. A failed required
+check stops the operation. A failed Zstar check MUST NOT silently fall back to
+unverified tar extraction. Snapshot, provenance, and ownership rules follow the
+[reader profile](#reader-implementation-profile).
+
+| Check | Directory/open | Selective read | Complete metadata |
 | --- | --- | --- | --- |
-| Footer and complete manifest | All | All | All |
-| Physical data frames | None | Intersecting sources | All |
-| Tar headers, payload mapping, padding and end records | None | Not established | All |
+| Footer and complete directory | All | All | All |
+| Entry-page Zstandard checksum, length, local schema and intervals | None | Selected pages | All |
+| Namespace and feature agreement | Directory declarations | Selected entries/ancestors and required dependencies | Global |
+| Extension pages | Declared references | Required dependencies | All, with semantics as above |
+| Physical data frames | None | Intersecting sources | None |
+| Tar headers, payload mapping, padding and end records | None | Not established | Not established |
 
-Extensions add their own checks at these scopes. External source validation,
-pointer agreement, and closure validation are defined by the [external-content
-extension](external-content.md#validation-and-conformance).
+A negative lookup describes the validated routing view of this snapshot. It is
+not proof that unread pages contain no misplaced entry. A bad separator can
+hide malformed metadata until the affected page or all metadata is validated.
+Callers requiring complete conformance before any result MUST complete metadata
+validation first; a selective reader MUST NOT claim that guarantee at open.
 
-#### File reads and verification scopes
+External source validation and pointer agreement are defined
+by the [external-content extension](external-content.md#validation-and-conformance).
+
+#### File reads
 
 For a file request `(offset, length)`, compute logical size by checked extent
 summation. Both request values must fit uint64, with `offset <= logical_size`
 and `length <= logical_size - offset`. Reject out-of-range requests rather than
 truncating them. A valid zero-length request fetches no content, including at
-EOF, but still requires footer and complete-manifest hash validation.
+EOF, but still requires directory validation, the selected entry page, ancestor
+checks, and any extension metadata needed to establish the request's validity.
+It does not require validating unrelated metadata pages.
 
 Use cumulative extent sizes to locate only sources intersecting the request.
 Decode each complete fetched source under its source-kind rules. Check each
@@ -456,22 +586,13 @@ complete declared selection against the actual decoded length, then return the
 requested bytes in logical order. A complete-file read does not establish a
 whole-file hash.
 
-#### Full archive validation
+#### Required read checks
 
-Full archive validation MUST scan every physical data frame and tar member,
-validate checksums, effective metadata, payload mapping, declared extension
-payload rules, zero padding, physical coverage, and exactly two final zero
-records. Every manifest entry MUST correspond to exactly one physical tar
-member, and every physical tar member MUST correspond to exactly one manifest
-entry. Reject missing, unindexed, or duplicate members, including directories,
-symlinks, and empty files. A local PAX header belongs to its following member
-and is not a separate manifest entry.
-
-#### Verification claims
-
-Footer and manifest digest checks and codec checks cannot be disabled.
-Extensions define verification of their external dependencies. Digests establish
-internal consistency, not authenticity. The core archive stores no digest of its
+Directory validation, required selected-page validation, and Zstandard frame
+checksum checks cannot be disabled. Complete metadata validation is an explicit
+scope and MUST NOT be inferred from directory validation or selected reads. Extensions
+define verification of their external dependencies. Checksums detect corruption,
+not authenticity. Core stores no cryptographic digest of its metadata or
 complete encoded bytes.
 
 ### Failure classes
@@ -484,8 +605,9 @@ names. Violating a wire limit makes input malformed; exceeding a lower local
 budget may reject valid input. A hash or checksum mismatch is an integrity
 failure when distinguishable from a codec structure error.
 
-Recognition, metadata authentication, and required-feature checks precede
-indexed use. Complete source validation precedes returning selected bytes. For
+Recognition, directory validation, and required-feature checks precede
+indexed use. Selected-page and ancestor checks precede returning selected
+entries. Complete source validation precedes returning selected bytes. For
 independent defects, an operation may report any applicable failure unless a
 dependency requires another check first.
 
@@ -495,8 +617,12 @@ Profiles apply to the declared conformance classes.
 
 ### Writer API contract (normative profile)
 
-Writers MUST preserve rewritten entry/header extensions or report their loss,
-and reject unknown required semantics. They MUST preserve supplied metadata and
+Writers MUST preserve rewritten directory, page, reference, and entry extensions
+or report their loss, and reject unknown required semantics. Preserving extension
+pages includes their payloads, group/index identities, and published references;
+physical page offsets MUST be recomputed after rewriting. A writer unable to
+preserve an optional extension's semantics MUST report its loss rather than
+silently claim preservation. Writers MUST preserve supplied metadata and
 write tar members in insertion order. Writers MAY require input entries in
 strict UTF-8 path order; such APIs MUST document and enforce this requirement.
 Arbitrary-order APIs MUST sort manifest entries before emission. All writers
@@ -507,6 +633,13 @@ before consuming the payload, using the configured frame size. Writers SHOULD
 stream payloads through bounded frame buffers and spill finalized records when
 retention is needed. A sorted-input API may validate the namespace
 incrementally without sorting.
+
+Writers SHOULD spool entry-page descriptors while emitting sorted pages, then
+stream the directory from those descriptors. They MUST know definite CBOR
+container lengths before encoding them and MAY use bounded temporary storage
+to determine compressed wrapper lengths. Extension pages MUST precede the
+directory in their prescribed order. Writers need not seek or rewrite emitted
+content; implementations MUST budget descriptor/page spools as well as data.
 
 Explicit storage choices MUST be honored or reported as conflicts; portable
 members cannot be silently externalized. Optimization hints may be declined
@@ -540,13 +673,42 @@ the primary error and report cleanup failures separately. Noninterruptible work
 MUST retain capacity until completion, even after cancellation. Coalesced
 misses MUST preserve cancellation, limits, and verification provenance.
 
-#### Manifest parsing and index budgets
+#### Metadata parsing, caching, and budgets
 
-Nesting, item, aggregate metadata, and index budgets are local policy; readers
-MAY impose lower limits but MUST distinguish budget rejection from malformed
-input. Parsing MUST retain at most one item and bounded read-ahead beyond the
-parsed index, applying aggregate decoded-byte budgets before parsing. Spooling
-does not bound index, parsing-scratch, or codec memory.
+Directory, descriptor-count, page, entry, extent, nesting, item, codec-window,
+retained-memory, and in-flight budgets are local policy. Readers MAY impose
+lower limits but MUST distinguish budget rejection from malformed input.
+Readers MUST enforce encoded and decoded limits before exceeding allocation,
+fetch, or decode budgets; a declared decoded size is not permission to allocate
+it without limits. Retained directory/index memory, typed pages, parser scratch,
+codec workspace, and speculative encoded buffers require explicit accounting.
+Spooling does not bound other owners' memory.
+
+A reader MAY retain the complete directory and a bounded page cache, without
+retaining every entry or a global extent index. Cache provenance MUST bind the
+source snapshot, exact page reference, and completed validation checks. A page
+validated under one separator interval MUST NOT be reused under an inconsistent
+reference without checking that interval. Eviction MUST NOT invalidate returned
+entries or file handles. Iteration MUST surface later-page failures and MUST
+NOT silently report complete success after a truncated scan.
+
+#### Remote range planning
+
+Page boundaries are decoding/cache units, not required network-request
+boundaries. Remote readers SHOULD use a bounded suffix prefetch for the footer
+and directory, reuse covered byte ranges, batch page and ancestor lookups,
+coalesce nearby ranges, and use bounded contiguous read-ahead for scans.
+All entry-page locations are known after directory validation; no recursive
+index requests are needed. For small metadata regions, a reader MAY fetch the
+whole encoded region within its budgets without decoding every page eagerly.
+
+A 128 KiB initial suffix and 256 KiB–1 MiB sequential windows are reasonable
+starting policies to measure, not wire requirements or coverage guarantees.
+Sparse requests SHOULD avoid excessive speculative transfer. S3 GetObject
+supports one byte range per request; distant ranges require separate requests,
+which MAY run with bounded concurrency. All requests MUST follow the snapshot
+contract. Speculative bytes MUST NOT be treated as validated pages before the
+complete required checks, and their storage and cancellation MUST be budgeted.
 
 ### Filesystem capture and restoration profile
 
@@ -607,14 +769,19 @@ malformed archive data.
 
 Bound decompression, traversal, allocation, storage, and parallel work before
 consuming untrusted input. A one-byte selection may require a whole source.
-Selective validation leaves unread tar data unchecked; only full validation
-establishes original frame boundaries and physical membership.
+Selective validation leaves unread metadata pages and tar data unchecked.
+Directory validation establishes declared routing and coverage, not actual page
+contents or global namespace validity. Only complete metadata validation
+establishes the complete namespace. Selective reads do not establish original
+data-frame boundaries or physical membership.
 
-Metadata hashes and data checksums establish consistency, not publisher
-authenticity: replacing both can produce another valid archive. Inline bytes have
-codec checksums, not a cryptographic manifest binding. The external-content
-extension defines content-address verification for external objects. Core archive
-digests do not cover the complete encoded archive.
+Zstandard frame checksums detect corruption, not publisher authenticity. They
+do not cryptographically bind the directory to referenced pages or prevent
+replacement of intact frames. Length and schema checks do not replace an
+aggregate integrity check. Inline bytes have codec
+checksums, not a cryptographic manifest binding. The external-content
+extension defines content-address verification for external objects. Core
+archives contain no cryptographic digest of the complete encoded archive.
 
 Archive replacement MUST follow the snapshot contract. Follow the [filesystem
 profile](#filesystem-capture-and-restoration-profile) against traversal,
@@ -628,13 +795,31 @@ This CDDL defines the CBOR structures. The preceding sections define
 deterministic encoding, namespace rules, and cross-field invariants.
 
 ```cddl
-; A CBOR sequence group: emit these items consecutively, without an array.
-manifest = (manifest-header, * entry)
-manifest-header = {
+; Each directory/page is one independent CBOR value, not a CBOR sequence.
+manifest-directory = {
   "version": 1,
   "requires": [* required-feature],
+  "pages": [* entry-page-descriptor],
+  ? "extension-pages": { + extension-key => [+ extension-page-reference] },
   * extension-key => extension-value
 }
+entry-page-descriptor = [
+  last-path: archive-path,
+  offset: uint, encoded-length: 9..18446744073709551615,
+  decoded-length: 1..18446744073709551615,
+  ? attributes: extension-attributes
+]
+extension-page-reference = [
+  offset: uint, encoded-length: 9..18446744073709551615,
+  decoded-length: 1..18446744073709551615,
+  ? attributes: extension-attributes
+]
+entry-page = {
+  "entries": [+ entry],
+  * extension-key => extension-value
+}
+extension-page = extension-value
+extension-page-id = [group-name: extension-key, page-index: uint]
 
 entry = file-entry / directory-entry / symlink-entry
 entry-fields = (
@@ -698,7 +883,6 @@ pax-mtime = [%s"-"] 1*DIGIT [%s"." 1*DIGIT]
 - [POSIX.1-2024 (Issue 8) tar/PAX](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/pax.html)
 - [RFC 8878: Zstandard](https://www.rfc-editor.org/rfc/rfc8878)
 - [RFC 8949: CBOR](https://www.rfc-editor.org/rfc/rfc8949)
-- [RFC 8742: CBOR sequences](https://www.rfc-editor.org/rfc/rfc8742)
 - [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174): requirement language
 - [RFC 3629: UTF-8](https://www.rfc-editor.org/rfc/rfc3629)
 - [RFC 5234: ABNF](https://www.rfc-editor.org/rfc/rfc5234)

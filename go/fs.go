@@ -121,6 +121,11 @@ func (r *Reader) Open(name string) (fs.File, error) {
 			return nil, pathError("open", name, err)
 		}
 	} else {
+		if r.manifest.paged != nil {
+			if err := r.manifest.paged.ensureFull(context.Background()); err != nil {
+				return nil, pathError("open", name, err)
+			}
+		}
 		prefix := ""
 		if name != "." {
 			prefix = name + "/"
@@ -197,6 +202,9 @@ func (f *archiveFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
+	if f.file != nil {
+		return f.file.Close()
+	}
 	return nil
 }
 

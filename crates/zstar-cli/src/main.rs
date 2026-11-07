@@ -379,7 +379,7 @@ async fn main() -> restore::AnyResult<()> {
             let parsed = BlockingArchive::open(source, metadata.options())?;
             println!(
                 "metadata_offset={} metadata_encoded_size={} metadata_decoded_size={} entries={}",
-                footer.toc_offset,
+                footer.metadata_range(size)?.start,
                 footer.toc_encoded_len,
                 footer.toc_decoded_len,
                 parsed.manifest().root().entry_count

@@ -24,27 +24,14 @@ def open_manifest(source_factory):
     return lambda data, **options: ManifestArchive(source_factory(data), len(data), **options)
 
 
-def test_streaming_encoder_and_restricted_cbor(open_manifest):
-    output = io.BytesIO()
-    writer = EntryArchiveWriter(output, frame_size=2048, memory_bytes=1)
-    for path, data in [("a", b"hello"), ("b", b"world"), ("c", bytes([7]) * 10000)]:
-        writer.add((path, 0, 420, 0, 0, 0, ()), io.BytesIO(data), len(data))
-    writer.close()
-    writer.close()
-    archive = open_manifest(output.getvalue())
-    try:
-        archive.validate()
-        assert archive.entry("a")[6][0][1] == archive.entry("b")[6][0][1]
-        assert archive.read("c") == bytes([7]) * 10000
-    finally:
-        archive.close()
+def test_native_cbor_value_conversion():
     value = {"x-values": (2**64 - 1, -(2**63), b"bytes", True, {"text": "value"})}
     assert decode_manifest_block(encode_manifest_block(value)) == value
     with pytest.raises((ZstarError, TypeError)):
         encode_manifest_block({"x-float": 0.5})
 
 
-def test_native_lossless_metadata_remains_owned_and_authenticated():
+def test_native_lossless_metadata_remains_owned_and_validated():
     fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
     entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
     output = io.BytesIO()
@@ -87,7 +74,7 @@ def test_iteration_and_owned_attributes(open_manifest):
     assert archive.entry("f0020")[7]["x-map"]["v"] == 20
     assert [e[0] for e in iterator] == [f"f{i:04}" for i in range(1, 100)]
     assert list(iterator) == []
-    archive.validate()
+
     pending = archive.iter_entries()
     archive.close()
     with pytest.raises(ZstarError, match="closed"):
@@ -96,13 +83,12 @@ def test_iteration_and_owned_attributes(open_manifest):
         archive.entry("f0000")
 
 
-def test_metadata_hash_and_read_budget_are_mandatory(inline_data, open_manifest):
+def test_metadata_checksum_and_read_budget_are_mandatory(inline_data, open_manifest):
     data = inline_data
     with pytest.raises(ZstarError, match="integrity"):
-        open_manifest(data[:-1] + bytes([data[-1] ^ 1]))
+        open_manifest(data[:-45] + bytes([data[-45] ^ 1]) + data[-44:])
     archive = open_manifest(data, max_read_bytes=1)
     try:
-        archive.validate()
         with pytest.raises(ZstarError, match="budget"):
             archive.read("a-b")
     finally:
@@ -114,12 +100,12 @@ def test_indexed_open_fetches_metadata_then_payload(source_factory):
 
     source = source_factory(data)
     archive = zstar._native.SyncArchive.from_source(source, len(data))
-    assert source.calls == 2  # footer, TOC
+    assert source.calls == 2  # Footer and directory.
     assert [entry[0] for entry in archive.iter_entries()] == ["x"]
     assert archive.read("x", 5, 0) == b""
-    assert source.calls == 2
+    assert source.calls == 4  # Complete scan rereads footer and metadata.
     assert archive.read("x", 1, 3) == b"ell"
-    assert source.calls == 3
+    assert source.calls == 5
 
 
 def test_source_short_reads_are_rejected():
@@ -176,8 +162,7 @@ def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
     )
     payload, report = archive.read_with_report("hello.txt", 0, 6, resolver=resolver)
     assert payload == b"hello\n"
-    assert report["metadata_authenticated"]
-    assert not report["full_archive_validated"]
+    assert report["metadata_validated"]
     assert report["external_objects_unchecked"]
     assert not report["external_objects_sha256_checked"]
     assert archive.read_many([("repeat", 0, 12), ("world.txt", 0, 6)], resolver=resolver) == [
@@ -203,14 +188,14 @@ def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(sour
     archive = zstar._native.SyncArchive.from_source(source, len(data))
     requests = [("x", 10, 4), ("x", 0, len(payload)), ("x", len(payload), 0), ("x", 10, 4)]
     assert archive.read_many(requests) == [payload[10:14], payload, b"", payload[10:14]]
-    assert source.calls == 3  # metadata + one shared payload frame, no frame cache
+    assert source.calls == 4  # Footer, directory, entry page, one shared payload frame.
     assert archive.read_many([]) == []
     with pytest.raises(zstar.ZstarError):
         archive.read_many([("x", 0, 4), ("x", len(payload), 1)])
     with pytest.raises(zstar.ZstarError) as caught:
         archive.read_many([("x", 0, 0)] * 4097)
     assert caught.value.category == "resource-limit"
-    assert source.calls == 3
+    assert source.calls == 4
 
     class BoundedSequence:
         def __len__(self):
@@ -223,7 +208,7 @@ def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(sour
             raise AssertionError("batch must only index the bounded sequence")
 
     assert archive.read_many(BoundedSequence()) == [payload[:1], payload[1:2]]
-    assert source.calls == 4
+    assert source.calls == 5
 
 
 def test_indexed_open_releases_spool_and_close_preserves_borrowed_source(source_factory):
@@ -276,7 +261,7 @@ def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
 
     class Source:
         def read_range(self, offset, length):
-            if offset == 0:
+            if offset == 0 and length < len(data):
                 started.set()
                 assert release.wait(5), "read was not released"
             return data[offset : offset + length]

@@ -7,7 +7,7 @@ import (
 )
 
 // ReaderOptions controls bounded metadata/content storage and external hashes.
-// Metadata is always authenticated and archive data checksums are mandatory.
+// Selected metadata is validated and archive data checksums are mandatory.
 type ReaderOptions struct {
 	// Manifest controls metadata storage and content resource budgets.
 	Manifest ManifestReaderOptions
@@ -17,8 +17,8 @@ type ReaderOptions struct {
 	VerifyExternalHash bool
 }
 
-// Reader owns authenticated sorted entries and bounded read state.
-// Metadata spools are released after open; retained entries use O(N) memory.
+// Reader owns a validated directory, cached entry pages, and bounded read state.
+// Counting and listing scan the complete metadata.
 // Close releases entries and cancels loads, without closing source.
 // Sources and resolvers must support concurrent calls and stay immutable.
 type Reader struct {
@@ -35,21 +35,29 @@ func (r *readerResolver) GetEncoded(ctx context.Context, address [32]byte, hint,
 	return r.inner.GetEncoded(ctx, address, hint, maxBytes)
 }
 
-// Open authenticates an archive using default resource budgets. The caller
+// Open validates an archive using default resource budgets. The caller
 // owns the immutable, concurrently readable source. Close the returned reader
 // to release SDK resources. ctx applies only to the opening operation.
 func Open(ctx context.Context, source RangeReader) (*Reader, error) {
 	return OpenWithOptions(ctx, source, ReaderOptions{})
 }
 
-// OpenWithOptions authenticates an archive using options. The caller owns
+// OpenWithOptions validates an archive using options. The caller owns
 // the source and resolver. Sources and resolvers must support
 // concurrent calls. ctx applies only to opening, not subsequent reads.
 func OpenWithOptions(ctx context.Context, source RangeReader, options ReaderOptions) (*Reader, error) {
-	manifest, err := openManifest(ctx, source, options.Manifest)
+	paged, err := openPaged(ctx, source, options)
 	if err != nil {
 		return nil, err
 	}
+	extensions := Extensions{}
+	for key, value := range paged.root {
+		if key, ok := key.(string); ok && len(key) >= 2 && key[:2] == "x-" {
+			extensions[key] = value
+		}
+	}
+	manifest := &manifest{source: paged.source, start: paged.start, maxRead: paged.config.MaxReadBytes, rootExtensions: extensions, spool: manifestSpool{options: decodedSpoolOptions(paged.config)}, content: paged.content, paged: paged}
+	paged.owner = manifest
 	resolver := options.Resolver
 	if resolver != nil && reflect.ValueOf(resolver).Kind() != reflect.Pointer {
 		resolver = &readerResolver{inner: resolver}
@@ -65,16 +73,31 @@ func (r *Reader) Close() error { return r.manifest.Close() }
 // match fs.ErrNotExist; invalid paths match fs.ErrInvalid. Errors are *fs.PathError.
 func (r *Reader) Entry(path string) (*Entry, error) { return r.manifest.Entry(path) }
 
-// EntryCount returns the member count without listing entries.
-func (r *Reader) EntryCount() uint64 { return r.manifest.EntryCount() }
+// EntryCount validates every metadata page and returns the derived member count.
+func (r *Reader) EntryCount() (uint64, error) {
+	if r.manifest.paged != nil {
+		if err := r.manifest.paged.ensureFull(context.Background()); err != nil {
+			return 0, err
+		}
+	}
+	return r.manifest.EntryCount(), nil
+}
 
-// RootExtensions returns an owned copy of authenticated root metadata.
+// RootExtensions returns an owned copy of validated root metadata.
 func (r *Reader) RootExtensions() Extensions { return r.manifest.RootExtensions() }
 
 // Entries yields owned entries whose paths begin with prefix, in path order.
 // Use "dir/" for descendants or "" for all entries. Stop on a nonnil error.
 func (r *Reader) Entries(prefix string) iter.Seq2[Entry, error] {
-	return r.manifest.Entries(prefix)
+	return func(yield func(Entry, error) bool) {
+		if r.manifest.paged != nil {
+			if err := r.manifest.paged.ensureFull(context.Background()); err != nil {
+				yield(Entry{}, err)
+				return
+			}
+		}
+		r.manifest.Entries(prefix)(yield)
+	}
 }
 
 // Read returns an owned buffer containing exactly size bytes at the logical
@@ -106,6 +129,8 @@ func (r *Reader) ReadManyWithReport(ctx context.Context, requests []ReadRequest)
 // OpenFile opens a regular member for concurrent random-access reads and
 // streaming. Keep the reader open while using the view. ctx applies only to
 // opening; ReadAtContext and WriteToContext accept per-operation deadlines.
+// The view retains one bounded decoded source; Close releases it independently
+// of the reader and other handles.
 func (r *Reader) OpenFile(ctx context.Context, path string) (*File, error) {
 	return r.manifest.OpenFile(ctx, path, r.resolver, r.verifyExternal)
 }
@@ -121,24 +146,4 @@ func (r *Reader) ReadLink(path string) (string, error) {
 		return "", pathError("readlink", path, rejected(CategoryUnsupportedOperation, "entry is not a symlink"))
 	}
 	return *entry.Linkname, nil
-}
-
-// VerificationScope selects the checks performed by Reader.Verify.
-type VerificationScope uint8
-
-const (
-	// VerifyArchive checks metadata and every physical frame and tar member.
-	VerifyArchive VerificationScope = iota
-	// VerifyExternalClosure additionally resolves all external selections.
-	// Hash checking still follows ReaderOptions.VerifyExternalHash.
-	VerifyExternalClosure
-)
-
-// Verify validates the archive under an explicit verification scope.
-// External object hashing follows ReaderOptions.VerifyExternalHash.
-func (r *Reader) Verify(ctx context.Context, scope VerificationScope) error {
-	if scope != VerifyArchive && scope != VerifyExternalClosure {
-		return rejected(CategoryUnsupportedOperation, "unknown verification scope")
-	}
-	return r.manifest.Verify(ctx, r.resolver, r.verifyExternal, scope == VerifyExternalClosure)
 }

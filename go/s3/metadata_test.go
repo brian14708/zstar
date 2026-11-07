@@ -17,7 +17,7 @@ import (
 	zstar "github.com/brian14708/zstar/go"
 )
 
-func metadataArchive(t *testing.T) ([]byte, zstar.Footer) {
+func metadataArchive(t *testing.T) []byte {
 	t.Helper()
 	var out bytes.Buffer
 	writer, err := zstar.NewWriter(&out, zstar.WriterOptions{})
@@ -30,27 +30,13 @@ func metadataArchive(t *testing.T) ([]byte, zstar.Footer) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	footer, err := zstar.ParseFooter(out.Bytes()[out.Len()-80:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out.Bytes(), footer
+	return out.Bytes()
 }
 
 type metadataUploadClient struct {
 	uploadClient
 	metadata                                   map[string]string
 	contentType, cacheControl, contentEncoding string
-}
-
-type completeEOFReader struct{ *bytes.Reader }
-
-func (r completeEOFReader) ReadAt(buffer []byte, offset int64) (int, error) {
-	n, err := r.Reader.ReadAt(buffer, offset)
-	if err == nil && n == len(buffer) {
-		err = io.EOF
-	}
-	return n, err
 }
 
 func (c *metadataUploadClient) CreateMultipartUpload(ctx context.Context, in *awss3.CreateMultipartUploadInput, opts ...func(*awss3.Options)) (*awss3.CreateMultipartUploadOutput, error) {
@@ -65,67 +51,25 @@ func (c *metadataUploadClient) PutObject(ctx context.Context, in *awss3.PutObjec
 	return c.uploadClient.PutObject(ctx, in, opts...)
 }
 
-func TestUploadCompletedArchivesAddsMetadataAndPreservesCallerOptions(t *testing.T) {
-	data, footer := metadataArchive(t)
-	expected, err := ArchiveMetadata(footer, uint64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected["owner"] = "example"
-	options := map[string]string{"owner": "example", "ZSTAR-VERSION": "bad"}
-	client := &metadataUploadClient{}
-	if err := Upload(context.Background(), client, "bucket", "key", bytes.NewReader(data), UploadOptions{Metadata: options}); err != nil {
-		t.Fatal(err)
-	}
-	if client.contentType != zstdContentType || client.cacheControl != mutableCacheControl || client.contentEncoding != "" {
-		t.Fatalf("content headers: %+v", client)
-	}
-	if !reflect.DeepEqual(client.metadata, expected) {
-		t.Fatalf("metadata: %v", client.metadata)
-	}
-	if options["ZSTAR-VERSION"] != "bad" || len(options) != 2 {
-		t.Fatal("caller options mutated")
-	}
-	metadata, err := inputArchiveMetadata(completeEOFReader{bytes.NewReader(data)})
-	if err != nil || metadata[ManifestPositionMetadataKey] != expected[ManifestPositionMetadataKey] {
-		t.Fatalf("complete footer read with EOF: %v", err)
-	}
-	// An archive embedded after the caller's initial position is uploaded as
-	// that suffix. Footer probing must leave that initial position unchanged.
-	input := bytes.NewReader(append([]byte("prefix"), data...))
-	if _, err := input.Seek(6, io.SeekStart); err != nil {
-		t.Fatal(err)
-	}
-	metadata, err = inputArchiveMetadata(input)
-	if err != nil || metadata[ManifestPositionMetadataKey] != expected[ManifestPositionMetadataKey] {
-		t.Fatal(err)
-	}
-	position, err := input.Seek(0, io.SeekCurrent)
-	if err != nil || position != 6 {
-		t.Fatalf("position=%d: %v", position, err)
-	}
-	// Streams have no discovered hints, but callers can supply known metadata.
-	client = &metadataUploadClient{}
-	if err := Upload(context.Background(), client, "bucket", "key", bytes.NewBuffer(data), UploadOptions{Metadata: expected}); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(client.metadata, expected) {
-		t.Fatal("stream annotations lost")
-	}
-	client = &metadataUploadClient{}
-	if err := Upload(context.Background(), client, "bucket", "key", bytes.NewReader(nil), UploadOptions{Metadata: map[string]string{"owner": "example"}}); err != nil {
-		t.Fatal(err)
-	}
-	if client.metadata["owner"] != "example" {
-		t.Fatal("empty PUT lost metadata")
-	}
-	if _, err := ArchiveMetadata(footer, uint64(len(data))+1); err == nil {
-		t.Fatal("invalid coverage accepted")
+func TestUploadPreservesCallerMetadata(t *testing.T) {
+	data := metadataArchive(t)
+	for _, metadata := range []map[string]string{nil, {"owner": "example"}} {
+		client := &metadataUploadClient{}
+		if err := Upload(context.Background(), client, "bucket", "archive.zstar", bytes.NewReader(data), UploadOptions{Metadata: metadata}); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(client.metadata, metadata) {
+			t.Fatalf("metadata changed: %v", client.metadata)
+		}
+		if client.contentType != zstdContentType || client.cacheControl != mutableCacheControl || client.contentEncoding != "" {
+			t.Fatalf("content headers: %+v", client)
+		}
 	}
 }
 
 type hintedClient struct {
 	data        []byte
+	inputs      []*awss3.GetObjectInput
 	metadata    map[string]string
 	heads, gets int
 }
@@ -137,12 +81,21 @@ func (c *hintedClient) HeadObject(context.Context, *awss3.HeadObjectInput, ...fu
 
 func (c *hintedClient) GetObject(_ context.Context, in *awss3.GetObjectInput, _ ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
 	c.gets++
-	if aws.ToString(in.IfMatch) != "\"snapshot\"" {
+	c.inputs = append(c.inputs, in)
+	if !strings.HasPrefix(aws.ToString(in.Range), "bytes=-") && aws.ToString(in.IfMatch) != "\"snapshot\"" {
 		return nil, errors.New("missing snapshot condition")
 	}
 	start, end, ok := strings.Cut(strings.TrimPrefix(aws.ToString(in.Range), "bytes="), "-")
 	if !ok {
 		return nil, errors.New("missing range")
+	}
+	if start == "" {
+		count, err := strconv.Atoi(end)
+		if err != nil {
+			return nil, err
+		}
+		start = strconv.Itoa(max(0, len(c.data)-count))
+		end = strconv.Itoa(len(c.data) - 1)
 	}
 	offset, err := strconv.Atoi(start)
 	if err != nil {
@@ -155,58 +108,30 @@ func (c *hintedClient) GetObject(_ context.Context, in *awss3.GetObjectInput, _ 
 	raw := c.data[offset : last+1]
 	return &awss3.GetObjectOutput{
 		Body: io.NopCloser(bytes.NewReader(raw)), ContentLength: aws.Int64(int64(len(raw))),
-		ContentRange: aws.String(fmt.Sprintf("bytes %d-%d/%d", offset, last, len(c.data))), ETag: aws.String("\"snapshot\""),
+		ContentRange: aws.String(fmt.Sprintf("bytes %d-%d/%d", offset, last, len(c.data))), ETag: aws.String("\"snapshot\""), Metadata: c.metadata,
 	}, nil
 }
 
-func TestManifestHintsSaveRequestAndFallBackSafely(t *testing.T) {
-	data, footer := metadataArchive(t)
-	good, err := ArchiveMetadata(footer, uint64(len(data)))
+func TestSuffixPrefetchWithoutObjectMetadata(t *testing.T) {
+	data := metadataArchive(t)
+	client := &hintedClient{data: data}
+	reader, err := zstar.Open(context.Background(), NewSource(client, "bucket", "key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, test := range map[string]struct {
-		metadata map[string]string
-		gets     int
-	}{
-		"present":              {good, 1},
-		"position-only":        {map[string]string{ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 1},
-		"absent":               {nil, 2},
-		"malformed":            {map[string]string{ManifestPositionMetadataKey: "+1:10"}, 2},
-		"overflow":             {map[string]string{ManifestPositionMetadataKey: "1:18446744073709551616"}, 2},
-		"bounds":               {map[string]string{ManifestPositionMetadataKey: "0:1"}, 2},
-		"unknown-version":      {map[string]string{VersionMetadataKey: "2", ManifestPositionMetadataKey: good[ManifestPositionMetadataKey]}, 2},
-		"stale":                {map[string]string{ManifestPositionMetadataKey: fmt.Sprintf("%d:%d", footer.ManifestOffset-1, footer.ManifestEncodedSize+1)}, 3},
-		"informational-digest": {map[string]string{ManifestPositionMetadataKey: good[ManifestPositionMetadataKey], ManifestSHA256MetadataKey: "bad"}, 1},
-	} {
-		t.Run(name, func(t *testing.T) {
-			client := &hintedClient{data: data, metadata: test.metadata}
-			reader, err := zstar.Open(context.Background(), NewSource(client, "bucket", "key"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if client.heads != 1 || client.gets != test.gets {
-				t.Fatalf("heads=%d gets=%d expected=%d", client.heads, client.gets, test.gets)
-			}
-			got, err := reader.Read(context.Background(), "x", 0, 5)
-			if err != nil || string(got) != "hello" {
-				t.Fatal(err)
-			}
-			if err := reader.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	got, err := reader.Read(context.Background(), "x", 0, 5)
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("read: %q %v", got, err)
 	}
-	client := &hintedClient{data: data, metadata: good}
-	if _, err := zstar.OpenWithOptions(context.Background(), NewSource(client, "bucket", "key"), zstar.ReaderOptions{Manifest: zstar.ManifestReaderOptions{MaxEncodedBytes: 1}}); zstar.ErrorCategory(err) != zstar.CategoryResourceLimit {
+	if client.heads != 0 || client.gets != 1 || aws.ToString(client.inputs[0].Range) != "bytes=-131072" {
+		t.Fatalf("heads=%d gets=%d", client.heads, client.gets)
+	}
+	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if client.gets != 1 {
-		t.Fatal("over-budget hint fetched")
-	}
 	corrupt := bytes.Clone(data)
-	corrupt[len(corrupt)-1] ^= 1
-	client = &hintedClient{data: corrupt, metadata: good}
+	corrupt[len(corrupt)-zstar.FooterSize-1] ^= 1
+	client = &hintedClient{data: corrupt}
 	if _, err := zstar.Open(context.Background(), NewSource(client, "bucket", "key")); zstar.ErrorCategory(err) != zstar.CategoryIntegrityFailure {
 		t.Fatal(err)
 	}

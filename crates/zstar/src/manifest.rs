@@ -565,10 +565,6 @@ pub(crate) fn ancestor_retained(dir: &str, entry: &str) -> bool {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep the ordered validation or protocol operation together."
-)]
 pub(crate) fn decode_sequence_budgeted(
     reader: impl std::io::Read,
     len: u64,
@@ -585,8 +581,25 @@ pub(crate) fn decode_sequence_budgeted(
             limits.max_entry_bytes
         },
     );
-    let value = sequence
-        .next()?
+    decode_values_budgeted(
+        std::iter::from_fn(move || sequence.next().transpose()),
+        data_end,
+        max_retained,
+        max_entries,
+        limits,
+    )
+}
+
+pub(crate) fn decode_values_budgeted(
+    mut values: impl Iterator<Item = Result<Value>>,
+    data_end: u64,
+    max_retained: u64,
+    max_entries: u64,
+    limits: crate::Limits,
+) -> Result<(ManifestRoot, Vec<Entry>)> {
+    let value = values
+        .next()
+        .transpose()?
         .ok_or_else(|| malformed("missing manifest header"))?;
     let m = map(&value)?;
     if unsigned(field(m, "version")?)? != 1 {
@@ -618,7 +631,7 @@ pub(crate) fn decode_sequence_budgeted(
     // one cumulative logical end per extent. Charge before allocating them.
     let mut retained = 0_u64;
     let mut external = false;
-    while let Some(value) = sequence.next()? {
+    while let Some(value) = values.next().transpose()? {
         if max_entries != 0 && entries.len() as u64 >= max_entries {
             return Err(Error::Budget("manifest entry count"));
         }
@@ -954,7 +967,7 @@ pub(crate) fn entry_allocation(entry: &Entry) -> usize {
 mod tests {
     use super::*;
     #[test]
-    fn document_rejects_legacy_missing_fields_and_trailing_items() {
+    fn document_rejects_missing_unknown_fields_and_trailing_items() {
         let empty = Value::Map(vec![
             (Value::Text("version".into()), Value::Integer(1.into())),
             (Value::Text("requires".into()), Value::Array(vec![])),
@@ -975,10 +988,8 @@ mod tests {
                 decode_document(&crate::cbor::encode(&Value::Map(missing)).unwrap(), 1).is_err()
             );
         }
-        fields.push((Value::Text("entry_count".into()), Value::Integer(0.into())));
+        fields.push((Value::Text("unexpected".into()), Value::Integer(0.into())));
         assert!(decode_document(&crate::cbor::encode(&Value::Map(fields)).unwrap(), 1).is_err());
-        let legacy = Value::Map(vec![(Value::Text("root".into()), Value::Map(vec![]))]);
-        assert!(decode_document(&crate::cbor::encode(&legacy).unwrap(), 1).is_err());
     }
     #[test]
     fn external_reference_and_pointer_sizes_fit_uint64() {

@@ -8,7 +8,6 @@ import (
 	"io"
 	"maps"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -34,8 +33,7 @@ type UploadOptions struct {
 	// ContentType and CacheControl override the inferred media type and cache policy.
 	ContentType  string
 	CacheControl string
-	// Metadata is copied into the upload. Completed ReaderAt/Seeker archives
-	// automatically replace the three reserved zstar keys with footer values.
+	// Metadata is caller-supplied object metadata, copied into the upload.
 	Metadata    map[string]string
 	PartSize    int // zero selects 8 MiB; [5 MiB,64 MiB]
 	Concurrency int // zero selects four; [1,32]
@@ -59,30 +57,9 @@ func Upload(ctx context.Context, client MultipartClient, bucket, key string, inp
 		return err
 	}
 	metadata := maps.Clone(options.Metadata)
-	archiveMetadata, err := inputArchiveMetadata(input)
-	if err != nil {
-		return err
-	}
-	if archiveMetadata != nil {
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
-		for key := range metadata {
-			for reserved := range archiveMetadata {
-				if strings.EqualFold(key, reserved) {
-					delete(metadata, key)
-					break
-				}
-			}
-		}
-		maps.Copy(metadata, archiveMetadata)
-	}
 	contentType := options.ContentType
 	if contentType == "" {
 		contentType = artifactContentType(key)
-		if archiveMetadata != nil {
-			contentType = zstdContentType
-		}
 	}
 	cache := options.CacheControl
 	if cache == "" {

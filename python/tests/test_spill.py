@@ -43,7 +43,6 @@ def test_writer_custom_stores_short_io_and_borrowed_lifetime():
     assert all(not store.closed for store in stores)
     with Archive(output.getvalue()) as reader:
         assert reader.read("f0099") == bytes([99]) * 128
-        reader.verify()
     for store in stores:
         store.close()
 
@@ -73,6 +72,8 @@ def test_reader_factory_temporary_files_and_cold_lookup(kind, inline_data, sourc
                 assert reader.getinfo("link").linkname == "../a//file"
             else:
                 assert reader.entry("link")[7]["linkname"] == "../a//file"
+            if kind in {"bytes", "indexed"}:
+                assert reader.entry_count == 6
             assert stores
         finally:
             reader.close()
@@ -88,11 +89,13 @@ def test_quota_rejected_before_factory_callback(kind, inline_data, source_factor
     options = {"memory_bytes": 0, "max_spool_bytes": 0, "create_spill_store": factory}
     with pytest.raises(ZstarError, match="aggregate spool storage"):
         if kind == "bytes":
-            Archive(inline_data, **options)
+            with Archive(inline_data, **options) as archive:
+                _ = archive.entry_count
         elif kind == "manifest":
             ManifestArchive(source_factory(), len(inline_data), **options)
         elif kind == "indexed":
-            SyncArchive.from_source(source_factory(), len(inline_data), **options)
+            with SyncArchive.from_source(source_factory(), len(inline_data), **options) as archive:
+                _ = archive.entry_count
         else:
             writer = EntryArchiveWriter(io.BytesIO(), **options)
             try:
@@ -156,8 +159,12 @@ def test_async_constructors_apply_spool_controls(inline_data, source_factory):
 
     async def run():
         with pytest.raises(ZstarError, match="aggregate spool storage"):
-            await AsyncArchive.from_bytes(inline_data, max_spool_bytes=0)
+            async with await AsyncArchive.from_bytes(inline_data, max_spool_bytes=0) as reader:
+                await reader.entry_count
         with pytest.raises(ZstarError, match="aggregate spool storage"):
-            await AsyncArchive.from_source(source_factory(), len(inline_data), max_spool_bytes=0)
+            async with await AsyncArchive.from_source(
+                source_factory(), len(inline_data), max_spool_bytes=0
+            ) as reader:
+                await reader.entry_count
 
     asyncio.run(run())

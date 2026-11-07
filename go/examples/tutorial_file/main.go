@@ -1,4 +1,4 @@
-// Command tutorial_file writes an archive to a file, reads it, and verifies it.
+// Command tutorial_file writes an archive to a file, reads it.
 package main
 
 import (
@@ -52,12 +52,6 @@ func run(ctx context.Context) (result error) {
 	fmt.Printf("%s%s\n", whole, selected)
 	// endregion read
 
-	// region verify
-	if err := archive.Verify(ctx, zstar.VerifyArchive); err != nil {
-		return err
-	}
-	fmt.Println("Archive verified")
-	// endregion verify
 	return nil
 }
 

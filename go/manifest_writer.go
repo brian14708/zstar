@@ -2,12 +2,10 @@ package zstar
 
 import (
 	"bytes"
-	"cmp"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"hash"
 	"io"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -19,16 +17,16 @@ import (
 // manifestWriter writes a deterministic manifest sequence in bounded compressed segments,
 // then the existing terminal footer. It does not close the archive destination.
 type manifestWriter struct {
-	output                          io.Writer
-	encoder                         *zstd.Encoder
-	encodedBuffer                   []byte
-	start, position, decoded, count uint64
-	hash                            hash.Hash
-	options                         manifestOptions
-	entries                         manifestSpool
-	external                        bool
-	err                             error
-	closed                          bool
+	output                             io.Writer
+	encoder                            *zstd.Encoder
+	encodedBuffer                      []byte
+	start, position, decoded, count    uint64
+	directoryEncoded, directoryDecoded uint64
+	options                            manifestOptions
+	entries                            manifestSpool
+	external                           bool
+	err                                error
+	closed                             bool
 }
 
 // newManifestWriter creates a bounded manifest encoder for data ending at
@@ -47,6 +45,21 @@ func newManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOp
 			return nil, err
 		}
 	}
+	groups := make(map[string][]any, len(options.ExtensionPages))
+	for group, values := range options.ExtensionPages {
+		if !strings.HasPrefix(group, "x-") || len(values) == 0 {
+			return nil, rejected(CategoryMalformedTOC, "extension page group")
+		}
+		copied := make([]any, len(values))
+		for i, value := range values {
+			if err := validateExtensionValue(value, 0); err != nil {
+				return nil, err
+			}
+			copied[i] = cloneExtensionValue(value)
+		}
+		groups[group] = copied
+	}
+	options.ExtensionPages = groups
 	options.RootExtensions = cloneExtensions(options.RootExtensions)
 	if options.BlockTarget < 512 {
 		return nil, errors.New("zstar: block target must be at least 512 bytes")
@@ -55,7 +68,7 @@ func newManifestWriter(output io.Writer, dataEnd uint64, config ManifestWriterOp
 	if err != nil {
 		return nil, err
 	}
-	return &manifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, hash: sha256.New(), options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
+	return &manifestWriter{output: output, encoder: encoder, start: dataEnd, position: dataEnd, options: options, entries: manifestSpool{options: decodedSpoolOptions(options)}}, nil
 }
 
 // AddEntry snapshots and spools one entry. Paths may arrive in any order.
@@ -71,6 +84,12 @@ func (w *manifestWriter) AddEntry(entry Entry) error {
 	// poison the writer.
 	if err := entry.validateFields(w.start); err != nil {
 		return err
+	}
+	// Page map, entries array, entry tuple, and attributes map precede values.
+	for _, value := range entry.Attributes {
+		if err := validateExtensionValue(value, 4); err != nil {
+			return err
+		}
 	}
 	raw, err := encodeEntry(entry)
 	if err != nil {
@@ -142,72 +161,19 @@ func (w *manifestWriter) writeSegment(raw []byte) error {
 	if err := writeExact(w.output, encoded); err != nil {
 		return err
 	}
-	_, _ = w.hash.Write(raw)
 	w.position += size
 	w.decoded += uint64(len(raw))
 	return nil
 }
 
 func (w *manifestWriter) writeDocument() (err error) {
-	type field struct {
-		keyBytes []byte
-		value    []byte
-	}
-	var fields []field
-	add := func(key string, value any) error {
-		b, err := manifestEncode(value)
-		if err == nil {
-			fields = append(fields, field{keyBytes: mustManifestKey(key), value: b})
-		}
-		return err
-	}
-	if err := add("version", uint64(1)); err != nil {
-		return err
-	}
+	root := map[string]any{"version": uint64(1)}
 	features := []string{}
 	if w.external {
 		features = append(features, "external-content")
 	}
-	if err := add("requires", features); err != nil {
-		return err
-	}
-	for key, value := range w.options.RootExtensions {
-		if !strings.HasPrefix(key, "x-") {
-			return rejected(CategoryMalformedTOC, "root extension key")
-		}
-		if err := add(key, value); err != nil {
-			return err
-		}
-	}
-	slices.SortFunc(fields, func(a, b field) int {
-		if order := cmp.Compare(len(a.keyBytes), len(b.keyBytes)); order != 0 {
-			return order
-		}
-		return bytes.Compare(a.keyBytes, b.keyBytes)
-	})
-	var pending []byte
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		err := w.writeSegment(pending)
-		pending = pending[:0]
-		return err
-	}
-	write := func(data []byte) error {
-		for len(data) > 0 {
-			room := w.options.BlockTarget - len(pending)
-			n := min(room, len(data))
-			pending = append(pending, data[:n]...)
-			data = data[n:]
-			if len(pending) == w.options.BlockTarget {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
+	root["requires"] = features
+	maps.Copy(root, w.options.RootExtensions)
 	sorted, err := sortManifestRecords(&w.entries)
 	if err != nil {
 		return err
@@ -242,16 +208,25 @@ func (w *manifestWriter) writeDocument() (err error) {
 		}
 		previous = entry.Path
 	}
-	if err = write(cborHead(5, uint64(len(fields)))); err != nil {
-		return err
-	}
-	for _, field := range fields {
-		if err = write(field.keyBytes); err != nil {
-			return err
+	pages := []any{}
+	pending := []byte{}
+	var pageCount uint64
+	lastPath := ""
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
 		}
-		if err = write(field.value); err != nil {
-			return err
+		raw := appendManifestText([]byte{0xa1}, "entries")
+		raw = appendManifestHead(raw, 4, pageCount)
+		raw = append(raw, pending...)
+		start := w.position
+		if e := w.writeSegment(raw); e != nil {
+			return e
 		}
+		pages = append(pages, []any{lastPath, start - w.start, w.position - start, uint64(len(raw))})
+		pending = pending[:0]
+		pageCount = 0
+		return nil
 	}
 	for at := uint64(0); at < sorted.size; {
 		value, e := sorted.readRecord(&at)
@@ -262,11 +237,61 @@ func (w *manifestWriter) writeDocument() (err error) {
 		if e != nil {
 			return e
 		}
-		if e = write(raw); e != nil {
-			return e
+		if len(pending) > 0 && 9+len(cborHead(4, pageCount+1))+len(pending)+len(raw) > w.options.BlockTarget {
+			if e = flush(); e != nil {
+				return e
+			}
 		}
+		entry, ok := value.([]any)
+		if !ok || len(entry) == 0 {
+			return rejected(CategoryMalformedTOC, "entry tuple")
+		}
+		lastPath, ok = entry[0].(string)
+		if !ok {
+			return rejected(CategoryMalformedTOC, "entry path")
+		}
+		pending = append(pending, raw...)
+		pageCount++
 	}
-	return flush()
+	if err = flush(); err != nil {
+		return err
+	}
+	groups := make([]string, 0, len(w.options.ExtensionPages))
+	for group := range w.options.ExtensionPages {
+		groups = append(groups, group)
+	}
+	slices.SortFunc(groups, func(a, b string) int { return bytes.Compare(mustManifestKey(a), mustManifestKey(b)) })
+	extensions := map[string]any{}
+	for _, group := range groups {
+		references := []any{}
+		for _, value := range w.options.ExtensionPages[group] {
+			raw, e := manifestEncode(value)
+			if e != nil {
+				return e
+			}
+			start := w.position
+			if e = w.writeSegment(raw); e != nil {
+				return e
+			}
+			references = append(references, []any{start - w.start, w.position - start, uint64(len(raw))})
+		}
+		extensions[group] = references
+	}
+	if len(extensions) > 0 {
+		root["extension-pages"] = extensions
+	}
+	root["pages"] = pages
+	raw, err := manifestEncode(root)
+	if err != nil {
+		return err
+	}
+	start := w.position
+	if err = w.writeSegment(raw); err != nil {
+		return err
+	}
+	w.directoryEncoded = w.position - start
+	w.directoryDecoded = uint64(len(raw))
+	return nil
 }
 
 // Close sorts and validates entries, writes metadata and the footer, and
@@ -287,15 +312,14 @@ func (w *manifestWriter) Close() (err error) {
 	if err = w.writeDocument(); err != nil {
 		return err
 	}
-	footer := make([]byte, 80)
+	footer := make([]byte, FooterSize)
 	binary.LittleEndian.PutUint32(footer, 0x184D2A5F)
-	binary.LittleEndian.PutUint32(footer[4:], 72)
-	copy(footer[8:], "ZSTAR001")
-	binary.LittleEndian.PutUint32(footer[16:], 1)
-	binary.LittleEndian.PutUint64(footer[24:], w.start)
-	binary.LittleEndian.PutUint64(footer[32:], w.position-w.start)
-	binary.LittleEndian.PutUint64(footer[40:], w.decoded)
-	copy(footer[48:], w.hash.Sum(nil))
+	binary.LittleEndian.PutUint32(footer[4:], 36)
+	binary.LittleEndian.PutUint64(footer[8:], w.position-w.start)
+	binary.LittleEndian.PutUint64(footer[16:], w.decoded)
+	binary.LittleEndian.PutUint64(footer[24:], w.directoryEncoded)
+	binary.LittleEndian.PutUint64(footer[32:], w.directoryDecoded)
+	copy(footer[40:], "Z*01")
 	return writeExact(w.output, footer)
 }
 

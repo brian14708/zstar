@@ -18,15 +18,15 @@ pub struct ReadRequest<'a> {
 
 /// Exact byte ranges from an immutable archive. Dropping a returned future
 /// cancels pending work; implementations must not detach network requests.
+///
+/// Raw-byte caching and prefetching belong to the source implementation; the
+/// archive does not retain encoded ranges across operations.
+/// [`crate::CachedRangeReader`] can decorate any immutable source to add bounded
+/// interval caching, shared fetches, and optional forward read-ahead.
 #[async_trait::async_trait]
 pub trait AsyncRangeReader: Send + Sync {
     /// Returns the immutable archive size in bytes.
     async fn size(&self) -> Result<u64>;
-    /// Optional location hint for the encoded manifest region, excluding the footer.
-    /// Readers validate bounds and the terminal footer before using this hint.
-    async fn manifest_range(&self) -> Result<Option<Range<u64>>> {
-        Ok(None)
-    }
     /// Returns exactly the requested half-open byte range.
     ///
     /// Return an error for reversed or out-of-bounds ranges and short reads.

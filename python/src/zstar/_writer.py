@@ -61,6 +61,7 @@ class ArchiveWriter:
         create_spill_store: Callable[[], SpillStore] | None = None,
         workers: int = 0,
         root_extensions: dict[str, ExtensionValue] | None = None,
+        extension_pages: dict[str, list[ExtensionValue]] | None = None,
     ) -> None:
         self._writer = _native.EntryArchiveWriter(
             fileobj,
@@ -73,6 +74,7 @@ class ArchiveWriter:
             create_spill_store=create_spill_store,
             workers=workers,
             root_extensions=root_extensions,
+            extension_pages=extension_pages,
         )
         self._owned: ExitStack | None = None
         self._path: tuple[str, tuple[int, int]] | None = None

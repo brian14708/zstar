@@ -99,7 +99,7 @@ fn ranged(request: &str, data: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn presigned_get_opens_archive_without_head_and_reloads_content() {
-    let mut writer = Builder::new(Vec::new());
+    let mut writer = Builder::try_new(Vec::new()).await.unwrap();
     writer.append_bytes("hello", b"hello world").await.unwrap();
     let data = writer.finish().await.unwrap();
     let server = server(move |request| ranged(request, &data)).await;
@@ -108,7 +108,7 @@ async fn presigned_get_opens_archive_without_head_and_reloads_content() {
         PresignedRequest::get(&server.url),
     ));
     let reader = Archive::open(source).await.unwrap();
-    assert_eq!(server.requests.lock().unwrap().len(), 3);
+    assert_eq!(server.requests.lock().unwrap().len(), 3); // Size, footer, directory.
     assert_eq!(
         reader.read_range("hello", 6..11).await.unwrap(),
         b"world"[..]
@@ -117,7 +117,7 @@ async fn presigned_get_opens_archive_without_head_and_reloads_content() {
         reader.read_range("hello", 0..5).await.unwrap(),
         b"hello"[..]
     );
-    assert_eq!(server.requests.lock().unwrap().len(), 5);
+    assert_eq!(server.requests.lock().unwrap().len(), 6); // Entry page and two uncached content reads.
 }
 
 #[tokio::test]

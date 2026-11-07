@@ -241,9 +241,8 @@ mod asynchronous {
                 .read_range_with_report_and_resolver("a", 0, 16_384, None)
                 .await
                 .unwrap();
-            assert!(report.metadata_authenticated);
+            assert!(report.metadata_validated);
             assert_ne!(report.data_frames_checked, [] as [u64; 0]);
-            assert!(!report.full_archive_validated);
             assert!(matches!(
                 source.read_range(Range { start: 1, end: 0 }).await,
                 Err(Error::Range)

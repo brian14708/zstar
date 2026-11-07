@@ -327,9 +327,6 @@ impl ManifestArchive {
         })?;
         Ok(PyBytes::new(py, &bytes).unbind())
     }
-    fn validate(&self, py: Python<'_>) -> PyResult<()> {
-        self.inner.run(py, BlockingArchive::validate)
-    }
     /// Explicit eager enumeration; `entry()` keeps lookup bounded for large archives.
     fn entries(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let entries = self

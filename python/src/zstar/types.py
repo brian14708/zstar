@@ -137,6 +137,7 @@ class WriterOptions(TypedDict, total=False):
     limits: Limits | None
     workers: int
     root_extensions: dict[str, ExtensionValue] | None
+    extension_pages: dict[str, list[ExtensionValue]] | None
     frame_size: int
     compression_level: int
     memory_bytes: int
@@ -180,10 +181,9 @@ class AsyncReaderOptions(_ReaderBudgets, total=False):
 
 
 class ReadReport(TypedDict):
-    """Content and authentication checks performed while reading an archive member."""
+    """Content and validation checks performed while reading an archive member."""
 
-    metadata_authenticated: bool
-    full_archive_validated: bool
+    metadata_validated: bool
     data_frames_checked: list[int]
     external_objects_sha256_checked: list[str]
     external_objects_unchecked: list[str]

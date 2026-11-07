@@ -889,8 +889,8 @@ pub fn materialize<R: RangeReader>(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-/// Validate the physical archive, resolve external objects once per adjacent
-/// extent group, and stream a portable archive preserving entry/root extensions.
+/// Resolve selected external objects once per adjacent extent group and stream
+/// a portable archive preserving entry/root extensions.
 pub fn materialize_to<R: RangeReader>(
     archive: &mut BlockingArchive<R>,
     output: &mut impl Write,
@@ -898,7 +898,6 @@ pub fn materialize_to<R: RangeReader>(
     verify_external: bool,
     options: PackOptions,
 ) -> AnyResult<()> {
-    archive.validate()?;
     let mut writer = BlockingBuilder::with_options(
         output,
         options.frame_size,

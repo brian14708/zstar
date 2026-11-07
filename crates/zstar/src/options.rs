@@ -69,6 +69,7 @@ pub struct MetadataWriterOptions {
     pub max_encoded_bytes: u64,
     pub max_decoded_bytes: u64,
     pub block_target: usize,
+    pub extension_pages: std::collections::BTreeMap<String, Vec<ciborium::Value>>,
     pub spool: SpoolOptions,
 }
 impl Default for MetadataWriterOptions {
@@ -78,6 +79,7 @@ impl Default for MetadataWriterOptions {
             max_encoded_bytes: options.max_encoded_bytes,
             max_decoded_bytes: options.max_decoded_bytes,
             block_target: options.block_target,
+            extension_pages: options.extension_pages,
             spool: SpoolOptions::default(),
         }
     }
@@ -88,6 +90,7 @@ impl MetadataWriterOptions {
         options.max_encoded_bytes = self.max_encoded_bytes;
         options.max_decoded_bytes = self.max_decoded_bytes;
         options.block_target = self.block_target;
+        options.extension_pages = self.extension_pages;
         self.spool.apply(options);
     }
 }
