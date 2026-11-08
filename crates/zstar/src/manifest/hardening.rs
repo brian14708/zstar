@@ -1,7 +1,21 @@
 //! Hostile-input hardening: size caps, ancestor tracking, tar header fuzzing.
+use super::{Entry, ManifestRoot, decode_values_budgeted, encode_block};
 use proptest::prelude::*;
 use std::time::{Duration, Instant};
-use zstar::backend::manifest::{Entry, decode_document, encode_block};
+
+pub(super) fn decode_document(
+    bytes: &[u8],
+    data_end: u64,
+) -> crate::Result<(ManifestRoot, Vec<Entry>)> {
+    let mut sequence = crate::cbor::SequenceDecoder::new(bytes, bytes.len() as u64);
+    decode_values_budgeted(
+        std::iter::from_fn(move || sequence.next().transpose()),
+        data_end,
+        4 << 30,
+        0,
+        crate::Limits::default(),
+    )
+}
 
 fn header() -> Vec<u8> {
     let mut out = vec![0xa2, 0x67];
@@ -92,6 +106,6 @@ proptest! {
     ) {
         bytes[257..265].copy_from_slice(b"ustar\x0000");
         bytes[156] = kind;
-        let _ = zstar::backend::parse_member_header(&bytes);
+        let _ = crate::tar::parse_header_prefix(&bytes);
     }
 }

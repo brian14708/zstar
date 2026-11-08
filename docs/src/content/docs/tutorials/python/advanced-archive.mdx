@@ -5,7 +5,7 @@ title: "Advanced archive creation with Python"
 import Example from "../../../../components/Example.astro";
 import source from "../../../../../../python/examples/tutorial_file.py?raw";
 
-Use `ArchiveWriter` and `Archive` to create and read an archive.
+Use `zstar.open` with mode `"w"` to create an archive and the default `"r"` to read it.
 For filesystem operations, start with the
 [fsspec tutorial](/zstar/tutorials/python/first-archive/).
 
@@ -26,15 +26,15 @@ metadata. uv installs them in an isolated environment automatically.
 
 ## Write the archive
 
-`write_bytes()` adds a member. Leaving the `with` block finalizes and closes
-the archive.
+`writestr()` adds a member. Leaving the writer context finalizes the footer
+and flushes and closes its owned output. An exceptional exit aborts unfinished output.
 
 <Example source={source} lang="python" region="create" />
 
 ## Read a file and a byte range
 
-`read()` returns the whole member. `read_range()` uses a half-open range:
-start 0 and end 5 return `Hello`.
+`read()` returns the whole member. Pass keyword arguments `offset=0, length=5`
+to read the first five bytes, yielding `Hello`.
 
 <Example source={source} lang="python" region="read" />
 

@@ -6,12 +6,12 @@
 """Create an archive, upload it to S3, read ranges, and delete it."""
 
 import os
-from io import BytesIO
 from uuid import uuid4
 
 import boto3
+import zstar
 from botocore.config import Config
-from zstar import Archive, ArchiveWriter
+from zstar.types import Credentials, ReaderOptions, S3Options, WriterOptions
 
 
 def main() -> None:
@@ -19,10 +19,13 @@ def main() -> None:
     bucket = os.environ["ZSTAR_S3_BUCKET"]
     region = os.environ["AWS_REGION"]
     endpoint = os.environ.get("ZSTAR_S3_ENDPOINT")
+    access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
+    secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+    session_token = os.environ.get("AWS_SESSION_TOKEN")
     credentials = {
-        "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
-        "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-        "aws_session_token": os.environ.get("AWS_SESSION_TOKEN"),
+        "aws_access_key_id": access_key_id,
+        "aws_secret_access_key": secret_access_key,
+        "aws_session_token": session_token,
     }
     client = boto3.client(
         "s3",
@@ -31,29 +34,28 @@ def main() -> None:
         config=Config(s3={"addressing_style": "path"}) if endpoint else None,
         **credentials,
     )
+    s3 = S3Options(
+        region=region,
+        endpoint=endpoint,
+        credentials=Credentials(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
+        ),
+    )
     # endregion configure
     try:
         # region upload
-        with BytesIO() as output:
-            with ArchiveWriter(output) as writer:
-                writer.write_bytes("example.txt", b"Hello from Zstar\n")
-            encoded = output.getvalue()
         key = f"zstar-tutorial/python-{uuid4().hex}.zstar"
-        client.put_object(Bucket=bucket, Key=key, Body=encoded, IfNoneMatch="*")
+        url = f"s3://{bucket}/{key}"
+        with zstar.open(url, options=WriterOptions(sink={"s3": s3}), mode="w") as writer:
+            writer.writestr("example.txt", b"Hello from Zstar\n")
         # endregion upload
         try:
             # region read
-            with Archive.from_s3(
-                bucket,
-                key,
-                region=region,
-                endpoint=endpoint,
-                access_key_id=credentials["aws_access_key_id"],
-                secret_access_key=credentials["aws_secret_access_key"],
-                session_token=credentials["aws_session_token"],
-            ) as archive:
+            with zstar.open(url, options=ReaderOptions(source={"s3": s3})) as archive:
                 content = archive.read("example.txt")
-                selected = archive.read_range("example.txt", 0, 5)
+                selected = archive.read("example.txt", offset=0, length=5)
                 assert content == b"Hello from Zstar\n"
                 assert selected == b"Hello"
                 print(content.decode(), end="")

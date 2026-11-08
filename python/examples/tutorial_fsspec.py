@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["zstar-py>=0.0.1"]
+# dependencies = ["zstar-py[fsspec]>=0.0.1"]
 # ///
 
 """Create an archive and read its members through fsspec."""

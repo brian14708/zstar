@@ -10,7 +10,8 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["fsspec>=2026.9.0", "typing_extensions>=4.16"]
+dependencies = ["typing_extensions>=4.16"]
+
 authors = [{ name = "Brian Li", email = "me@brian14708.dev" }]
 keywords = ["zstd", "tar", "archive", "random-access", "fsspec", "asyncio"]
 classifiers = [
@@ -30,6 +31,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+fsspec = ["fsspec>=2026.9.0"]
+
 [project.urls]
 Homepage = "https://github.com/brian14708/zstar"
 Repository = "https://github.com/brian14708/zstar"
@@ -37,7 +41,7 @@ Issues = "https://github.com/brian14708/zstar/issues"
 Documentation = "https://github.com/brian14708/zstar/tree/main/python"
 
 [project.entry-points."fsspec.specs"]
-zstar = "zstar._fsspec:ZstarFileSystem"
+zstar = "zstar.fsspec:ZstarFileSystem"
 
 [tool.maturin]
 locked = true

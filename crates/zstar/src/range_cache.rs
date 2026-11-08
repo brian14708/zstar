@@ -40,6 +40,34 @@ impl Default for RangeCacheOptions {
         }
     }
 }
+impl RangeCacheOptions {
+    /// Checks interval storage and fetch concurrency settings without source I/O.
+    ///
+    /// # Errors
+    /// Returns an invalid-options error for zero entry/fetch limits or concurrency
+    /// outside one through 1024. Zero cache capacity remains valid.
+    pub const fn validate(&self) -> Result<()> {
+        if self.max_entries == 0 {
+            return Err(Error::InvalidOptions {
+                option: "range_cache.max_entries",
+                reason: "must be positive",
+            });
+        }
+        if self.max_fetch_bytes == 0 {
+            return Err(Error::InvalidOptions {
+                option: "range_cache.max_fetch_bytes",
+                reason: "must be positive",
+            });
+        }
+        if self.max_in_flight == 0 || self.max_in_flight > 1024 {
+            return Err(Error::InvalidOptions {
+                option: "range_cache.max_in_flight",
+                reason: "must be between 1 and 1024",
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Cumulative counters and current retained storage. Counters are approximate
 /// snapshots during concurrent operations and do not include HTTP headers.
@@ -164,12 +192,7 @@ impl<R: AsyncRangeReader + ?Sized> CachedRangeReader<R> {
 
 impl FetchCoordinator {
     fn new(options: RangeCacheOptions) -> Result<Self> {
-        if options.max_entries == 0 || options.max_fetch_bytes == 0 {
-            return Err(Error::Budget("invalid range cache storage limits"));
-        }
-        if !(1..=1024).contains(&options.max_in_flight) {
-            return Err(Error::Budget("invalid range cache concurrency"));
-        }
+        options.validate()?;
         Ok(Self {
             slots: Arc::new(Semaphore::new(options.max_in_flight)),
             options,

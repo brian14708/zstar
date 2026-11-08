@@ -5,19 +5,19 @@
 
 """Write an archive to a file, read its contents."""
 
-from zstar import Archive, ArchiveWriter
+import zstar
 
 
 def main() -> None:
     # region create
-    with ArchiveWriter.from_file("example.zstar") as writer:
-        writer.write_bytes("example.txt", b"Hello from Zstar\n")
+    with zstar.open("example.zstar", mode="w") as writer:
+        writer.writestr("example.txt", b"Hello from Zstar\n")
     # endregion create
 
     # region read
-    with Archive.from_file("example.zstar") as archive:
+    with zstar.open("example.zstar") as archive:
         content = archive.read("example.txt")
-        selected = archive.read_range("example.txt", 0, 5)
+        selected = archive.read("example.txt", offset=0, length=5)
         assert content == b"Hello from Zstar\n"
         assert selected == b"Hello"
         print(content.decode(), end="")

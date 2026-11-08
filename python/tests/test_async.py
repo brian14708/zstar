@@ -1,149 +1,86 @@
-"""The native async reader has the same semantics for bytes and custom sources."""
+"""Async ownership, lazy iteration, and external verification using explicit types."""
 
 import asyncio
 import gc
 import weakref
-from tarfile import TarInfo
 
 import pytest
 import zstar
-from zstar import AsyncArchiveWriter, _native
+from zstar import EntryKind, ReadRequest, ZstarError, _native
+from zstar.types import ReaderOptions
 
 
 @pytest.mark.parametrize("ranged", [False, True])
-def test_async_iteration_reads_reports_and_close(ranged, inline_data, source_factory):
-    data = inline_data
-    source = source_factory(data)
-
-    async def exercise():
-        archive = (
-            await zstar.AsyncArchive.from_source(source, len(data))
+def test_async_iteration_reads_and_close(ranged, inline_data, source_factory):
+    async def run():
+        source = source_factory(inline_data)
+        adapted = (
+            _native.BlockingAdapter(source)
             if ranged
-            else await zstar.AsyncArchive.from_bytes(data)
+            else await _native.AsyncSource.memory(inline_data)
         )
+        archive = await zstar.open(adapted, async_=True)
         async with archive:
-            iterator = archive.members()
-            assert aiter(iterator) is iterator
+            iterator = archive.entries()
             first = await anext(iterator)
-            expected = [name async for name in archive.names()]
-            assert first.name == expected[0]
-            assert (await archive.getinfo(first.name)).name == first.name
-            with pytest.raises(KeyError):
-                await archive.getinfo("missing")
-            assert await archive.entry_count == len(expected)
-            assert [first.name] + [entry.name async for entry in iterator] == expected
-            assert [entry async for entry in iterator] == []
-            assert source.calls == (4 if ranged else 0)  # Open plus complete metadata scan.
-            assert await archive.read_many([("a-b", 0, 2), ("a-b", 1, 4)]) == [b"he", b"ello"]
-            assert await archive.read("a-b", 1, 4) == b"ello"
-            payload, report = await archive.read_with_report("a-b", 0, 5)
-            assert payload == b"hello"
-            assert report["metadata_validated"] and report["data_frames_checked"]
-            pending = archive.members()
+            expected = [entry.path async for entry in archive]
+            assert (await archive.entry(first.path)).path == first.path
+            assert [first.path] + [entry.path async for entry in iterator] == expected
+            assert await archive.read_many(
+                [ReadRequest("a-b", 0, 2), ReadRequest("a-b", 1, 4)]
+            ) == [b"he", b"ello"]
+            result = await archive.read("a-b", offset=0, length=5)
+            assert result == b"hello"
+            pending = archive.entries()
         assert not source.closed
         await archive.close()
         with pytest.raises(ValueError, match="closed"):
             await anext(pending)
-        with pytest.raises(ValueError, match="closed"):
-            await archive.read("a-b")
-        with pytest.raises(ValueError, match="closed"):
-            async with archive:
-                pass
 
-    asyncio.run(exercise())
+    asyncio.run(run())
 
 
-def test_async_open_validates_metadata_and_reads_check_selected_content(corpus_dir):
-    data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
+def test_async_close_releases_source_even_with_outstanding_iterator(source_factory):
+    async def run():
+        source = source_factory()
+        reference = weakref.ref(source)
+        archive = await zstar.open(_native.BlockingAdapter(source), async_=True)
+        pending = archive.entries()
+        del source
+        assert reference() is not None
+        await archive.close()
+        gc.collect()
+        assert reference() is None
+        with pytest.raises(ValueError):
+            await anext(pending)
 
-    async def exercise():
-        async with await zstar.AsyncArchive.from_bytes(data) as archive:
-            assert (await archive.getinfo("a-b")).isfile()
-            with pytest.raises(zstar.ZstarError) as caught:
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_async_external_verification(verify, thin_data, object_resolver):
+    async def run():
+        options = ReaderOptions(
+            verify_external=verify, resolver=_native.BlockingAdapter(object_resolver)
+        )
+        async with zstar.open(
+            await _native.AsyncSource.memory(thin_data), options=options, async_=True
+        ) as archive:
+            result = await archive.read("hello.txt", offset=0, length=6)
+            assert result == b"hello\n"
+
+    asyncio.run(run())
+
+
+def test_lazy_open_does_not_validate_unselected_content(corpus_dir):
+    async def run():
+        async with (
+            await _native.aopen_source(str(corpus_dir / "invalid/data-checksum.zstar")) as source,
+            await zstar.open(source, async_=True) as archive,
+        ):
+            assert (await archive.entry("a-b")).kind is EntryKind.FILE
+            with pytest.raises(ZstarError) as caught:
                 await archive.read("a-b")
             assert caught.value.category == "integrity-failure"
 
-    asyncio.run(exercise())
-
-
-def test_async_close_releases_source_even_with_an_outstanding_iterator(source_factory):
-    async def exercise():
-        data = _native.pack_file("x", b"hello")
-        source = source_factory(data)
-        borrowed = weakref.ref(source)
-        archive = await zstar.AsyncArchive.from_source(source, len(data))
-        iterator = archive.members()
-        del source
-        assert borrowed() is not None
-        await archive.close()
-        gc.collect()
-        assert borrowed() is None
-        with pytest.raises(ValueError, match="closed"):
-            await anext(iterator)
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize("ranged", [False, True])
-@pytest.mark.parametrize("verify_external", [True, False])
-def test_async_resolvers_and_verification_policy(
-    ranged, verify_external, thin_data, source_factory, object_resolver
-):
-    async def open_archive(**options):
-        if ranged:
-            return await zstar.AsyncArchive.from_source(
-                source_factory(thin_data), len(thin_data), **options
-            )
-        return await zstar.AsyncArchive.from_bytes(thin_data, **options)
-
-    async def exercise():
-        async with await open_archive(
-            resolver=object_resolver, verify_external=verify_external
-        ) as archive:
-            assert await archive.read("hello.txt") == b"hello\n"
-
-        async with await open_archive(verify_external=verify_external) as archive:
-            assert await archive.read("world.txt", resolver=object_resolver) == b"world\n"
-
-    asyncio.run(exercise())
-
-
-def test_async_chunks_errors_and_factories(tmp_path):
-    path = tmp_path / "archive.zstar"
-
-    async def exercise():
-        context = await AsyncArchiveWriter.from_file(path, "x")
-        async with context as writer:
-            directory = TarInfo("dir")
-            directory.type = b"5"
-            await writer.addfile(directory)
-            await writer.write_bytes("dir/file", b"hello world", mode=0o640)
-        reader_context = await zstar.AsyncArchive.from_file(path, max_read_bytes=3)
-        async with reader_context as archive:
-            assert (await archive.getinfo("dir/file")).mode == 0o640
-            with pytest.raises(IsADirectoryError):
-                async with archive.open("dir"):
-                    pass
-            with pytest.raises(KeyError):
-                async with archive.open("missing"):
-                    pass
-            async with archive.open("dir/file") as member:
-                assert await member.read(2) == b"he"
-                assert [chunk async for chunk in member.iter_chunks(100)] == [
-                    b"llo",
-                    b" wo",
-                    b"rld",
-                ]
-                assert [chunk async for chunk in member.iter_chunks()] == []
-                await member.seek(0)
-                for size in (0, -1):
-                    with pytest.raises(ValueError, match="positive"):
-                        await anext(member.iter_chunks(size))
-                with pytest.raises(TypeError):
-                    await anext(member.iter_chunks(1.5))
-            assert member.closed and not archive.closed
-            with pytest.raises(ValueError, match="closed"):
-                await anext(member.iter_chunks())
-        assert archive.closed
-
-    asyncio.run(exercise())
+    asyncio.run(run())

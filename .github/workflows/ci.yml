@@ -79,7 +79,7 @@ jobs:
           python -m pip install uv==0.13.1
           uv sync --locked --package zstar-py --group test --no-editable --python "$(python -c 'import sys; print(sys.executable)')"
           env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml --search-path python/src python/src/zstar
-          env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml python/tests/typing_api.py
+          env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml python/tests/typing_api.py python/tests/typing_core.py
           uv run --no-sync python -I -m pytest python/tests
 
   integration:

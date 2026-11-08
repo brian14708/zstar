@@ -14,7 +14,8 @@ lint: prepare-python
     golangci-lint run ./...
     go vet ./...
     env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml --search-path python/src python/src/zstar
-    env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml python/tests/typing_api.py
+    env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --python-platform win32 --min-severity=warn --config python/pyproject.toml --search-path python/src python/src/zstar
+    env -u PYTHONPATH uv run --no-sync python -I -m pyrefly check --min-severity=warn --config python/pyproject.toml python/tests/typing_api.py python/tests/typing_core.py
 
 check: prepare-python
     cargo test --locked --workspace --all-features

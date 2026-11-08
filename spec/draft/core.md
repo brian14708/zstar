@@ -6,8 +6,7 @@ This specification defines Zstar's self-contained indexed archive format: a tar
 stream in independent Zstandard frames, with deterministic CBOR metadata.
 It covers the core wire format, validation, and implementation profiles.
 Core archives contain all file content. Optional extensions build on this
-format, such as [external content](external-content.md) for external-object
-references and reconstruction.
+format.
 
 [Wire format](#wire-format) · [Validation](#validation-and-failures) ·
 [Profiles](#implementation-profiles) · [Security](#security-considerations) ·
@@ -35,9 +34,8 @@ Unknown required features MUST be rejected while validating the directory,
 before any indexed entry use.
 
 An operation establishes only the checks it completes. Metadata validation and
-selective reads do not establish full archive validity, content authenticity,
-or availability of extension dependencies. Implementations MUST NOT claim checks
-they did not complete.
+selective reads do not establish full archive validity or content authenticity.
+Implementations MUST NOT claim checks they did not complete.
 Rejection requirements apply to the structures and dependencies being
 validated; selective readers need not inspect unrelated entry pages, optional
 extension pages, or tar regions.
@@ -61,7 +59,7 @@ Byte positions use four coordinates:
 | Encoded archive position | Byte zero of the archive; derived manifest offsets and integer extent sources use this coordinate. |
 | Metadata-relative position | Metadata start `T`; entry-page and extension-page offsets use this coordinate. |
 | Decoded tar position | Byte zero of the concatenated data-frame output; member headers, payloads and physical coverage use this coordinate. |
-| Decoded source selection | Byte zero of one complete decoded frame or object; an extent's optional `offset` uses this coordinate. |
+| Decoded source selection | Byte zero of one complete decoded data frame; an extent's optional `offset` uses this coordinate. |
 
 A file-read offset addresses the logical bytes formed by concatenating that
 file's extent selections.
@@ -89,8 +87,8 @@ frames or gaps are permitted.
 
 Each data frame or metadata wrapper payload contains exactly one
 independently decodable Zstandard frame. Skippable frames, concatenated frames,
-trailing bytes, and external dictionaries are forbidden within a source range.
-Dictionary IDs MUST be absent or zero.
+and trailing bytes are forbidden within a source range. Dictionary compression
+is forbidden; dictionary IDs MUST be absent or zero.
 
 The format sets no fixed encoded-frame, decoded-frame, or window byte limit.
 Encoded and decoded lengths MUST fit uint64. Readers and writers MAY impose
@@ -171,7 +169,6 @@ complete metadata or physical archive validity. A filename extension or media
 type is insufficient. Use `application/zstd`; generic
 `application/octet-stream` is acceptable. No Zstar media type is registered.
 Ordinary Zstandard/tar tools decode the tar stream and skip metadata wrappers.
-Thin-content resolution follows the [external-content extension](external-content.md).
 
 ### Tar profile
 
@@ -223,8 +220,7 @@ syntax, but need not equal their PAX values.
 
 Apply PAX overrides before locating payloads or comparing with the manifest.
 The effective path, kind, mode, uid, gid, mtime, and symlink target MUST match
-the manifest entry. Core file size equals the extent sum. Extensions define any
-alternative payload representation and its agreement with the manifest.
+the manifest entry. File size equals the extent sum.
 
 Effective tar directory names have exactly one trailing `/`; remove it before
 comparing with the manifest path. Directory and symlink effective sizes MUST be
@@ -261,7 +257,7 @@ symlink entries. Automatic symlink resolution is outside this profile.
 The manifest consists of entry pages, optional extension pages, and one flat
 directory. The [manifest schema](#manifest-schema) defines their CBOR structures.
 Pages are independently usable decoding/cache units. There is no recursive
-index, enclosing CBOR sequence, or global content-frame or object table.
+index, enclosing CBOR sequence, or global content-frame table.
 
 #### Directory and page references
 
@@ -416,15 +412,14 @@ The optional `attributes` map holds extension fields and symlink targets.
 `linkname` is required for symlinks and forbidden otherwise; it preserves the
 exact effective symlink target. Other attribute names MUST start with `x-`. An
 empty attributes map MUST be omitted. Directories, symlinks, and empty files
-have empty extents. Empty files remain inline. The logical size of a file is
-the checked sum of its extent sizes.
+have empty extents. The logical size of a file is the checked sum of its extent
+sizes.
 
 The manifest does not retain header offsets, header-sequence lengths, physical
 payload sizes, owner/group display names, prefix splits, or file digests.
 Reconstruction generates equivalent tar/PAX metadata with new headers,
-checksums, and padding; it need not reproduce the original header bytes. Inline
-physical payload size equals logical size. Extensions define the physical
-payload sizes of their alternative representations.
+checksums, and padding; it need not reproduce the original header bytes.
+Physical payload size equals logical size.
 
 #### Extents
 
@@ -451,11 +446,6 @@ established by full validation. Multiple members may share a frame, and a
 member may span frames. Source validation follows the [frame
 requirements](#zstandard-frame-requirements).
 
-The [external-content extension](external-content.md) adds object-address
-sources, advisory encoded sizes, and pointer payloads. These representations
-are valid only with the required extension declaration. See
-[Security](#security-considerations) for integrity guarantees.
-
 #### Derived values and coverage
 
 These values are derived, not additional manifest fields:
@@ -463,7 +453,7 @@ These values are derived, not additional manifest fields:
 | Value | Definition |
 | --- | --- |
 | `logical_size(entry)` | Checked sum of decoded extent `size` values; zero for directories/symlinks. |
-| `physical_size(member)` | Effective tar size after PAX overrides: logical file bytes in core, extension-defined bytes for alternative representations, zero for other kinds. |
+| `physical_size(member)` | Effective tar size after PAX overrides: logical file size for regular files, zero for other kinds. |
 | `effective_header_size(member)` | 512 bytes, or 512-byte local PAX header + its padded payload + the 512-byte member header. |
 | `payload_offset(member)` | Decoded member start + effective header size. |
 | `member_end(member)` | Payload offset + `roundUp(physical_size, 512)`. |
@@ -477,21 +467,20 @@ zero bytes follow the final member (or start at decoded zero for an empty
 archive), and their end equals the sum of all `d_i`. There are no undecoded
 gaps or trailing physical bytes.
 
-For an inline extent selecting frame `i`, its decoded interval is `[D_i +
+For an extent selecting frame `i`, its decoded interval is `[D_i +
 offset, D_i + offset + size)`. In logical order, those intervals MUST cover
 exactly that member's physical payload, without reordering, overlap, gaps, or
 another member's bytes. Selective reads check metadata and fetched-source bounds
 without establishing physical membership.
 
-Aggregate logical content is the sum of each regular file's logical size,
-including any content reused through extensions. It is not a stored field.
-Implementations using bounded integers MUST detect and report counter overflow.
+Aggregate logical content is the sum of each regular file's logical size.
+It is not a stored field. Implementations using bounded integers MUST detect
+and report counter overflow.
 
 ### Extensions and versions
 
 The footer signature is `Z*01` and the directory version is exactly 1. Reject
-other core versions. Extensions define their own version markers; independent
-formats such as standalone external references need not share the core number.
+other core versions. Extensions define their own version markers.
 
 Core extension points are directory fields, entry-page fields, page-reference
 attributes, entry attributes, and named extension-page groups. Extension field
@@ -547,7 +536,7 @@ The directory's exact contiguous coverage makes this a linear page scan;
 no recursive node traversal or visited-page set is required.
 
 Reject unsupported versions, unknown required semantics, malformed data,
-overflows, and digest mismatches within the operation's scope. A failed required
+overflows, and checksum mismatches within the operation's scope. A failed required
 check stops the operation. A failed Zstar check MUST NOT silently fall back to
 unverified tar extraction. Snapshot, provenance, and ownership rules follow the
 [reader profile](#reader-implementation-profile).
@@ -567,9 +556,6 @@ hide malformed metadata until the affected page or all metadata is validated.
 Callers requiring complete conformance before any result MUST complete metadata
 validation first; a selective reader MUST NOT claim that guarantee at open.
 
-External source validation and pointer agreement are defined
-by the [external-content extension](external-content.md#validation-and-conformance).
-
 #### File reads
 
 For a file request `(offset, length)`, compute logical size by checked extent
@@ -581,7 +567,7 @@ checks, and any extension metadata needed to establish the request's validity.
 It does not require validating unrelated metadata pages.
 
 Use cumulative extent sizes to locate only sources intersecting the request.
-Decode each complete fetched source under its source-kind rules. Check each
+Decode each complete fetched data frame under the frame requirements. Check each
 complete declared selection against the actual decoded length, then return the
 requested bytes in logical order. A complete-file read does not establish a
 whole-file hash.
@@ -590,10 +576,9 @@ whole-file hash.
 
 Directory validation, required selected-page validation, and Zstandard frame
 checksum checks cannot be disabled. Complete metadata validation is an explicit
-scope and MUST NOT be inferred from directory validation or selected reads. Extensions
-define verification of their external dependencies. Checksums detect corruption,
-not authenticity. Core stores no cryptographic digest of its metadata or
-complete encoded bytes.
+scope and MUST NOT be inferred from directory validation or selected reads.
+Checksums detect corruption, not authenticity. Core stores no cryptographic
+digest of its metadata or complete encoded bytes.
 
 ### Failure classes
 
@@ -602,7 +587,7 @@ unsupported core versions, unsupported required semantics, integrity failure,
 missing required content, transport failure or unavailable content, invalid
 logical requests, and local budget rejection. SDKs choose their exception
 names. Violating a wire limit makes input malformed; exceeding a lower local
-budget may reject valid input. A hash or checksum mismatch is an integrity
+budget may reject valid input. A checksum mismatch is an integrity
 failure when distinguishable from a codec structure error.
 
 Recognition, directory validation, and required-feature checks precede
@@ -627,7 +612,7 @@ write tar members in insertion order. Writers MAY require input entries in
 strict UTF-8 path order; such APIs MUST document and enforce this requirement.
 Arbitrary-order APIs MUST sort manifest entries before emission. All writers
 MUST emit the sorted manifest and reject duplicates, invalid ancestors, and
-required-feature disagreement. For known-size inline input, writers SHOULD
+required-feature disagreement. For known-size file input, writers SHOULD
 reject entries that cannot fit configured entry-byte or extent-count budgets
 before consuming the payload, using the configured frame size. Writers SHOULD
 stream payloads through bounded frame buffers and spill finalized records when
@@ -641,10 +626,9 @@ to determine compressed wrapper lengths. Extension pages MUST precede the
 directory in their prescribed order. Writers need not seek or rewrite emitted
 content; implementations MUST budget descriptor/page spools as well as data.
 
-Explicit storage choices MUST be honored or reported as conflicts; portable
-members cannot be silently externalized. Optimization hints may be declined
-with diagnostics but cannot silently change capture scope. Filesystem
-operations follow the [filesystem
+Explicit storage choices MUST be honored or reported as conflicts.
+Optimization hints may be declined with diagnostics but cannot silently change
+capture scope. Filesystem operations follow the [filesystem
 profile](#filesystem-capture-and-restoration-profile).
 
 ### Reader implementation profile
@@ -661,8 +645,9 @@ strong ETags with conditional reads.
 
 #### Cache ownership
 
-Cache capacity includes retained payloads and bookkeeping. APIs SHOULD document
-separate memory held by streams, entries, and returned buffers. Returned bytes
+Caches MUST bound retained payloads and bookkeeping, either within one capacity
+or with separate byte and entry limits. APIs SHOULD document capacity accounting
+and separate memory held by streams, entries, and returned buffers. Returned bytes
 MUST survive eviction; callbacks MUST NOT alter verified bytes or proofs.
 
 #### Temporary storage and cancellation
@@ -778,10 +763,9 @@ data-frame boundaries or physical membership.
 Zstandard frame checksums detect corruption, not publisher authenticity. They
 do not cryptographically bind the directory to referenced pages or prevent
 replacement of intact frames. Length and schema checks do not replace an
-aggregate integrity check. Inline bytes have codec
-checksums, not a cryptographic manifest binding. The external-content
-extension defines content-address verification for external objects. Core
-archives contain no cryptographic digest of the complete encoded archive.
+aggregate integrity check. File content has codec checksums, not a cryptographic
+manifest binding. Core archives contain no cryptographic digest of the complete
+encoded archive.
 
 Archive replacement MUST follow the snapshot contract. Follow the [filesystem
 profile](#filesystem-capture-and-restoration-profile) against traversal,
@@ -888,4 +872,3 @@ pax-mtime = [%s"-"] 1*DIGIT [%s"." 1*DIGIT]
 - [RFC 5234: ABNF](https://www.rfc-editor.org/rfc/rfc5234)
 - [RFC 7405: case-sensitive ABNF literals](https://www.rfc-editor.org/rfc/rfc7405)
 - [RFC 8610: CDDL](https://www.rfc-editor.org/rfc/rfc8610)
-- [FIPS 180-4: SHA-256](https://doi.org/10.6028/NIST.FIPS.180-4)

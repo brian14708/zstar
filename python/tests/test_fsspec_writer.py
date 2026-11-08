@@ -3,15 +3,18 @@
 import asyncio
 import io
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import fsspec
 import pytest
 import zstar
+from _support import open_bytes, open_file
 from fsspec.asyn import AsyncFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractBufferedFile
-from zstar import ZstarFileSystem
+from zstar.fsspec import ZstarFileSystem
+from zstar.types import Limits, WriterOptions
 
 
 def test_write_text_seek_directories_and_round_trip(tmp_path):
@@ -25,17 +28,26 @@ def test_write_text_seek_directories_and_round_trip(tmp_path):
             assert member.seek(1) == 1
             assert member.write(b"a") == 1
             assert member.tell() == 2
-        assert fs.ls("nested", detail=False) == ["nested/data.txt"]
-        assert fs.info("seek.bin")["size"] == 5
-        assert fs.isdir("empty")
+        # Staged metadata is available without warnings.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            assert fs.ls("nested", detail=False) == ["nested/data.txt"]
+            assert fs.ls("nested") == [{"name": "nested/data.txt", "size": 6, "type": "file"}]
+            assert fs.info("seek.bin") == {"name": "seek.bin", "size": 5, "type": "file"}
+            assert fs.isdir("empty")
         with pytest.raises(PermissionError):
             fs.cat_file("seek.bin")
     assert member.closed
     with ZstarFileSystem(fo=archive) as fs:
         assert fs.cat_file("nested/data.txt") == "h\u00e9llo".encode()
         assert fs.cat_file("seek.bin") == b"hallo"
-    with zstar.Archive.from_file(archive) as reader:
-        assert list(reader.names()) == ["empty", "nested", "nested/data.txt", "seek.bin"]
+    with open_file(archive) as reader:
+        assert [entry.path for entry in reader.entries()] == [
+            "empty",
+            "nested",
+            "nested/data.txt",
+            "seek.bin",
+        ]
 
 
 def test_empty_archive_close_and_closed_operations(tmp_path):
@@ -43,8 +55,8 @@ def test_empty_archive_close_and_closed_operations(tmp_path):
     fs = ZstarFileSystem(fo=path, mode="w")
     fs.close()
     fs.close()
-    with zstar.Archive.from_file(path) as reader:
-        assert list(reader.names()) == []
+    with open_file(path) as reader:
+        assert [entry.path for entry in reader.entries()] == []
     with pytest.raises(ValueError, match="closed"):
         fs.open("x", "wb")
     with pytest.raises(ValueError, match="closed"):
@@ -83,7 +95,7 @@ def test_put_recursive_uses_standard_filesystem_operations(tmp_path):
     (source / "nested/b.txt").write_bytes(b"b")
     with ZstarFileSystem(fo=tmp_path / "archive", mode="w") as fs:
         fs.put(str(source) + "/", "data", recursive=True)
-    with zstar.Archive.from_file(tmp_path / "archive") as reader:
+    with open_file(tmp_path / "archive") as reader:
         assert reader.read("data/a.txt") == b"a"
         assert reader.read("data/nested/b.txt") == b"b"
 
@@ -105,8 +117,8 @@ def test_bulk_write_modes_and_protocol_paths(tmp_path):
         for operation, args in ((fs.put_file, (str(source), "bad")), (fs.pipe_file, ("bad", b"x"))):
             with pytest.raises(NotImplementedError):
                 operation(*args, mode="append")
-    with zstar.Archive.from_file(path) as archive:
-        assert list(archive.names()) == [
+    with open_file(path) as archive:
+        assert [entry.path for entry in archive.entries()] == [
             "dir",
             "dir/bytes",
             "dir/local",
@@ -244,7 +256,7 @@ def test_publication_preserves_commit_and_cleanup_errors(tmp_path, external):
     path.write_bytes(b"original")
     objects = fsspec.filesystem("dir", path=str(tmp_path / "objects"), fs=backend)
     with (
-        pytest.raises(zstar.ZstarError if external else ExceptionGroup) as caught,
+        pytest.raises(ExceptionGroup) as caught,
         ZstarFileSystem(
             fo=path,
             fs=None if external else backend,
@@ -254,7 +266,7 @@ def test_publication_preserves_commit_and_cleanup_errors(tmp_path, external):
         ) as fs,
     ):
         fs.pipe_file("data", b"hello")
-    failure = caught.value.__cause__ if external else caught.value
+    failure = caught.value
     assert isinstance(failure, ExceptionGroup)
     assert failure.exceptions == (commit_error, cleanup_error)
     assert path.read_bytes() == b"original"
@@ -298,7 +310,10 @@ def test_member_failure_cannot_be_committed(tmp_path):
 def test_memory_backend_and_writer_options():
     backend = fsspec.filesystem("memory")
     with ZstarFileSystem(
-        fo="/writer-test/output.zstar", fs=backend, mode="w", writer_options={"frame_size": 1 << 16}
+        fo="/writer-test/output.zstar",
+        fs=backend,
+        mode="w",
+        options=WriterOptions(frame_size=1 << 16),
     ) as fs:
         fs.pipe_file("dir/x", b"hello world")
     with ZstarFileSystem(fo="/writer-test/output.zstar", fs=backend) as fs:
@@ -452,7 +467,7 @@ def test_external_upload_failure_preserves_archive(tmp_path):
         "dir", path=str(tmp_path / "objects"), fs=BrokenObjects(skip_instance_cache=True)
     )
     with (
-        pytest.raises(zstar.ZstarError, match="external object upload failed"),
+        pytest.raises(OSError, match="object upload failed"),
         ZstarFileSystem(fo=path, mode="w", external=objects, external_threshold=0) as fs,
     ):
         fs.pipe_file("bad", b"not uploaded")
@@ -523,7 +538,7 @@ def test_async_backend_sink_runs_on_owner_loop():
         ):
             await member.write(b"hello")
         assert backend.closed
-        with zstar.Archive(bytes(backend.output)) as reader:
+        with open_bytes(bytes(backend.output)) as reader:
             assert reader.read("x") == b"hello"
 
     asyncio.run(exercise())
@@ -551,7 +566,7 @@ def test_writer_callbacks_run_off_async_loop():
 
     asyncio.run(exercise())
     assert sink.closed
-    with zstar.Archive(sink.archive) as reader:
+    with open_bytes(sink.archive) as reader:
         assert reader.read("x") == b"hello"
 
 
@@ -566,7 +581,7 @@ def test_shared_writer_serializes_parallel_known_size_members(tmp_path):
             for future in futures:
                 future.result(timeout=10)
         assert len(fs.find("")) == 12
-    with zstar.Archive.from_file(path) as archive:
+    with open_file(path) as archive:
         for index in range(12):
             assert archive.read(f"dir{index % 3}/file{index}") == bytes([index]) * 2000
 
@@ -602,3 +617,134 @@ def test_member_emission_and_spool_cleanup_errors_are_preserved(tmp_path, monkey
     with pytest.raises(ValueError, match="writer failed"):
         fs.close()
     assert path.read_bytes() == b"original"
+
+
+def test_external_limits_match_direct_async_writer(tmp_path):
+    payload = b"x" * 2048
+    options = WriterOptions(frame_size=512, limits=Limits(max_frame_decoded_bytes=1024))
+    uploads = []
+
+    class Objects:
+        async def put_encoded(self, address, encoded, raw_size):
+            uploads.append(address)
+            return len(encoded)
+
+    async def chunks():
+        yield payload
+
+    async def run():
+        direct = await zstar.open(
+            zstar._native.BlockingAdapter(io.BytesIO()), options=options, mode="w", async_=True
+        )
+        with pytest.raises(zstar.ZstarError) as direct_error:
+            await direct.add_external(zstar.Header.file("data", len(payload)), chunks(), Objects())
+        await direct.abort()
+        assert uploads == []
+
+        fs = ZstarFileSystem(
+            fo=tmp_path / "archive",
+            mode="w",
+            asynchronous=True,
+            external=(tmp_path / "objects").as_uri(),
+            external_threshold=0,
+            options=options,
+        )
+        with pytest.raises(zstar.ZstarError) as integrated_error:
+            async with fs:
+                await fs._pipe_file("data", payload)
+        assert direct_error.value.category == integrated_error.value.category == "resource-limit"
+        assert not (tmp_path / "archive").exists()
+        assert not list((tmp_path / "objects").glob("*.zst"))
+
+    asyncio.run(run())
+
+
+def test_cancelled_external_write_drains_async_store_before_discard(tmp_path):
+    async def run():
+        entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class Objects(AsyncFileSystem):
+            async def _info(self, path, **kwargs):
+                raise FileNotFoundError(path)
+
+            async def _pipe_file(self, path, value, **kwargs):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelling.set()
+                    await release.wait()
+
+        fs = ZstarFileSystem(
+            fo=tmp_path / "archive",
+            mode="w",
+            asynchronous=True,
+            external=Objects(asynchronous=True, skip_instance_cache=True),
+            external_threshold=0,
+        )
+        with pytest.raises(ValueError, match="writer failed"):
+            async with fs:
+                writing = asyncio.create_task(fs._pipe_file("data", b"hello"))
+                await asyncio.wait_for(entered.wait(), 2)
+                writing.cancel()
+                try:
+                    await asyncio.wait_for(cancelling.wait(), 2)
+                    assert not writing.done()
+                finally:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writing, 2)
+        assert not (tmp_path / "archive").exists()
+
+    asyncio.run(run())
+
+
+def test_cancelled_external_output_acquisition_discards_transaction(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    discarded = []
+
+    class Objects(LocalFileSystem):
+        def _open(self, path, mode="rb", **kwargs):
+            output = super()._open(path, mode, **kwargs)
+            if "w" in mode:
+                discard = output.discard
+
+                def discard_output():
+                    assert output.closed
+                    discard()
+                    discarded.append(path)
+
+                output.discard = discard_output
+                entered.set()
+                assert release.wait(5)
+            return output
+
+    async def run():
+        fs = ZstarFileSystem(
+            fo=tmp_path / "archive",
+            mode="w",
+            asynchronous=True,
+            external=fsspec.filesystem(
+                "dir", path=str(tmp_path / "objects"), fs=Objects(skip_instance_cache=True)
+            ),
+            external_threshold=0,
+        )
+        with pytest.raises(ValueError, match="writer failed"):
+            async with fs:
+                writing = asyncio.create_task(fs._pipe_file("data", b"hello"))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 2)
+                    writing.cancel()
+                    await asyncio.sleep(0)
+                finally:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(writing, 2)
+        assert len(discarded) == 1
+        assert not (tmp_path / "archive").exists()
+        assert not list((tmp_path / "objects").glob("*.zst"))
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()

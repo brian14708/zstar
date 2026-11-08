@@ -88,6 +88,8 @@ func (r *Reader) RootExtensions() Extensions { return r.manifest.RootExtensions(
 
 // Entries yields owned entries whose paths begin with prefix, in path order.
 // Use "dir/" for descendants or "" for all entries. Stop on a nonnil error.
+// Iteration validates all metadata before yielding and retains the complete index
+// until Close, even for a prefix. Use Entry for selective lookup.
 func (r *Reader) Entries(prefix string) iter.Seq2[Entry, error] {
 	return func(yield func(Entry, error) bool) {
 		if r.manifest.paged != nil {

@@ -1,4 +1,4 @@
-//! Native S3-compatible storage and verified external objects.
+//! Native S3-compatible storage and content-addressed external objects.
 //!
 //! Conditional archive ranges pin snapshots. Storage keys are adapter policy,
 //! never wire-format fields.
@@ -10,9 +10,10 @@
 //!
 //! [`S3RangeSource`](crate::s3::S3RangeSource) pins object size and version
 //! validators for conditional range reads. [`S3BlobStore`](crate::s3::S3BlobStore)
-//! stores complete independently compressed, content-addressed objects and
-//! verifies their decoded SHA-256. Keys, credentials, and endpoints stay
-//! outside the archive format.
+//! stores and fetches complete independently compressed, content-addressed objects.
+//! The archive reader decodes them and verifies decoded SHA-256 when
+//! [`ReaderOptions::verify_external`](crate::ReaderOptions::verify_external) is enabled.
+//! Keys, credentials, and endpoints stay outside the archive format.
 
 use crate::{AsyncRangeReader, Digest, Error, Extent, Result, Source};
 use bytes::{Bytes, BytesMut};
@@ -26,6 +27,9 @@ use tokio::sync::{OnceCell, Semaphore};
 
 pub use object_store;
 pub use object_store::{aws::AmazonS3, path::Path};
+
+mod upload;
+pub use upload::{ArchiveUpload, MIN_PART_BYTES, UploadCleanupError, UploadMode};
 
 /// Explicit S3 configuration for the core adapter.
 ///
@@ -274,7 +278,10 @@ impl S3RangeSource {
             .get_or_try_init(|| async {
                 let suffix = self.max_range_bytes.min(128 << 10);
                 if suffix == 0 {
-                    return Err(Error::Budget("S3 range size"));
+                    return Err(crate::Error::budget(
+                        crate::BudgetResource::RangeBytes,
+                        "S3 range size",
+                    ));
                 }
                 let result = self
                     .store
@@ -349,7 +356,10 @@ impl AsyncRangeReader for S3RangeSource {
             return Ok(Bytes::new());
         }
         if range.end - range.start > self.max_range_bytes {
-            return Err(Error::Budget("S3 range size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::RangeBytes,
+                "S3 range size",
+            ));
         }
         let tail_start = meta.size - pinned.tail.len() as u64;
         if range.start >= tail_start {
@@ -400,15 +410,23 @@ impl AsyncRangeReader for S3RangeSource {
 pub(crate) async fn read_exact(result: GetResult, count: u64) -> Result<Bytes> {
     use futures_util::StreamExt;
     let mut stream = result.into_stream();
-    let count = usize::try_from(count).map_err(|_| Error::Budget("S3 response size"))?;
+    let count = usize::try_from(count).map_err(|_| {
+        crate::Error::budget(crate::BudgetResource::ResponseBytes, "S3 response size")
+    })?;
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(count)
-        .map_err(|_| Error::Budget("S3 response allocation"))?;
+    bytes.try_reserve_exact(count).map_err(|_| {
+        crate::Error::budget(
+            crate::BudgetResource::AllocationBytes,
+            "S3 response allocation",
+        )
+    })?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(storage_error)?;
         if chunk.len() > count - bytes.len() {
-            return Err(Error::Budget("oversized storage response"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::ResponseBytes,
+                "oversized storage response",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -469,9 +487,9 @@ impl S3BlobStore {
             .permits
             .acquire()
             .await
-            .map_err(|_| Error::Budget("object store closed"))?;
-        // Content addresses are verified by the reader, so a single bounded
-        // GET suffices without a separate metadata probe or version pin.
+            .map_err(|_| Error::Unsupported("object store closed"))?;
+        // Fetch the complete immutable object in one bounded GET. Decoding and
+        // optional content-address verification belong to the reader.
         let result = match self.store.get(&(self.key)(digest)).await {
             Err(object_store::Error::NotFound { .. }) => {
                 return Err(Error::MissingObject(digest));
@@ -480,7 +498,10 @@ impl S3BlobStore {
         };
         let size = result.meta.size;
         if size == 0 || size > limit {
-            return Err(Error::Budget("encoded object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::EncodedObjectBytes,
+                "encoded object size",
+            ));
         }
         if result.range != (0..size) {
             return Err(Error::MalformedFrame(
@@ -496,14 +517,17 @@ impl S3BlobStore {
     )]
     pub async fn put(&self, raw: Bytes) -> Result<Extent> {
         if raw.is_empty() {
-            return Err(Error::Budget("external object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::ExternalObjectBytes,
+                "external object size",
+            ));
         }
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| Error::Budget("object store closed"))?;
+            .map_err(|_| Error::Unsupported("object store closed"))?;
         let raw_for_digest = raw.clone();
         let (digest, permit) = tokio::task::spawn_blocking(move || {
             (*Digest::sha256(&raw_for_digest).as_bytes(), permit)
@@ -512,9 +536,9 @@ impl S3BlobStore {
         .map_err(|_| Error::Io(std::io::Error::other("object hasher failed")))?;
         let path = (self.key)(digest);
         // Keys are content addresses: an existing non-empty object under this
-        // key is the same content, so skip the encode and upload. Its size is
-        // only a hint (another encoder may have written it); readers always
-        // decode and verify the SHA-256, so a damaged object fails loudly.
+        // key is assumed to hold the same content, so skip the encode and upload.
+        // Its size is only a hint (another encoder may have written it). Readers
+        // decode it and check SHA-256 when verify_external is enabled.
         match self.store.head(&path).await {
             Ok(meta) if meta.size > 0 => {
                 drop(permit);
@@ -525,7 +549,12 @@ impl S3BlobStore {
                     offset: 0,
                 });
             }
-            Ok(_) => return Err(Error::Budget("encoded object size")),
+            Ok(_) => {
+                return Err(crate::Error::budget(
+                    crate::BudgetResource::EncodedObjectBytes,
+                    "encoded object size",
+                ));
+            }
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(storage_error(error)),
         }
@@ -555,7 +584,10 @@ impl S3BlobStore {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let meta = self.store.head(&path).await.map_err(storage_error)?;
                 if meta.size == 0 {
-                    return Err(Error::Budget("encoded object size"));
+                    return Err(crate::Error::budget(
+                        crate::BudgetResource::EncodedObjectBytes,
+                        "encoded object size",
+                    ));
                 }
                 meta.size
             }

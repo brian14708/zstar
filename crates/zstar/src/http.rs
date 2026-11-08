@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 pub(crate) const ZSTD_CONTENT_TYPE: &str = "application/zstd";
 pub(crate) const MUTABLE_CACHE_CONTROL: &str = "private, no-cache, no-transform";
+#[cfg(feature = "s3")]
 pub(crate) const IMMUTABLE_CACHE_CONTROL: &str =
     "private, max-age=31536000, immutable, no-transform";
 
@@ -174,19 +175,31 @@ fn map_conditional(error: std::io::Error, condition: Option<(&str, &str)>) -> st
         _ => error,
     }
 }
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Ownership matches the public API or asynchronous boundary."
-)]
 fn provider_failure(error: std::io::Error) -> std::io::Error {
     // Provider implementations may include signed URLs or credentials in
     // their error text. Preserve cancellation-like kinds for callers while
-    // replacing the message and all other implementation details.
-    match error.kind() {
-        std::io::ErrorKind::Interrupted | std::io::ErrorKind::TimedOut => {
-            std::io::Error::new(error.kind(), "zstar: presigned provider failed")
-        }
-        _ => std::io::Error::other("zstar: presigned provider failed"),
+    // replacing displayed details. Keep the source for language bindings that
+    // restore the user's exception as a cause, without exposing it in Debug.
+    let kind = match error.kind() {
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::TimedOut => error.kind(),
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, ProviderFailure(error))
+}
+struct ProviderFailure(std::io::Error);
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("zstar: presigned provider failed")
+    }
+}
+impl std::fmt::Debug for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for ProviderFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 #[async_trait::async_trait]
@@ -636,10 +649,13 @@ impl crate::ObjectResolver for HttpEncodedObjectResolver {
             .permits
             .acquire()
             .await
-            .map_err(|_| crate::Error::Budget("HTTP object resolver closed"))?;
+            .map_err(|_| crate::Error::Unsupported("HTTP object resolver closed"))?;
         let limit = max_bytes.min(self.max_object_bytes);
         if limit == 0 {
-            return Err(crate::Error::Budget("encoded object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::EncodedObjectBytes,
+                "encoded object size",
+            ));
         }
         let source =
             HttpRangeSource::with_provider(self.transport.clone(), (self.provider)(address));
@@ -655,7 +671,10 @@ impl crate::ObjectResolver for HttpEncodedObjectResolver {
             result => result?,
         };
         if size == 0 || size > limit {
-            return Err(crate::Error::Budget("encoded object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::EncodedObjectBytes,
+                "encoded object size",
+            ));
         }
         let bytes = source.read_range(0..size).await?;
         Ok(bytes)

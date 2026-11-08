@@ -6,14 +6,14 @@ import asyncio
 import errno
 import io
 import os
+import sys
 import threading
-from collections.abc import Mapping
-from contextlib import AbstractAsyncContextManager, suppress
+from collections.abc import Coroutine, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from os import PathLike, fspath
 from pathlib import Path
-from tarfile import ExtractError, TarInfo
 from types import TracebackType
 from typing import BinaryIO, Literal, cast, overload
 
@@ -24,12 +24,17 @@ from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from typing_extensions import Buffer, override
 
 from . import _native
-from ._archive import AsyncArchive
 from ._file import AsyncArchiveFile
-from ._info import _nanoseconds
-from ._publication import _Publication, _WriteSession
+from ._fileobj import fileobj
+from ._metadata import Entry, EntryKind
+from ._native import ZstarError
+from ._open_options import reader_options, writer_options
+from ._ownership import _acquire
+from ._publication import _Publication, _StagedMember, _WriteSession
+from ._reader_api import AsyncArchive
+from ._request import ReadRequest
 from ._writer import _writer_call
-from .types import FileInfo, FileSystemReaderOptions, ProgressCallback, ReaderOptions, WriterOptions
+from .types import FileInfo, ProgressCallback, ReaderOptions, SourceOptions, WriterOptions
 
 __all__ = ["FileInfo", "ZstarFileSystem"]
 
@@ -62,41 +67,53 @@ def _write_all(output: BinaryIO, data: bytes) -> None:
         remaining = remaining[count:]
 
 
-def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
-    """Walk pinned directory descriptors; reject symlinks at every component."""
-    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+if sys.platform == "win32":
+
+    def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
         raise NotImplementedError(
             "confined local downloads require descriptor-relative no-follow I/O"
         )
-    # Resolve '.' and '..' lexically before opening anything, without following links.
-    absolute = Path(os.path.abspath(path))
-    parts = absolute.parts[1:]
-    fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        parents = parts if directory else parts[:-1]
-        for component in parents:
-            with suppress(FileExistsError):
-                os.mkdir(component, dir_fd=fd)
-            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = child
-        if directory:
-            return None
-        leaf = os.open(
-            parts[-1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666, dir_fd=fd
-        )
-        try:
-            import stat
 
-            if not stat.S_ISREG(os.fstat(leaf).st_mode):
-                raise OSError("local download destination must be a regular file")
-            os.ftruncate(leaf, 0)
-            return os.fdopen(leaf, "wb")
-        except BaseException:
-            os.close(leaf)
-            raise
-    finally:
-        os.close(fd)
+else:
+
+    def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
+        """Walk pinned directory descriptors; reject symlinks at every component."""
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            raise NotImplementedError(
+                "confined local downloads require descriptor-relative no-follow I/O"
+            )
+        # Resolve '.' and '..' lexically before opening anything, without following links.
+        absolute = Path(os.path.abspath(path))
+        parts = absolute.parts[1:]
+        fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            parents = parts if directory else parts[:-1]
+            for component in parents:
+                with suppress(FileExistsError):
+                    os.mkdir(component, dir_fd=fd)
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            if directory:
+                return None
+            leaf = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o666,
+                dir_fd=fd,
+            )
+            try:
+                import stat
+
+                if not stat.S_ISREG(os.fstat(leaf).st_mode):
+                    raise OSError("local download destination must be a regular file")
+                os.ftruncate(leaf, 0)
+                return os.fdopen(leaf, "wb")
+            except BaseException:
+                os.close(leaf)
+                raise
+        finally:
+            os.close(fd)
 
 
 def _range_bounds(size: int, start: int | None, end: int | None) -> tuple[int, int]:
@@ -105,21 +122,27 @@ def _range_bounds(size: int, start: int | None, end: int | None) -> tuple[int, i
     return start, max(start, end)
 
 
-def _file_info(name: str, entry: TarInfo) -> FileInfo:
-    return {
-        "name": name,
-        "size": entry.size,
-        "type": "directory" if entry.isdir() else "link" if entry.issym() else "file",
-    }
+_INFO_TYPES: dict[EntryKind, Literal["file", "directory", "link"]] = {
+    EntryKind.FILE: "file",
+    EntryKind.DIRECTORY: "directory",
+    EntryKind.SYMLINK: "link",
+}
+
+
+def _entry_info(name: str, entry: Entry) -> FileInfo:
+    return {"name": name, "size": entry.size, "type": _INFO_TYPES[entry.kind]}
 
 
 class _AsyncFsspecSource:
     """Exact backend ranges through the native async-source seam."""
 
     def __init__(self, backend: AbstractFileSystem, path: str, size: int):
-        self.backend, self.path, self.size = backend, path, size
+        self.backend, self.path, self._size = backend, path, size
 
-    async def read_range(self, offset: int, length: int) -> bytes:
+    async def size(self) -> int:
+        return self._size
+
+    async def read_at(self, offset: int, length: int) -> bytes:
         return cast(
             bytes, await self.backend._cat_file(self.path, start=offset, end=offset + length)
         )
@@ -128,51 +151,48 @@ class _AsyncFsspecSource:
 class _ExternalObjects:
     """Borrowed filesystem rooted at the encoded object directory."""
 
-    def __init__(self, fs: AbstractFileSystem, root: str, loop: asyncio.AbstractEventLoop):
+    def __init__(self, fs: AbstractFileSystem, root: str):
         self.fs, self.root = fs, root.rstrip("/")
-        self.loop = loop
         self._prepared = False
 
     def _path(self, address: str) -> str:
         name = f"{address.removeprefix('sha256:')}.zst"
         return f"{self.root}/{name}" if self.root else name
 
-    def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes:
+    async def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes:
         path = self._path(address)
         if getattr(self.fs, "asynchronous", False):
-            data = cast(
-                bytes,
-                asyncio.run_coroutine_threadsafe(
-                    self.fs._cat_file(path, start=0, end=max_bytes + 1), self.loop
-                ).result(),
-            )
+            data = cast(bytes, await self.fs._cat_file(path, start=0, end=max_bytes + 1))
         else:
-            with self.fs.open(path, "rb", cache_type="none") as file:
-                chunks = bytearray()
-                while len(chunks) <= max_bytes:
-                    chunk = file.read(min(1 << 20, max_bytes + 1 - len(chunks)))
-                    if not chunk:
-                        break
-                    chunks.extend(chunk)
-                data = bytes(chunks)
+
+            def read() -> bytes:
+                with self.fs.open(path, "rb", cache_type="none") as file:
+                    chunks = bytearray()
+                    while len(chunks) <= max_bytes:
+                        chunk = file.read(min(1 << 20, max_bytes + 1 - len(chunks)))
+                        if not chunk:
+                            break
+                        chunks.extend(chunk)
+                    return bytes(chunks)
+
+            data = await _writer_call(read)
         if len(data) > max_bytes:
             raise ValueError("external object exceeds encoded size limit")
         return data
 
-    def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int:
+    async def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int:
         path = self._path(address)
-
         if getattr(self.fs, "asynchronous", False):
             try:
-                info = asyncio.run_coroutine_threadsafe(self.fs._info(path), self.loop).result()
+                info = await self.fs._info(path)
             except FileNotFoundError:
                 pass
             else:
                 return int(info["size"])
-            asyncio.run_coroutine_threadsafe(self.fs._pipe_file(path, encoded), self.loop).result()
+            await self.fs._pipe_file(path, encoded)
             return len(encoded)
         try:
-            info = self.fs.info(path)
+            info = await _writer_call(partial(self.fs.info, path))
         except FileNotFoundError:
             pass
         else:
@@ -180,20 +200,15 @@ class _ExternalObjects:
         if not self._prepared:
             parent = self.fs._parent(path)
             if parent or self.fs.protocol == "dir":
-                self.fs.makedirs(parent, exist_ok=True)
+                await _writer_call(partial(self.fs.makedirs, parent, exist_ok=True))
             self._prepared = True
-        publication = _Publication.open(self.fs, path, self.loop)
+        publication = await _Publication.open(self.fs, path)
         try:
-            position = 0
-            while position < len(encoded):
-                count = publication.output.write(memoryview(encoded)[position:])
-                if not isinstance(count, int) or count <= 0 or count > len(encoded) - position:
-                    raise OSError("invalid external object write count")
-                position += count
+            await _writer_call(partial(_write_all, cast(BinaryIO, publication.output), encoded))
         except BaseException as primary:
-            publication.finish(abort=True, errors=(primary,))
+            await publication.finish(abort=True, errors=(primary,))
             raise
-        publication.finish()
+        await publication.finish()
         return len(encoded)
 
 
@@ -223,14 +238,8 @@ class _ArchiveResources:
 
 
 class _AsyncMemberFile(AbstractAsyncStreamedFile):
-    def __init__(
-        self,
-        fs: ZstarFileSystem,
-        path: str,
-        stream: AsyncArchiveFile,
-        context: AbstractAsyncContextManager[AsyncArchiveFile],
-    ):
-        self._stream, self._context = stream, context
+    def __init__(self, fs: ZstarFileSystem, path: str, stream: AsyncArchiveFile):
+        self._stream = stream
         super().__init__(fs, path, mode="rb", size=stream.size, cache_type="none")
 
     async def read(self, length: int | None = -1) -> bytes:
@@ -256,7 +265,7 @@ class _AsyncMemberFile(AbstractAsyncStreamedFile):
         try:
             await super().close()
         finally:
-            await self._context.__aexit__(None, None, None)
+            await self._stream.__aexit__(None, None, None)
 
     def __del__(self) -> None:
         # The stream borrows the archive. Dropping it releases its cursor;
@@ -297,45 +306,10 @@ class _MemberFile(AbstractBufferedFile):
         return sync(self.fs.loop, self._stream._fetch_range, start, end)
 
 
-class _AsyncWriterMember:
-    mode = "wb"
-
-    def __init__(self, member: _native.StagedMember):
-        self._member = member
-        self.path = member.name
-
-    @property
-    def closed(self) -> bool:
-        return self._member.closed
-
-    async def write(self, data: Buffer) -> int:
-        return await _writer_call(partial(self._member.write, data))
-
-    async def seek(self, offset: int, whence: int = 0) -> int:
-        return await _writer_call(partial(self._member.seek, offset, whence))
-
-    async def tell(self) -> int:
-        return await _writer_call(self._member.tell)
-
-    async def flush(self) -> None:
-        await _writer_call(self._member.flush)
-
-    async def close(self) -> None:
-        await _writer_call(self._member.close)
-
-    async def __aenter__(self) -> _AsyncWriterMember:
-        if self.closed:
-            raise ValueError("I/O operation on closed file")
-        return self
-
-    async def __aexit__(self, exc_type: object, *args: object) -> None:
-        await _writer_call(partial(self._member.close, abort=exc_type is not None))
-
-
 class _WriterMemberFile(io.BufferedIOBase):
     mode = "wb"
 
-    def __init__(self, fs: ZstarFileSystem, stream: _AsyncWriterMember):
+    def __init__(self, fs: ZstarFileSystem, stream: _StagedMember):
         self.fs, self._stream = fs, stream
         self.name = stream.path
 
@@ -397,14 +371,14 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
 
     Use ``zstar://member::file:///path/archive.zstar`` or construct with ``fo``.
     Member paths are relative; ``""`` is the root. ``asynchronous=True`` enables
-    fsspec's async methods and ``open_async``. Use ``await fs.aclose()`` for async
+    fsspec's async methods and ``open_async``. Use ``await fs.close()`` for async
     cleanup. The default sync facade shares the same async reader. Use explicit
     close or a context manager; garbage-collection cleanup is best effort.
 
     ``mode="w"`` creates a new archive. Close each member before opening the
     next; ancestors are created automatically and duplicate names are rejected.
     Members spool to memory up to ``member_spool_bytes``, then to disk, since
-    their sizes must be known before compression. ``writer_options`` configures
+    their sizes must be known before compression. ``options`` configures
     the archive encoder. Normal filesystem close finalizes the archive;
     exceptional context exit discards it when the backend supports transactions.
     Supplied file objects are closed; supplied filesystems remain caller-owned.
@@ -412,8 +386,10 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     objects, stored as ``<lowercase sha256>.zst``. Files of at least
     ``external_threshold`` bytes (16 MiB by default) are externalized on write
     using FastCDC with 2/8/16 MiB minimum/target/maximum chunks. Custom resolvers
-    belong to the low-level API. ``verify_external`` controls external SHA-256
-    checking; ``reader_options`` accepts only budgets and concurrency settings.
+    belong to the direct API. ``options`` accepts ``zstar.types.ReaderOptions``
+    for reading, including external SHA-256 verification, or
+    ``zstar.types.WriterOptions`` for writing. Configure transport with ``fs=``
+    or ``target_options``; nested source/sink settings belong to the direct API.
 
     Chained URLs and ``fs=`` use fsspec seekable range streams. Keep their
     underlying archive objects immutable. S3 paths use fsspec/s3fs credentials
@@ -443,16 +419,17 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         target_protocol: str | None = None,
         target_options: Mapping[str, object] | None = None,
         fs: AbstractFileSystem | None = None,
-        verify_external: bool = False,
         external: str | AbstractFileSystem | None = None,
         external_threshold: int = 16 << 20,
         asynchronous: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
         member_spool_bytes: int = 8 << 20,
-        writer_options: WriterOptions | None = None,
-        reader_options: FileSystemReaderOptions | None = None,
+        options: ReaderOptions | WriterOptions | None = None,
         **kwargs: object,
     ) -> None:
+        for old_option in ("reader_options", "writer_options"):
+            if old_option in kwargs:
+                raise TypeError(f"use options= instead of {old_option}=")
         if "member_cache_bytes" in kwargs:
             raise TypeError("member_cache_bytes is no longer configurable")
         if "resolver" in kwargs:
@@ -474,18 +451,22 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         self.target_protocol: str | None = target_protocol
         self.mode: str = mode
         self.member_spool_bytes = member_spool_bytes
-        self._reader_options = cast(FileSystemReaderOptions, dict(reader_options or {}))
-        if "resolver" in self._reader_options:
-            raise TypeError("use external=filesystem instead of a resolver")
-        if "verify_external" in self._reader_options:
-            raise TypeError("use verify_external= instead of reader_options['verify_external']")
-        self._writer_options = cast(WriterOptions, dict(writer_options or {}))
+        if mode == "r":
+            self._reader_options, source = reader_options(cast("ReaderOptions | None", options))
+            if source is not None:
+                raise ValueError("use fs= or target_options for fsspec transport settings")
+            if options is not None and options.get("resolver") is not None:
+                raise TypeError("use external=filesystem instead of a resolver")
+            self._writer_options = _native.WriterConfig(None)
+        else:
+            self._writer_options, sink = writer_options(cast("WriterOptions | None", options))
+            if sink is not None:
+                raise ValueError("use fs= or target_options for fsspec transport settings")
+            self._reader_options = _native.ReaderConfig(None)
         self._write_session: _WriteSession | None = None
         self._write_loading: asyncio.Task[_WriteSession] | None = None
-        self._write_lock = asyncio.Lock()
         self._aborting = False
         self._filesystem = fs
-        self.verify_external: bool = verify_external
         self.external: str | AbstractFileSystem | None = external
         self.external_threshold: int = external_threshold
         self._backend_options = dict(target_options or {})
@@ -526,36 +507,29 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             return backend, backend._strip_protocol(location)
         return url_to_fs(location, **self._backend_options)
 
-    def _external_store(self, loop: asyncio.AbstractEventLoop) -> _ExternalObjects:
+    def _external_store(self) -> _ExternalObjects:
         if isinstance(self.external, str):
             from fsspec.core import url_to_fs
 
             backend, root = url_to_fs(self.external)
-            return _ExternalObjects(backend, root, loop)
+            return _ExternalObjects(backend, root)
         assert self.external is not None
-        return _ExternalObjects(self.external, "", loop)
-
-    def _new_write_session(self, loop: asyncio.AbstractEventLoop) -> _WriteSession:
-        if isinstance(self.fo, (str, PathLike)):
-            backend, path = self._backend(fspath(self.fo))
-            publication = _Publication.open(backend, path, loop)
-        else:
-            publication = _Publication(self.fo)
-        try:
-            external = self._external_store(loop) if self.external is not None else None
-            return _WriteSession(
-                publication,
-                self.member_spool_bytes,
-                self._writer_options,
-                external=external.put_encoded if external is not None else None,
-                external_threshold=self.external_threshold,
-            )
-        except BaseException as primary:
-            publication.finish(abort=True, errors=(primary,))
-            raise
+        return _ExternalObjects(self.external, "")
 
     async def _load_writer(self) -> _WriteSession:
-        session = await _writer_call(partial(self._new_write_session, asyncio.get_running_loop()))
+        external = await _writer_call(self._external_store) if self.external is not None else None
+        if isinstance(self.fo, (str, PathLike)):
+            backend, path = await _writer_call(partial(self._backend, fspath(self.fo)))
+            publication = await _Publication.open(backend, path)
+        else:
+            publication = _Publication(self.fo)
+        session = await _WriteSession.create(
+            publication,
+            self.member_spool_bytes,
+            self._writer_options,
+            external=external,
+            external_threshold=self.external_threshold,
+        )
         self._write_session = session
         return session
 
@@ -594,19 +568,13 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                 self._loading = None
 
     async def _open_archive(self) -> _ArchiveResources:
-        external = (
-            await asyncio.to_thread(self._external_store, asyncio.get_running_loop())
-            if self.external is not None
-            else None
-        )
-        options: ReaderOptions = {
-            **self._reader_options,
-            "verify_external": self.verify_external,
-            "resolver": external,
-        }
+        external = await _writer_call(self._external_store) if self.external is not None else None
+        options = self._reader_options.with_resolver(external)
         if not isinstance(self.fo, (str, PathLike)):
             try:
-                archive = await AsyncArchive.from_file(self.fo, **options)
+                archive = await AsyncArchive._from_config(
+                    _native.BlockingAdapter(fileobj(self.fo)), options
+                )
             except BaseException as primary:
                 try:
                     await asyncio.to_thread(self.fo.close)
@@ -625,24 +593,30 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             unknown = set(self._backend_options) - {"headers"}
             if unknown:
                 raise ValueError("HTTP target_options supports headers only")
-            archive = await AsyncArchive.from_url(
-                location,
-                headers=cast("dict[str, str] | None", self._backend_options.get("headers")),
-                **options,
+            source = await _acquire(
+                _native.aopen_source(
+                    location,
+                    options=SourceOptions(
+                        headers=cast("dict[str, str]", self._backend_options.get("headers") or {})
+                    ),
+                ),
+                lambda source: source.aclose(),
             )
-            return _ArchiveResources(archive)
+            return _ArchiveResources(await AsyncArchive._from_owned(source, options))
         return await self._open_fsspec(location, options)
 
-    async def _open_fsspec(self, location: str, options: ReaderOptions) -> _ArchiveResources:
+    async def _open_fsspec(self, location: str, options: _native.ReaderConfig) -> _ArchiveResources:
         backend, path = await asyncio.to_thread(self._backend, location)
         if getattr(backend, "asynchronous", False):
             info = await backend._info(path)
             source = _AsyncFsspecSource(backend, path, info["size"])
-            return _ArchiveResources(await AsyncArchive.from_source(source, source.size, **options))
+            return _ArchiveResources(await AsyncArchive._from_config(source, options))
         # Let the backend choose its source cache, including disk-cache wrappers.
         file = cast(BinaryIO, await asyncio.to_thread(backend.open, path, "rb"))
         try:
-            archive = await AsyncArchive.from_file(file, **options)
+            archive = await AsyncArchive._from_config(
+                _native.BlockingAdapter(fileobj(file)), options
+            )
         except BaseException as primary:
             try:
                 await asyncio.to_thread(file.close)
@@ -659,7 +633,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                 with suppress(BaseException):
                     await self._write_loading
             if self._write_session is not None:
-                await _writer_call(partial(self._write_session.close, abort=self._aborting))
+                await self._write_session.close(abort=self._aborting)
             elif not isinstance(self.fo, (str, PathLike)):
                 await asyncio.to_thread(self.fo.close)
             return
@@ -672,7 +646,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         elif not isinstance(self.fo, (str, PathLike)) and not self.fo.closed:
             await asyncio.to_thread(self.fo.close)
 
-    async def aclose(self) -> None:
+    async def _close(self) -> None:
         self._check_loop()
         if self.mode == "w" and not self._closed and not self._aborting:
             await self._get_writer()
@@ -683,10 +657,12 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             self._close_task = _retain_cleanup(asyncio.create_task(self._drain_close()))
         await asyncio.shield(self._close_task)
 
-    def close(self) -> None:
+    def close(self) -> Coroutine[object, object, None] | None:
+        """Close storage; await the result for an asynchronous filesystem."""
         if self.asynchronous:
-            raise RuntimeError("use await fs.aclose() for an asynchronous filesystem")
-        sync(self.loop, self.aclose)
+            return self._close()
+        sync(self.loop, self._close)
+        return None
 
     def __enter__(self) -> ZstarFileSystem:
         if self.asynchronous:
@@ -706,7 +682,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     async def _finalize(self) -> None:
         self._aborting = True
         with suppress(Exception):
-            await self.aclose()
+            await self._close()
 
     def _start_finalizer(self) -> None:
         _retain_cleanup(asyncio.create_task(self._finalize()))
@@ -738,7 +714,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     async def __aexit__(self, exc_type: object, *args: object) -> None:
         self._aborting = self._aborting or exc_type is not None
         try:
-            await self.aclose()
+            await self._close()
         except BaseException as cleanup:
             if args and isinstance(args[0], BaseException):
                 raise BaseExceptionGroup(
@@ -754,10 +730,10 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         return "/".join(part for part in stripped.split("/") if part not in ("", "."))
 
     @staticmethod
-    async def _lookup(archive: AsyncArchive, member: str) -> TarInfo:
+    async def _lookup(archive: AsyncArchive, member: str) -> Entry:
         """Look up the exact entry without following symlinks."""
         try:
-            return await archive.getinfo(member)
+            return await archive.entry(member)
         except KeyError:
             raise FileNotFoundError(member) from None
 
@@ -769,16 +745,16 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     @overload
     async def open_async(
         self, path: str, mode: Literal["wb", "xb"], **kwargs: object
-    ) -> _AsyncWriterMember: ...
+    ) -> _StagedMember: ...
 
     @overload
     async def open_async(
         self, path: str, mode: str, **kwargs: object
-    ) -> _AsyncMemberFile | _AsyncWriterMember: ...
+    ) -> _AsyncMemberFile | _StagedMember: ...
 
     async def open_async(
         self, path: str, mode: str = "rb", **kwargs: object
-    ) -> _AsyncMemberFile | _AsyncWriterMember:
+    ) -> _AsyncMemberFile | _StagedMember:
         member = cast(str, self._strip_protocol(path))
         if self.mode == "w":
             if mode not in {"wb", "xb"} or kwargs:
@@ -786,12 +762,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                     "writer members support wb or xb without buffering options"
                 )
             session = await self._get_writer()
-            member = _native.member_name(member)
-            staged = await _writer_call(
-                partial(session.open, member),
-                discard=lambda staged: staged.close(abort=True),
-            )
-            return _AsyncWriterMember(staged)
+            return await session.open(member)
         if mode != "rb" or kwargs:
             raise NotImplementedError(
                 "open_async supports read-only binary members without buffering options"
@@ -799,17 +770,23 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         if not member:
             raise IsADirectoryError(path)
         archive = await self._get_archive()
-        context = archive.open(member)
         try:
-            stream = await context.__aenter__()
+            stream = await archive.open(member)
+            await stream.__aenter__()
         except KeyError:
             raise FileNotFoundError(path) from None
-        except ExtractError:
-            raise OSError(errno.ELOOP, "cannot open a symlink as a file", path) from None
+        except IsADirectoryError:
+            raise IsADirectoryError(path) from None
+        except ZstarError:
+            # Only failures pay for a second lookup to classify symlinks.
+            entry = await self._lookup(archive, member)
+            if entry.kind is EntryKind.SYMLINK:
+                raise OSError(errno.ELOOP, "cannot open a symlink as a file", path) from None
+            raise
         try:
-            return _AsyncMemberFile(self, member, stream, context)
+            return _AsyncMemberFile(self, member, stream)
         except BaseException:
-            await context.__aexit__(None, None, None)
+            await stream.__aexit__(None, None, None)
             raise
 
     def _open(
@@ -819,21 +796,17 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             if kwargs.get("autocommit") is False:
                 raise NotImplementedError("member transactions are unsupported; commit the archive")
             stream = sync(self.loop, self.open_async, path, mode)
-            return _WriterMemberFile(self, cast(_AsyncWriterMember, stream))
+            return _WriterMemberFile(self, cast(_StagedMember, stream))
         stream = sync(self.loop, self.open_async, path, mode)
         return _MemberFile(self, cast(str, self._strip_protocol(path)), stream, **kwargs)
 
     async def _mkdir(self, path: str, create_parents: bool = True, **kwargs: object) -> None:
         session = await self._get_writer()
-        await _writer_call(
-            partial(session.mkdir, cast(str, self._strip_protocol(path)), parents=create_parents)
-        )
+        await session.mkdir(cast(str, self._strip_protocol(path)), parents=create_parents)
 
     async def _makedirs(self, path: str, exist_ok: bool = False) -> None:
         session = await self._get_writer()
-        await _writer_call(
-            partial(session.mkdir, cast(str, self._strip_protocol(path)), exist_ok=exist_ok)
-        )
+        await session.mkdir(cast(str, self._strip_protocol(path)), exist_ok=exist_ok)
 
     async def _put_file(
         self,
@@ -845,23 +818,19 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     ) -> None:
         if mode not in {"overwrite", "create"} or kwargs:
             raise NotImplementedError("put_file supports overwrite or create without extra options")
-        # fsspec batches put_file concurrently. Archive insertion stays serial.
-        async with self._write_lock:
-            session = await self._get_writer()
-
-            def copy() -> None:
-                import os
-
-                if os.path.isdir(lpath):
-                    session.mkdir(cast(str, self._strip_protocol(rpath)), exist_ok=True)
-                    return
-                with open(lpath, "rb") as source:
-                    size = os.fstat(source.fileno()).st_size
-                    callback.set_size(size)
-                    session.add_file(cast(str, self._strip_protocol(rpath)), source, size)
-                    callback.relative_update(size)
-
-            await _writer_call(copy)
+        session = await self._get_writer()
+        path = cast(str, self._strip_protocol(rpath))
+        if await _writer_call(partial(os.path.isdir, lpath)):
+            await session.mkdir(path, exist_ok=True)
+            return
+        source = await _writer_call(partial(open, lpath, "rb"), discard=lambda file: file.close())
+        try:
+            size = await _writer_call(lambda: os.fstat(source.fileno()).st_size)
+            callback.set_size(size)
+            await session.add_file(path, source, size)
+            callback.relative_update(size)
+        finally:
+            await _writer_call(source.close)
 
     async def _pipe_file(
         self,
@@ -875,15 +844,8 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             raise NotImplementedError(
                 "pipe_file supports overwrite or create without extra options"
             )
-        async with self._write_lock:
-            session = await self._get_writer()
-
-            def write() -> None:
-                session.add_file(
-                    cast(str, self._strip_protocol(path)), io.BytesIO(value), len(value)
-                )
-
-            await _writer_call(write)
+        session = await self._get_writer()
+        await session.add_file(cast(str, self._strip_protocol(path)), io.BytesIO(value), len(value))
 
     async def _cat_file(
         self, path: str, start: int | None = None, end: int | None = None, **kwargs: object
@@ -964,9 +926,9 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             return []
         archive = await self._get_archive()
         results: list[bytes | Exception] = []
-        requests: list[tuple[str, int, int]] = []
+        requests: list[ReadRequest] = []
         positions: list[int] = []
-        members: dict[str, TarInfo] = {}
+        members: dict[str, Entry] = {}
         for index, (path, raw_start, raw_end) in enumerate(
             zip(paths, start_list, end_list, strict=True)
         ):
@@ -976,14 +938,14 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
                     raise IsADirectoryError(path)
                 if member not in members:
                     members[member] = await self._lookup(archive, member)
-                info = members[member]
-                if info.issym():
+                entry = members[member]
+                if entry.kind is EntryKind.SYMLINK:
                     raise OSError(errno.ELOOP, "cannot read a symlink as a file", path)
-                if not info.isfile():
+                if entry.kind is not EntryKind.FILE:
                     raise IsADirectoryError(path)
-                start, end = _range_bounds(info.size, raw_start, raw_end)
+                start, end = _range_bounds(entry.size, raw_start, raw_end)
                 if end > start:
-                    requests.append((info.name, start, end - start))
+                    requests.append(ReadRequest(entry.path, start, end - start))
                     positions.append(index)
                 results.append(b"")
             except Exception as exc:
@@ -1001,9 +963,13 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
             except Exception:
                 # Preserve per-range errors and partial success when a batch
                 # contains one invalid range or missing external object.
-                for (name, start, length), index in zip(selected, indices, strict=True):
+                for request, index in zip(selected, indices, strict=True):
                     try:
-                        results[index] = await self._cat_file(name, start, start + length)
+                        results[index] = await self._cat_file(
+                            request.path,
+                            request.offset,
+                            None if request.length is None else request.offset + request.length,
+                        )
                     except Exception as individual:
                         if on_error == "raise":
                             raise
@@ -1014,16 +980,16 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         member = cast(str, self._strip_protocol(path))
         if self.mode == "w":
             session = await self._get_writer()
-            entries = await _writer_call(session.snapshot)
+            entries = session.snapshot()
             if not member:
                 return {"name": "", "type": "directory", "size": 0}
             if member not in entries:
                 raise FileNotFoundError(member)
-            return _file_info(member, entries[member])
+            return entries[member]
         archive = await self._get_archive()
         if not member:
             return {"name": "", "type": "directory", "size": 0}
-        return _file_info(member, await self._lookup(archive, member))
+        return _entry_info(member, await self._lookup(archive, member))
 
     def info(self, path: str, **kwargs: object) -> FileInfo:
         return sync(self.loop, self._info, path, **kwargs)
@@ -1031,8 +997,7 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
     async def _modified(self, path: str) -> datetime:
         member = cast(str, self._strip_protocol(path))
         archive = await self._get_archive()
-        info = await self._lookup(archive, member) if member else None
-        ns = _nanoseconds(info.pax_headers.get("mtime", info.mtime)) if info else 0
+        ns = (await self._lookup(archive, member)).mtime_ns if member else 0
         return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=ns // 1000)
 
     def modified(self, path: str) -> datetime:
@@ -1053,15 +1018,15 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         member = cast(str, self._strip_protocol(path))
         if self.mode == "w":
             session = await self._get_writer()
-            entries = await _writer_call(session.snapshot)
+            entries = session.snapshot()
             if member and member not in entries:
                 raise FileNotFoundError(member)
-            if member and not entries[member].isdir():
-                return [_file_info(member, entries[member])] if detail else [member]
+            if member and entries[member]["type"] != "directory":
+                return [entries[member]] if detail else [member]
             prefix = member + "/" if member else ""
             items: list[FileInfo] = [
-                _file_info(name, entry)
-                for name, entry in sorted(entries.items())
+                info
+                for name, info in sorted(entries.items())
                 if name.startswith(prefix) and "/" not in name[len(prefix) :] and name != member
             ]
             return items if detail else [item["name"] for item in items]
@@ -1069,20 +1034,20 @@ class ZstarFileSystem(AsyncFileSystem, AbstractArchiveFileSystem):
         requested = member
         if member:
             entry = await self._lookup(archive, member)
-            if not entry.isdir():
-                return [_file_info(member, entry)] if detail else [member]
-            member = entry.name
+            if entry.kind is not EntryKind.DIRECTORY:
+                return [_entry_info(member, entry)] if detail else [member]
+            member = entry.path
         prefix = member + "/" if member else ""
         display_prefix = requested + "/" if requested else ""
         if not detail:
             return [
                 f"{display_prefix}{name[len(prefix) :]}"
-                async for entry in archive.members(prefix)
-                if "/" not in (name := entry.name)[len(prefix) :]
+                async for entry in archive.entries(prefix)
+                if "/" not in (name := entry.path)[len(prefix) :]
             ]
         items = []
-        async for entry in archive.members(prefix):
-            if "/" in entry.name[len(prefix) :]:
+        async for entry in archive.entries(prefix):
+            if "/" in entry.path[len(prefix) :]:
                 continue
-            items.append(_file_info(f"{display_prefix}{entry.name[len(prefix) :]}", entry))
+            items.append(_entry_info(f"{display_prefix}{entry.path[len(prefix) :]}", entry))
         return items

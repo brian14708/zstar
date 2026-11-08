@@ -105,7 +105,9 @@ decode and validate frames; retain a member `File` or `Stream` for decoded-sourc
 
 ## Iteration
 
-Use `Reader.Entries(prefix)` for lazy Go iteration over owned entry metadata:
+Use `Reader.Entries(prefix)` to iterate over owned entry metadata. Before yielding
+the first entry, it scans and validates all metadata and retains the complete
+entry index, even when a prefix is supplied:
 
 ```go
 for entry, err := range reader.Entries("dir/") {
@@ -118,8 +120,10 @@ for entry, err := range reader.Entries("dir/") {
 
 Prefixes match
 literal UTF-8 bytes; `"dir/"` selects descendants, `"dir"` also matches names
-such as `"directory"`, and `""` selects everything. Iteration seeks with binary
-search, retains one bounded batch and releases it on early loop exit.
+such as `"directory"`, and `""` selects everything. Iteration seeks within the
+retained index using binary search. Early loop exit releases the current batch;
+the complete index remains until the reader closes. Use `Reader.Entry` for
+selective lookup without a full scan.
 
 ## Writing
 

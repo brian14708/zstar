@@ -1,118 +1,10 @@
 //! Async tar-style writing over bounded channels to the compression worker.
-use crate::backend::BlockingBuilder;
-use crate::{Entry, EntryKind, Error, Extensions, ManifestOptions, Result};
+use crate::blocking::Builder as BlockingBuilder;
+use crate::{Error, Header, Result, WriterOptions};
 use bytes::Bytes;
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-
-/// Metadata for an entry to append with [`Builder`].
-///
-/// The encoder assigns extents; this header describes the input file and its
-/// declared size. Directory and symlink headers have size zero.
-#[derive(Clone, Debug)]
-pub struct Header {
-    entry: Entry,
-    size: u64,
-}
-impl Header {
-    /// Creates a regular-file header with a declared byte length.
-    pub fn file(path: impl Into<String>, size: u64) -> Self {
-        Self {
-            entry: Entry::file(path),
-            size,
-        }
-    }
-    /// Creates a directory header with mode `0o755`.
-    pub fn directory(path: impl Into<String>) -> Self {
-        Self {
-            entry: Entry::directory(path),
-            size: 0,
-        }
-    }
-    /// Creates a symlink header with mode `0o777` and an exact target string.
-    pub fn symlink(path: impl Into<String>, target: impl Into<String>) -> Self {
-        Self {
-            entry: Entry::symlink(path, target),
-            size: 0,
-        }
-    }
-    /// Returns the archive-relative path.
-    #[must_use]
-    pub fn path(&self) -> &str {
-        &self.entry.path
-    }
-    /// Returns the declared payload length in bytes.
-    #[must_use]
-    pub const fn size(&self) -> u64 {
-        self.size
-    }
-    /// Sets the Unix permission bits.
-    pub const fn set_mode(&mut self, mode: u64) {
-        self.entry.mode = mode;
-    }
-    /// Sets the user ID recorded in the archive.
-    pub const fn set_uid(&mut self, uid: u64) {
-        self.entry.uid = uid;
-    }
-    /// Sets the group ID recorded in the archive.
-    pub const fn set_gid(&mut self, gid: u64) {
-        self.entry.gid = gid;
-    }
-    /// Sets modification time as signed nanoseconds since the Unix epoch.
-    pub const fn set_mtime_ns(&mut self, timestamp: i64) {
-        self.entry.mtime_ns = timestamp;
-    }
-    /// Replaces the entry's `x-*` CBOR extension values.
-    pub fn set_attributes(&mut self, attributes: Extensions) {
-        self.entry.attributes = attributes;
-    }
-}
-
-/// Compression, metadata, and storage options for a [`Builder`].
-///
-/// Reader-only metadata settings are unavailable on writers:
-/// ```compile_fail
-/// let options = zstar::WriterOptions::default();
-/// let _ = options.metadata.max_entries;
-/// ```
-#[derive(Clone, Debug)]
-pub struct WriterOptions {
-    /// Decoded data-frame target: at least 512 bytes, subject to manifest limits.
-    pub frame_size: usize,
-    /// Zstandard compression level; defaults to 3.
-    pub compression_level: i32,
-    /// Compression worker count, from 0 (serial) to 16.
-    pub workers: usize,
-    /// Metadata encoding and temporary storage policy.
-    pub metadata: crate::MetadataWriterOptions,
-    /// Per-source frame/window and entry/extent/pointer limits. Zero disables each limit.
-    pub limits: crate::Limits,
-    /// Archive-level `x-*` CBOR values.
-    pub root_extensions: Extensions,
-}
-impl WriterOptions {
-    fn manifest_options(&self) -> ManifestOptions {
-        let mut options = ManifestOptions {
-            limits: self.limits,
-            ..Default::default()
-        };
-        self.metadata.clone().apply(&mut options);
-        options
-    }
-}
-impl Default for WriterOptions {
-    fn default() -> Self {
-        Self {
-            frame_size: 1 << 20,
-            compression_level: 3,
-            workers: 0,
-            metadata: crate::MetadataWriterOptions::default(),
-            limits: crate::Limits::default(),
-            root_extensions: Extensions::default(),
-        }
-    }
-}
 
 enum Output {
     Bytes(Bytes),
@@ -155,7 +47,7 @@ impl Read for Body {
 /// Writes an indexed tar archive to an [`AsyncWrite`] sink.
 ///
 /// Entries may be appended in any order; include all ancestor directories.
-/// Appending in UTF-8 path order avoids an additional manifest sorting spool.
+/// Appending in UTF-8 path order avoids an additional manifest sorting buffer.
 /// [`Self::finish`] sorts the manifest if needed, writes the footer, and flushes the sink.
 /// It returns the sink without calling [`AsyncWriteExt::shutdown`].
 ///
@@ -212,14 +104,7 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
             .map_err(|_| Error::Unsupported("writer requires a Tokio runtime"))?;
         let (send, output_rx) = mpsc::channel(2);
         let worker = handle.spawn_blocking(move || {
-            let writer = BlockingBuilder::with_options(
-                Sink(send.clone()),
-                options.frame_size,
-                options.compression_level,
-                options.manifest_options(),
-            )
-            .and_then(|writer| writer.with_workers(options.workers))
-            .and_then(|writer| writer.with_root_extensions(options.root_extensions));
+            let writer = BlockingBuilder::try_with_options(Sink(send.clone()), options);
             complete(send, writer.map(Some))
         });
         let mut builder = Self {
@@ -335,7 +220,10 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         }
         Ok(())
     }
-    async fn append(&mut self, entry: Entry) -> Result<()> {
+    async fn append(
+        &mut self,
+        append: impl FnOnce(&mut BlockingBuilder<Sink>) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
         let mut operation = Operation {
             builder: self,
             complete: false,
@@ -343,7 +231,7 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         let this = &mut *operation.builder;
         this.ready().await?;
         this.start(move |mut writer| {
-            writer.add_metadata(entry)?;
+            append(&mut writer)?;
             Ok(Some(writer))
         });
         this.drain_self().await?;
@@ -385,16 +273,12 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         };
         let this = &mut *operation.builder;
         this.ready().await?;
-        if header.entry.kind != EntryKind::File {
-            this.stop();
-            return Err(Error::Unsupported("append_data requires a file header"));
-        }
         let (sender, body) = mpsc::channel(2);
+        let size = header.size;
         let result = async {
             this.start(move |mut writer| {
-                writer.add_file(
-                    header.entry,
-                    header.size,
+                writer.append_data(
+                    header,
                     &mut Body {
                         input: body,
                         pending: Bytes::new(),
@@ -403,7 +287,7 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
                 Ok(Some(writer))
             });
             let feed = async move {
-                let mut remaining = header.size;
+                let mut remaining = size;
                 // One buffer is reused: `split` hands out the filled prefix and
                 // `reserve` reclaims the allocation once chunks are consumed.
                 let mut buffer = bytes::BytesMut::new();
@@ -455,11 +339,8 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
     )]
     /// Appends metadata for a directory, symlink or empty regular file.
     pub async fn append_header(&mut self, header: Header) -> Result<()> {
-        if header.size != 0 {
-            self.stop();
-            return Err(Error::Unsupported("nonempty file requires append_data"));
-        }
-        self.append(header.entry).await
+        self.append(move |writer| writer.append_header(header))
+            .await
     }
     #[expect(
         clippy::missing_errors_doc,
@@ -467,7 +348,7 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
     )]
     /// Appends a directory with default metadata.
     pub async fn append_dir(&mut self, path: impl Into<String>) -> Result<()> {
-        self.append(Header::directory(path).entry).await
+        self.append_header(Header::directory(path)).await
     }
     #[expect(
         clippy::missing_errors_doc,
@@ -479,19 +360,21 @@ impl<W: AsyncWrite + Unpin> Builder<W> {
         path: impl Into<String>,
         target: impl Into<String>,
     ) -> Result<()> {
-        self.append(Header::symlink(path, target).entry).await
+        self.append_header(Header::symlink(path, target)).await
     }
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
     /// Appends file metadata that references already encoded external objects.
-    pub async fn append_external(&mut self, entry: Entry) -> Result<()> {
-        if !entry.is_external() {
-            self.stop();
-            return Err(Error::Unsupported("external entry required"));
-        }
-        self.append(entry).await
+    /// An empty file with no extents, as produced by externalizing zero bytes, is accepted.
+    pub async fn append_external(
+        &mut self,
+        header: Header,
+        extents: Vec<crate::Extent>,
+    ) -> Result<()> {
+        self.append(move |writer| writer.append_external(header, extents))
+            .await
     }
     #[expect(
         clippy::missing_errors_doc,

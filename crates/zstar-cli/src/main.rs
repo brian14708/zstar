@@ -1,6 +1,8 @@
 mod remote;
 
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+
+type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 use aws_runtime::env_config::{file::EnvConfigFiles, property::PropertiesKey};
 use aws_types::os_shim_internal::{Env as AwsEnv, Fs as AwsFs};
 use clap::{Parser, Subcommand};
@@ -9,8 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use zstar::backend::BlockingArchive;
-use zstar::backend::ManifestOptions;
+use zstar::blocking::Archive as BlockingArchive;
 use zstar::fs::{self as restore, LocalFileSource};
 use zstar::s3::object_store::client::CredentialProvider;
 use zstar::s3::object_store::{aws::AwsCredential, path::Path as ObjectPath};
@@ -39,17 +40,16 @@ fn s3_error(operation: &str, error: zstar::s3::object_store::Error) -> std::io::
 
 #[derive(clap::Args, Clone)]
 struct MetadataLimits {
-    #[arg(long = "metadata-memory-bytes", default_value_t = 8 << 20)]
+    #[arg(long = "metadata-memory-bytes", default_value_t = 128 << 20)]
     memory: u64,
-    #[arg(long = "max-metadata-bytes", default_value_t = 4 << 30)]
-    max_size: u64,
+    #[arg(long = "max-metadata-page-bytes", default_value_t = 8 << 20)]
+    max_page: u64,
 }
 impl MetadataLimits {
-    fn options(&self) -> ManifestOptions {
-        ManifestOptions {
-            memory_bytes: self.memory,
-            max_encoded_bytes: self.max_size,
-            max_decoded_bytes: self.max_size,
+    fn options(&self) -> zstar::MetadataReaderOptions {
+        zstar::MetadataReaderOptions {
+            max_page_bytes: self.max_page,
+            max_retained_entry_bytes: self.memory,
             ..Default::default()
         }
     }
@@ -97,14 +97,19 @@ impl EncodingOptions {
     fn options(&self) -> restore::PackOptions {
         restore::PackOptions {
             preserve_metadata: self.preserve_metadata,
-            frame_size: self.frame_size,
-            compression_level: self.compression_level,
-            workers: self
-                .workers
-                .unwrap_or_else(|| restore::PackOptions::default().workers),
-            manifest: ManifestOptions {
-                block_target: self.metadata_block_size,
-                ..self.metadata.options()
+            writer: zstar::WriterOptions {
+                frame_size: self.frame_size,
+                compression_level: self.compression_level,
+                workers: self
+                    .workers
+                    .unwrap_or_else(|| restore::PackOptions::default().writer.workers),
+                metadata: zstar::MetadataWriterOptions {
+                    block_target: self.metadata_block_size,
+                    max_page_bytes: self.metadata.max_page,
+                    max_buffer_bytes: self.metadata.memory,
+                    ..Default::default()
+                },
+                ..Default::default()
             },
         }
     }
@@ -160,7 +165,7 @@ fn parent(path: &Path) -> &Path {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
-fn s3_location(path: &Path) -> restore::AnyResult<Option<(String, ObjectPath)>> {
+fn s3_location(path: &Path) -> AnyResult<Option<(String, ObjectPath)>> {
     let Some(text) = path.to_str() else {
         return Ok(None);
     };
@@ -200,7 +205,7 @@ impl CredentialProvider for AwsCredentials {
     }
 }
 
-async fn s3_store(bucket: &str) -> restore::AnyResult<Arc<zstar::s3::AmazonS3>> {
+async fn s3_store(bucket: &str) -> AnyResult<Arc<zstar::s3::AmazonS3>> {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .load()
         .await;
@@ -264,11 +269,7 @@ async fn s3_store(bucket: &str) -> restore::AnyResult<Arc<zstar::s3::AmazonS3>> 
     Ok(Arc::new(builder.build()?))
 }
 
-fn endpoint_for_style(
-    endpoint: &str,
-    bucket: &str,
-    virtual_hosted: bool,
-) -> restore::AnyResult<String> {
+fn endpoint_for_style(endpoint: &str, bucket: &str, virtual_hosted: bool) -> AnyResult<String> {
     if !virtual_hosted {
         return Ok(endpoint.to_owned());
     }
@@ -281,7 +282,7 @@ fn endpoint_for_style(
     Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
-async fn download(path: &Path) -> restore::AnyResult<tempfile::NamedTempFile> {
+async fn download(path: &Path) -> AnyResult<tempfile::NamedTempFile> {
     let (bucket, key) = s3_location(path)?.ok_or("expected an s3://bucket/key URL")?;
     let store = s3_store(&bucket).await?;
     let mut file = tempfile::NamedTempFile::new()?;
@@ -294,7 +295,7 @@ async fn download(path: &Path) -> restore::AnyResult<tempfile::NamedTempFile> {
     reason = "Keep the ordered validation or protocol operation together."
 )]
 #[tokio::main]
-async fn main() -> restore::AnyResult<()> {
+async fn main() -> AnyResult<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
@@ -351,7 +352,7 @@ async fn main() -> restore::AnyResult<()> {
             restore::pack_to_with_options(&input, staged.as_file_mut(), encoding.options())?;
             if let Some((bucket, key)) = remote {
                 let store = s3_store(&bucket).await?;
-                remote::upload(store.as_ref(), &key, staged.as_file_mut(), force).await?;
+                remote::upload(&store, &key, staged.as_file_mut(), force).await?;
             } else if force {
                 staged.persist(&output).map_err(|e| e.error)?;
             } else {
@@ -376,13 +377,19 @@ async fn main() -> restore::AnyResult<()> {
             let footer = zstar::backend::parse_footer(
                 &source.read_range(size - zstar::backend::FOOTER_SIZE as u64..size)?,
             )?;
-            let parsed = BlockingArchive::open(source, metadata.options())?;
+            let parsed = BlockingArchive::open_with_options(
+                source,
+                zstar::blocking::ReaderOptions {
+                    metadata: metadata.options(),
+                    ..Default::default()
+                },
+            )?;
             println!(
                 "metadata_offset={} metadata_encoded_size={} metadata_decoded_size={} entries={}",
                 footer.metadata_range(size)?.start,
                 footer.toc_encoded_len,
                 footer.toc_decoded_len,
-                parsed.manifest().root().entry_count
+                parsed.entry_count()
             );
         }
         Command::Extract {
@@ -402,18 +409,23 @@ async fn main() -> restore::AnyResult<()> {
             let local_archive = staged
                 .as_ref()
                 .map_or(archive.as_path(), tempfile::NamedTempFile::path);
+            let resolver = objects
+                .as_deref()
+                .map(restore::LocalObjects::open)
+                .transpose()?
+                .map(|o| Box::new(o) as Box<dyn zstar::blocking::ObjectResolver>);
             let report = restore::extract_file_with_report(
                 local_archive,
                 &destination,
-                objects
-                    .as_deref()
-                    .map(restore::LocalObjects::open)
-                    .transpose()?,
                 restore::ExtractOptions {
                     allow_special_bits,
-                    verify_external: verify_external_hash,
                     max_directory_handles,
-                    manifest: metadata.options(),
+                    reader: zstar::blocking::ReaderOptions {
+                        metadata: metadata.options(),
+                        verify_external: verify_external_hash,
+                        resolver,
+                        ..Default::default()
+                    },
                 },
             )?;
             for omitted in &report.omitted {

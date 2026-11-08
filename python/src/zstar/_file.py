@@ -6,14 +6,27 @@ import operator
 import threading
 from collections.abc import AsyncIterator, Iterator
 from types import TracebackType
-from typing import TYPE_CHECKING, Self
+from typing import Protocol, Self
 
 from typing_extensions import Buffer, override
 
 from . import _native
 
-if TYPE_CHECKING:
-    from ._archive import Archive, AsyncArchive
+
+class _SyncStreamOwner(Protocol):
+    @property
+    def _reader(self) -> _native.SyncArchive: ...
+    @property
+    def _max_read_bytes(self) -> int: ...
+    def _check_open(self) -> None: ...
+
+
+class _AsyncStreamOwner(Protocol):
+    @property
+    def _reader(self) -> _native.AsyncArchive: ...
+    @property
+    def _max_read_bytes(self) -> int: ...
+    def _check_open(self) -> None: ...
 
 
 class ArchiveFile(io.RawIOBase):
@@ -24,16 +37,18 @@ class ArchiveFile(io.RawIOBase):
     cursor updates, and close.
     """
 
-    def __init__(self, archive: "Archive", name: str, cursor: _native.MemberCursor) -> None:
+    def __init__(
+        self, archive: "_SyncStreamOwner", name: str, cursor: _native.MemberCursor
+    ) -> None:
         self._lock = threading.Lock()
         super().__init__()
-        self._archive: Archive | None = archive
+        self._archive: _SyncStreamOwner | None = archive
         self.name = name
         self.mode = "rb"
         self._cursor: _native.MemberCursor | None = cursor
         self.size: int = cursor.size
 
-    def _owner(self) -> "Archive":
+    def _owner(self) -> "_SyncStreamOwner":
         archive = self._archive
         if self.closed or archive is None:
             raise ValueError("I/O operation on closed file")
@@ -42,18 +57,21 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def readable(self) -> bool:
+        self._owner()
         with self._lock:
             self._owner()
         return True
 
     @override
     def seekable(self) -> bool:
+        self._owner()
         with self._lock:
             self._owner()
         return True
 
     @override
     def tell(self) -> int:
+        self._owner()
         with self._lock:
             self._owner()
             assert self._cursor is not None
@@ -61,6 +79,7 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._owner()
         with self._lock:
             self._owner()
             assert self._cursor is not None
@@ -68,6 +87,7 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def read(self, size: int | None = -1) -> bytes:
+        self._owner()
         with self._lock:
             archive = self._owner()
             assert self._cursor is not None
@@ -92,6 +112,7 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def readinto(self, buffer: "Buffer") -> int:
+        self._owner()
         with self._lock:
             archive = self._owner()
             assert self._cursor is not None
@@ -101,6 +122,8 @@ class ArchiveFile(io.RawIOBase):
 
     @override
     def close(self) -> None:
+        if self._archive is not None:
+            self._archive._reader._check_access()
         with self._lock:
             super().close()
             self._archive = None
@@ -119,18 +142,23 @@ class AsyncArchiveFile:
     call with ``asyncio.run_coroutine_threadsafe(stream.read(n), loop)``.
     """
 
-    def __init__(self, archive: "AsyncArchive", name: str, cursor: _native.MemberCursor) -> None:
-        self._archive: AsyncArchive | None = archive
+    def __init__(
+        self, archive: "_AsyncStreamOwner", name: str, cursor: _native.MemberCursor
+    ) -> None:
+        self._archive: _AsyncStreamOwner | None = archive
         self.name, self.mode = name, "rb"
         self._cursor: _native.MemberCursor | None = cursor
         self.size: int = cursor.size
         self._lock = asyncio.Lock()
+        self._loop = asyncio.get_running_loop()
 
     @property
     def closed(self) -> bool:
         return self._archive is None
 
-    def _owner(self) -> "AsyncArchive":
+    def _owner(self) -> "_AsyncStreamOwner":
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("stream belongs to another event loop")
         if self._archive is None:
             raise ValueError("I/O operation on closed file")
         self._archive._check_open()
@@ -145,6 +173,7 @@ class AsyncArchiveFile:
         return True
 
     async def read(self, size: int | None = -1) -> bytes:
+        self._owner()
         async with self._lock:
             archive = self._owner()
             assert self._cursor is not None
@@ -164,6 +193,7 @@ class AsyncArchiveFile:
             yield chunk
 
     async def readinto(self, buffer: "Buffer") -> int:
+        self._owner()
         async with self._lock:
             archive = self._owner()
             assert self._cursor is not None
@@ -177,18 +207,24 @@ class AsyncArchiveFile:
         return await archive._reader._read_member_into_at(self._cursor, offset, buffer)
 
     async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._owner()
         async with self._lock:
             self._owner()
             assert self._cursor is not None
             return self._cursor.seek(operator.index(offset), operator.index(whence))
 
     async def tell(self) -> int:
+        self._owner()
         async with self._lock:
             self._owner()
             assert self._cursor is not None
             return self._cursor.tell()
 
     async def close(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("stream belongs to another event loop")
+        if self._archive is not None:
+            self._archive._reader._check_access()
         async with self._lock:
             self._archive = None
             self._cursor = None

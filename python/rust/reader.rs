@@ -7,16 +7,12 @@ use pyo3::{
 use std::{
     future::Future,
     ops::Deref,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
-use super::request::FailureSlot;
-use crate::support::{PyCause, core_error, py_io};
-use zstar::{ObjectResolver, ReaderOptions};
+use crate::support::{core_error, py_io};
+use zstar::ReaderOptions;
 
 pub type Reader = zstar::Archive<dyn zstar::AsyncRangeReader>;
 
@@ -29,7 +25,7 @@ pub struct MemberCursor {
     size: u64,
 }
 struct MemberState {
-    cursor: zstar::FileCursor,
+    cursor: zstar::backend::FileCursor,
     position: Mutex<u64>,
 }
 impl MemberCursor {
@@ -39,25 +35,20 @@ impl MemberCursor {
             .await
             .map_err(crate::support::core_error)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(path.to_owned()))?;
-        match entry.kind {
+        match entry.kind() {
             zstar::EntryKind::Directory => {
                 return Err(pyo3::exceptions::PyIsADirectoryError::new_err(
                     path.to_owned(),
                 ));
             }
             zstar::EntryKind::Symlink => {
-                return Python::attach(|py| {
-                    let error = py
-                        .import("tarfile")?
-                        .getattr("ExtractError")?
-                        .call1(("cannot open a symlink as a file",))?;
-                    Err(PyErr::from_value(error))
-                });
+                return Err(core_error(zstar::Error::Unsupported(
+                    "cannot open a symlink as a file",
+                )));
             }
             zstar::EntryKind::File => (),
         }
-        let cursor = reader
-            .open_cursor(path)
+        let cursor = zstar::backend::open_cursor(reader, path)
             .await
             .map_err(crate::support::core_error)?;
         Ok(Self {
@@ -95,7 +86,7 @@ impl MemberCursor {
         buffer: &WritableBuffer,
     ) -> PyResult<usize> {
         let count = self.size.saturating_sub(start).min(buffer.length as u64);
-        let step = reader.max_read_bytes().max(1);
+        let step = reader.max_read_bytes().clamp(1, 1 << 20);
         let mut done = 0;
         while done < count {
             let bytes = self
@@ -238,19 +229,22 @@ pub fn member_read_length(size: Option<&Bound<'_, PyAny>>) -> PyResult<Option<u6
 /// Owns a reader snapshot. Adapters admit operations through short-lived leases;
 /// closing stops admission without holding a lock while calling Python.
 pub struct Session {
-    owner: Mutex<Owner>,
+    owner: Arc<Mutex<Owner>>,
+    scope: Arc<Mutex<Option<Arc<crate::dispatch::Scope>>>>,
+    native_token: Option<u64>,
+    terminal: crate::completion::Completion,
 }
 struct Owner {
     open: Option<Arc<State>>,
-    closing: Weak<State>,
+    closing: Option<Arc<State>>,
 }
 pub struct State {
     pub reader: Reader,
-    pub resolver: Option<Arc<dyn ObjectResolver>>,
     closed: watch::Sender<bool>,
-    active: AtomicUsize,
-    drained: Notify,
-    failures: Option<Arc<FailureSlot>>,
+    jobs: crate::dispatch::JobCounter,
+    native_owner: Option<Py<PyAny>>,
+    native_source: Option<Arc<crate::sources::SourceState>>,
+    owned: bool,
 }
 pub struct Lease(Arc<State>);
 impl Deref for Lease {
@@ -261,127 +255,157 @@ impl Deref for Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.drained.notify_waiters();
-        }
+        self.jobs.exit();
     }
 }
 impl Session {
-    pub async fn open(
+    pub async fn open_scoped(
         source: Arc<dyn zstar::AsyncRangeReader>,
         options: ReaderOptions,
-        failures: Option<Arc<FailureSlot>>,
+        scope: Arc<crate::dispatch::Scope>,
+        native_owner: Option<Py<PyAny>>,
+        native_token: Option<u64>,
+        native_source: Option<Arc<crate::sources::SourceState>>,
+        owned: bool,
     ) -> PyResult<Self> {
-        let resolver = options.resolver.clone();
-        let reader = Reader::open_with_options(source, options)
-            .await
-            .map_err(crate::support::core_error)
-            .map_err(|error| match &failures {
-                Some(failures) => failures.annotate(error),
-                None => error,
-            })?;
+        let reader = match Reader::open_with_options(source, options).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                scope.drain().await;
+                if owned && let Some(source) = native_source {
+                    source.close().await;
+                }
+                return Err(core_error(error));
+            }
+        };
         Ok(Self {
-            owner: Mutex::new(Owner {
+            owner: Arc::new(Mutex::new(Owner {
                 open: Some(Arc::new(State {
                     reader,
-                    resolver,
                     closed: watch::channel(false).0,
-                    active: AtomicUsize::new(0),
-                    drained: Notify::new(),
-                    failures,
+                    jobs: crate::dispatch::JobCounter::default(),
+                    native_owner,
+                    native_source,
+                    owned,
                 })),
-                closing: Weak::new(),
-            }),
+                closing: None,
+            })),
+            scope: Arc::new(Mutex::new(Some(scope))),
+            native_token,
+            terminal: crate::completion::Completion::default(),
         })
-    }
-    pub async fn from_bytes(data: Vec<u8>, options: ReaderOptions) -> PyResult<Self> {
-        Self::open(Arc::new(bytes::Bytes::from(data)), options, None).await
-    }
-    pub async fn from_file(path: std::path::PathBuf, options: ReaderOptions) -> PyResult<Self> {
-        let source = zstar::fs::AsyncLocalFileSource::open(path)
-            .await
-            .map_err(crate::support::local_source_error)?;
-        Self::open(Arc::new(source), options, None).await
-    }
-    pub async fn from_python(
-        source: Py<PyAny>,
-        size: u64,
-        options: ReaderOptions,
-    ) -> PyResult<Self> {
-        Self::open(Arc::new(PythonSource::new(source, size)), options, None).await
-    }
-    pub async fn from_fileobj(file: Py<PyAny>, options: ReaderOptions) -> PyResult<Self> {
-        static CAPACITY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
-        let (source, size) = crate::support::blocking(&CAPACITY, move || {
-            Python::attach(|py| {
-                let source = py
-                    .import("zstar._source")?
-                    .getattr("_FileSource")?
-                    .call1((file,))?;
-                let size = source.getattr("size")?.extract()?;
-                Ok((source.unbind(), size))
-            })
-        })
-        .await?;
-        Self::from_python(source, size, options).await
-    }
-    pub async fn from_s3(
-        builder: zstar::s3::AmazonS3Builder,
-        key: String,
-        prefix: Option<String>,
-        mut options: ReaderOptions,
-    ) -> PyResult<Self> {
-        let source = super::s3::source(builder, key, prefix, &mut options).map_err(core_error)?;
-        Self::open(source, options, None).await
     }
     pub fn lease(&self) -> PyResult<Lease> {
+        Python::attach(|py| self.check_access(py))?;
         let admitted = {
             let owner = crate::support::lock_state(&self.owner);
             owner.open.as_ref().map(|state| {
-                state.active.fetch_add(1, Ordering::Relaxed);
+                state.jobs.enter();
                 state.clone()
             })
         };
         admitted
             .map(Lease)
-            .ok_or_else(|| crate::support::core_error(zstar::Error::Unsupported("reader closed")))
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("archive closed"))
+    }
+    pub fn check_access(&self, py: Python<'_>) -> PyResult<()> {
+        let scope = crate::support::lock_state(&self.scope).clone();
+        if let Some(scope) = scope {
+            scope.reject(py)?;
+        }
+        if let Some(token) = self.native_token {
+            crate::dispatch::callbacks(py)?.reject.call1(py, (token,))?;
+        }
+        Ok(())
     }
     pub fn closed(&self) -> bool {
         crate::support::lock_state(&self.owner).open.is_none()
     }
     /// Stop admission and cancel async work immediately, even if the adapter's
     /// close awaitable is dropped. Repeated closers join the same active state.
-    pub fn close(&self) -> Closing {
+    fn begin_close(&self) -> Closing {
         let state = {
             let mut owner = crate::support::lock_state(&self.owner);
             if let Some(state) = owner.open.take() {
-                owner.closing = Arc::downgrade(&state);
+                owner.closing = Some(state.clone());
                 Some(state)
             } else {
-                owner.closing.upgrade()
+                owner.closing.clone()
             }
         };
         if let Some(state) = &state {
             state.closed.send_replace(true);
         }
-        Closing(state)
+        Closing {
+            state,
+            scope: self.scope.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+    pub fn close(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<impl Future<Output = PyResult<()>> + Send + 'static> {
+        self.check_access(py)?;
+        self.start_close(py)?;
+        Ok(self.terminal.wait())
+    }
+    fn start_close(&self, py: Python<'_>) -> PyResult<()> {
+        self.terminal.start(py, || {
+            let closing = self.begin_close();
+            async move {
+                closing.drain().await;
+                Ok(())
+            }
+        })
+    }
+    pub fn clear(&self) {
+        let _ = Python::attach(|py| self.start_close(py));
+        self.terminal.clear();
+    }
+    pub fn traverse(&self, visit: &pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+        if let Some(scope) = crate::support::lock_state(&self.scope).as_ref() {
+            scope.traverse(visit)?;
+        }
+        let owner = crate::support::lock_state(&self.owner);
+        if let Some(state) = owner.open.as_ref().or(owner.closing.as_ref()) {
+            visit.call(&state.native_owner)?;
+        }
+        drop(owner);
+        self.terminal.traverse(visit)?;
+        Ok(())
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = Python::attach(|py| self.start_close(py));
     }
 }
 /// Keeps the closing state alive while an async adapter drains admitted work.
-pub struct Closing(Option<Arc<State>>);
+pub struct Closing {
+    state: Option<Arc<State>>,
+    owner: Arc<Mutex<Owner>>,
+    scope: Arc<Mutex<Option<Arc<crate::dispatch::Scope>>>>,
+}
 impl Closing {
     pub async fn drain(self) {
-        if let Some(state) = self.0 {
-            loop {
-                let drained = state.drained.notified();
-                tokio::pin!(drained);
-                drained.as_mut().enable();
-                if state.active.load(Ordering::Acquire) == 0 {
-                    break;
+        if let Some(state) = self.state {
+            state.jobs.drain().await;
+            if let Some(source) = &state.native_source {
+                source.drain_callbacks().await;
+                if state.owned {
+                    source.clone().close().await;
                 }
-                drained.await;
             }
         }
+        let scope = crate::support::lock_state(&self.scope).clone();
+        if let Some(scope) = scope {
+            scope.drain().await;
+        }
+        let scope = crate::support::lock_state(&self.scope).take();
+        drop(scope);
+        let state = crate::support::lock_state(&self.owner).closing.take();
+        drop(state);
     }
 }
 impl Lease {
@@ -396,355 +420,116 @@ impl Lease {
                     let _ = closed.changed().await;
                 }
             } => Err(crate::support::core_error(zstar::Error::Unsupported("reader closed"))),
-            result = work => result.map_err(|error| match &self.failures {
-                Some(failures) => failures.annotate(error),
-                None => error,
-            }),
+            result = work => result,
         }
     }
 }
 impl State {
-    pub async fn member_info(&self, path: &str) -> PyResult<Option<Py<PyAny>>> {
-        let entry = self.reader.entry(path).await.map_err(core_error)?;
-        Python::attach(|py| {
-            entry
-                .as_ref()
-                .map(|entry| member_metadata(py, entry))
-                .transpose()
-        })
+    async fn check_file(&self, path: &str) -> PyResult<()> {
+        let entry = self
+            .reader
+            .entry(path)
+            .await
+            .map_err(core_error)?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(path.to_owned()))?;
+        match entry.kind() {
+            zstar::EntryKind::File => Ok(()),
+            zstar::EntryKind::Directory => Err(pyo3::exceptions::PyIsADirectoryError::new_err(
+                path.to_owned(),
+            )),
+            zstar::EntryKind::Symlink => Err(core_error(zstar::Error::Unsupported(
+                "cannot read a symlink as a file",
+            ))),
+        }
     }
 
-    fn object_resolver<'a>(
-        &'a self,
-        resolver: Option<&'a dyn ObjectResolver>,
-    ) -> Option<&'a dyn ObjectResolver> {
-        resolver.or(self.resolver.as_deref())
+    /// Map a failed read, giving missing/kind errors the precedence they had when
+    /// every path was checked up front. Only failures pay for the extra lookup.
+    async fn read_error(
+        &self,
+        paths: impl IntoIterator<Item = &str>,
+        error: zstar::Error,
+    ) -> PyErr {
+        for path in paths {
+            if let Err(error) = self.check_file(path).await {
+                return error;
+            }
+        }
+        core_error(error)
     }
-    async fn read_length(
+
+    async fn read_range(
         &self,
         path: &str,
         offset: u64,
         length: Option<u64>,
-    ) -> zstar::Result<u64> {
-        match length {
-            Some(length) => Ok(length),
+    ) -> zstar::Result<std::ops::Range<u64>> {
+        let end = match length {
+            Some(length) => offset.checked_add(length).ok_or(zstar::Error::Range)?,
             None => self
                 .reader
                 .entry(path)
                 .await?
                 .ok_or_else(|| zstar::Error::MissingEntry(path.into()))?
-                .size()?
-                .checked_sub(offset)
-                .ok_or(zstar::Error::Range),
-        }
-    }
-    async fn read_bytes(
-        &self,
-        path: &str,
-        offset: u64,
-        length: Option<u64>,
-        resolver: Option<&dyn ObjectResolver>,
-    ) -> zstar::Result<bytes::Bytes> {
-        let length = self.read_length(path, offset, length).await?;
-        self.reader
-            .read_range_with_resolver(path, offset, length, self.object_resolver(resolver))
-            .await
-    }
-    async fn read_bytes_with_report(
-        &self,
-        path: &str,
-        offset: u64,
-        length: Option<u64>,
-        resolver: Option<&dyn ObjectResolver>,
-    ) -> zstar::Result<(bytes::Bytes, zstar::ReadReport)> {
-        let length = self.read_length(path, offset, length).await?;
-        self.reader
-            .read_range_with_report_and_resolver(
-                path,
-                offset,
-                length,
-                self.object_resolver(resolver),
-            )
-            .await
-    }
-    async fn read_many_bytes(
-        &self,
-        requests: &[(String, u64, u64)],
-        resolver: Option<&dyn ObjectResolver>,
-    ) -> zstar::Result<Vec<bytes::Bytes>> {
-        let requests: Vec<_> = requests
-            .iter()
-            .map(|(path, offset, length)| zstar::ReadRequest {
-                path,
-                offset: *offset,
-                length: *length,
-            })
-            .collect();
-        self.reader
-            .read_many_with_resolver(&requests, self.object_resolver(resolver))
-            .await
-    }
-}
-
-/// One keyword parser and set of defaults for every native reader factory.
-#[pyclass(module = "zstar._native", frozen)]
-pub struct ReaderConfig {
-    inner: ReaderOptions,
-}
-#[pymethods]
-impl ReaderConfig {
-    #[new]
-    #[pyo3(signature = (*,
-            limits = None,
-            concurrent_chunks = 8,
-            verify_external = false,
-            memory_bytes = 8 << 20,
-            max_encoded_bytes = 4 << 30,
-            max_decoded_bytes = 4 << 30,
-            max_read_bytes = 64 << 20,
-            max_retained_entry_bytes = 1 << 30,
-            max_entries = 0,
-            max_spool_bytes = 4 << 30,
-            create_spill_store = None,
-            resolver = None,
-    ))]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Shared Python constructor keyword options."
-    )]
-    fn new(
-        py: Python<'_>,
-        limits: Option<&Bound<'_, pyo3::types::PyDict>>,
-        concurrent_chunks: usize,
-        verify_external: bool,
-        memory_bytes: u64,
-        max_encoded_bytes: u64,
-        max_decoded_bytes: u64,
-        max_read_bytes: u64,
-        max_retained_entry_bytes: u64,
-        max_entries: u64,
-        max_spool_bytes: u64,
-        create_spill_store: Option<Py<PyAny>>,
-        resolver: Option<Py<PyAny>>,
-    ) -> PyResult<Self> {
-        let options = ReaderOptions {
-            concurrent_chunks,
-            verify_external,
-            resolver: resolver
-                .map(|r| super::external::binding(py, r))
-                .transpose()?,
-            limits: self::limits(limits)?,
-            max_read_bytes,
-            metadata: zstar::MetadataReaderOptions {
-                spool: zstar::SpoolOptions {
-                    memory_bytes,
-                    budget: Arc::new(zstar::SpoolBudget::new(max_spool_bytes)),
-                    create_store: super::manifest::spill_factory(py, create_spill_store)?,
-                    ..Default::default()
-                },
-                max_encoded_bytes,
-                max_decoded_bytes,
-                max_retained_entry_bytes,
-                max_entries,
-            },
+                .size(),
         };
-        Ok(Self { inner: options })
-    }
-}
-
-pub fn reader_options(
-    py: Python<'_>,
-    options: Option<&Bound<'_, pyo3::types::PyDict>>,
-) -> PyResult<ReaderOptions> {
-    if let Some(resolver) = options
-        .map(|o| o.get_item("resolver"))
-        .transpose()?
-        .flatten()
-        && !resolver.is_none()
-        && crate::callback::AsyncCallback::is_async_method(py, &resolver.unbind(), "get_encoded")?
-    {
-        return Err(pyo3::exceptions::PyTypeError::new_err(
-            "use AsyncArchive for async resolvers",
-        ));
-    }
-    async_reader_options(py, options)
-}
-
-pub fn async_reader_options(
-    py: Python<'_>,
-    options: Option<&Bound<'_, pyo3::types::PyDict>>,
-) -> PyResult<ReaderOptions> {
-    let config = py.get_type::<ReaderConfig>().call((), options)?;
-    Ok(config.extract::<PyRef<'_, ReaderConfig>>()?.inner.clone())
-}
-
-pub fn batch_requests(requests: &Bound<'_, PyAny>) -> PyResult<Vec<(String, u64, u64)>> {
-    let count = requests.len()?;
-    if count > zstar::MAX_BATCH_REQUESTS {
-        return Err(core_error(zstar::Error::Budget("batch request count")));
-    }
-    (0..count)
-        .map(|index| requests.get_item(index)?.extract())
-        .collect()
-}
-
-pub fn report_dict(py: Python<'_>, report: zstar::ReadReport) -> PyResult<Py<pyo3::types::PyDict>> {
-    let result = pyo3::types::PyDict::new(py);
-    result.set_item("metadata_validated", report.metadata_validated)?;
-    result.set_item("data_frames_checked", report.data_frames_checked)?;
-    result.set_item(
-        "external_objects_sha256_checked",
-        report
-            .external_objects_sha256_checked
-            .iter()
-            .map(zstar::backend::manifest::object_address)
-            .collect::<Vec<_>>(),
-    )?;
-    result.set_item(
-        "external_objects_unchecked",
-        report
-            .external_objects_unchecked
-            .iter()
-            .map(zstar::backend::manifest::object_address)
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(result.unbind())
-}
-
-struct PythonSource {
-    object: Arc<Py<PyAny>>,
-    size: u64,
-    permits: Arc<tokio::sync::Semaphore>,
-    callback: Option<crate::callback::AsyncCallback>,
-}
-impl PythonSource {
-    fn new(source: Py<PyAny>, size: u64) -> Self {
-        Self {
-            object: Arc::new(source),
-            size,
-            permits: Arc::new(tokio::sync::Semaphore::new(8)),
-            callback: None,
+        if end < offset {
+            return Err(zstar::Error::Range);
         }
+        Ok(offset..end)
     }
-}
-
-#[async_trait::async_trait]
-impl zstar::AsyncRangeReader for PythonSource {
-    async fn size(&self) -> zstar::Result<u64> {
-        Ok(self.size)
-    }
-    async fn read_range(&self, range: std::ops::Range<u64>) -> zstar::Result<bytes::Bytes> {
-        zstar::backend::checked_range(
-            range.start,
-            range
-                .end
-                .checked_sub(range.start)
-                .ok_or(zstar::Error::Range)?,
-            self.size,
-        )?;
-        if let Some(callback) = &self.callback {
-            let args = Python::attach(|py| {
-                (range.start, range.end - range.start)
-                    .into_pyobject(py)
-                    .map(Bound::unbind)
-            })
-            .map_err(|error| zstar::Error::Io(py_io(error)))?;
-            let value = callback
-                .call(args)
-                .await
-                .map_err(|error| zstar::Error::Io(py_io(error)))?;
-            let bytes = Python::attach(|py| -> PyResult<Vec<u8>> {
-                if value.bind(py).len()? as u64 != range.end - range.start {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "short range response",
-                    ));
-                }
-                value.extract(py)
-            })
-            .map_err(|error| zstar::Error::Io(py_io(error)))?;
-            return Ok(bytes::Bytes::from(bytes));
-        }
-        let object = self.object.clone();
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
+    pub async fn entry_value(&self, path: &str) -> PyResult<Option<crate::values::EntryValue>> {
+        self.reader
+            .entry_layout(path)
             .await
-            .map_err(|_| zstar::Error::Unsupported("source closed"))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let bytes: Vec<u8> = Python::attach(|py| -> PyResult<Vec<u8>> {
-                let value = object.call_method1(
-                    py,
-                    "read_range",
-                    (range.start, range.end - range.start),
-                )?;
-                if value.bind(py).len()? as u64 != range.end - range.start {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "short range response",
-                    ));
-                }
-
-                value.extract(py)
-            })
-            .map_err(|error| zstar::Error::Io(PyCause::io(error.to_string(), error)))?;
-            if bytes.len() as u64 != range.end - range.start {
-                return Err(zstar::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "short range response",
-                )));
-            }
-            Ok(bytes::Bytes::from(bytes))
-        })
-        .await
-        .map_err(|_| zstar::Error::Io(std::io::Error::other("Python source worker failed")))?
-    }
-}
-
-impl State {
-    pub async fn entry(&self, path: &str) -> PyResult<Option<Py<PyAny>>> {
-        let entry = self.reader.entry(path).await.map_err(core_error)?;
-        Python::attach(|py| {
-            entry
-                .map(|entry| super::manifest::to_py(py, &entry.to_value()))
-                .transpose()
-        })
+            .map_err(core_error)?
+            .map(crate::values::EntryValue::new)
+            .transpose()
     }
     pub async fn read(
         &self,
         path: &str,
         offset: u64,
         length: Option<u64>,
-        resolver: Option<&dyn ObjectResolver>,
     ) -> PyResult<Py<PyBytes>> {
-        let bytes = self
-            .read_bytes(path, offset, length, resolver)
-            .await
-            .map_err(core_error)?;
+        let result = async {
+            let range = self.read_range(path, offset, length).await?;
+            self.reader.read_range(path, range).await
+        }
+        .await;
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(self.read_error([path], error).await),
+        };
         Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
-    }
-    pub async fn read_with_report(
-        &self,
-        path: &str,
-        offset: u64,
-        length: Option<u64>,
-        resolver: Option<&dyn ObjectResolver>,
-    ) -> PyResult<(Py<PyBytes>, Py<pyo3::types::PyDict>)> {
-        let (bytes, report) = self
-            .read_bytes_with_report(path, offset, length, resolver)
-            .await
-            .map_err(core_error)?;
-        Python::attach(|py| Ok((PyBytes::new(py, &bytes).unbind(), report_dict(py, report)?)))
     }
     pub async fn read_many(
         &self,
-        requests: &[(String, u64, u64)],
-        resolver: Option<&dyn ObjectResolver>,
+        requests: &[(String, u64, Option<u64>)],
     ) -> PyResult<Vec<Py<PyBytes>>> {
-        let bytes = self
-            .read_many_bytes(requests, resolver)
-            .await
-            .map_err(core_error)?;
+        let mut batch = Vec::with_capacity(requests.len());
+        for (path, offset, length) in requests {
+            let length = match length {
+                Some(length) => *length,
+                None => match self.read_range(path, *offset, None).await {
+                    Ok(range) => range.end - range.start,
+                    Err(error) => return Err(self.read_error([path.as_str()], error).await),
+                },
+            };
+            batch.push(zstar::ReadRequest {
+                path,
+                offset: *offset,
+                length,
+            });
+        }
+        let bytes = match self.reader.read_many(&batch).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // Collected first: a borrowing iterator here breaks the `Send` bound.
+                let paths: Vec<&str> = batch.iter().map(|request| request.path).collect();
+                return Err(self.read_error(paths, error).await);
+            }
+        };
         Ok(Python::attach(|py| {
             bytes
                 .iter()
@@ -752,9 +537,32 @@ impl State {
                 .collect()
         }))
     }
-    pub async fn read_link(&self, path: &str) -> PyResult<String> {
-        self.reader.read_link(path).await.map_err(core_error)
+}
+
+pub fn request_values(requests: &Bound<'_, PyAny>) -> PyResult<Vec<(String, u64, Option<u64>)>> {
+    let count = requests.len()?;
+    if count > zstar::MAX_BATCH_REQUESTS {
+        return Err(core_error(zstar::Error::budget(
+            zstar::BudgetResource::BatchRequests,
+            "batch request count",
+        )));
     }
+    (0..count)
+        .map(|index| {
+            let request = requests.get_item(index)?;
+            Ok((
+                request.getattr("path")?.extract()?,
+                request
+                    .getattr("offset")?
+                    .extract::<crate::support::Unsigned>()?
+                    .0,
+                request
+                    .getattr("length")?
+                    .extract::<Option<crate::support::Unsigned>>()?
+                    .map(|length| length.0),
+            ))
+        })
+        .collect()
 }
 
 /// Shared transactional metadata cursor. Each adapter leases the parent anew;
@@ -763,50 +571,18 @@ pub struct EntryIterator {
     prefix: Option<String>,
     checkpoint: Option<zstar::backend::EntryCursor>,
     exhausted: bool,
-    buffer: std::collections::VecDeque<Py<PyAny>>,
-    projection: MetadataProjection,
-}
-
-#[derive(Clone, Copy)]
-pub enum MetadataProjection {
-    Wire,
-    Member,
-    Name,
-}
-
-fn member_metadata(py: Python<'_>, entry: &zstar::Entry) -> PyResult<Py<PyAny>> {
-    Ok((
-        &entry.path,
-        entry.kind.code(),
-        entry.mode,
-        entry.uid,
-        entry.gid,
-        entry.mtime_ns,
-        entry.size().map_err(core_error)?,
-        entry.linkname.as_deref().unwrap_or(""),
-        !entry.attributes.is_empty(),
-    )
-        .into_pyobject(py)?
-        .into_any()
-        .unbind())
 }
 
 impl EntryIterator {
     pub const fn new(prefix: Option<String>) -> Self {
-        Self::projected(prefix, MetadataProjection::Wire)
-    }
-
-    pub const fn projected(prefix: Option<String>, projection: MetadataProjection) -> Self {
         Self {
             prefix,
             checkpoint: None,
             exhausted: false,
-            buffer: std::collections::VecDeque::new(),
-            projection,
         }
     }
-    pub async fn next_batch(&mut self, reader: &Reader, limit: usize) -> PyResult<Vec<Py<PyAny>>> {
-        if self.buffer.is_empty() && !self.exhausted {
+    pub async fn next_batch(&mut self, reader: &Reader) -> PyResult<Vec<Py<PyAny>>> {
+        if !self.exhausted {
             let checkpoint = match self.checkpoint.clone() {
                 Some(checkpoint) => checkpoint,
                 None => match &self.prefix {
@@ -821,56 +597,104 @@ impl EntryIterator {
                 .map_err(core_error)?;
             let output = Python::attach(|py| {
                 entries
-                    .iter()
-                    .map(|entry| match self.projection {
-                        MetadataProjection::Wire => super::manifest::to_py(py, &entry.to_value()),
-                        MetadataProjection::Member => member_metadata(py, entry),
-                        MetadataProjection::Name => {
-                            Ok(entry.path.as_str().into_pyobject(py)?.into_any().unbind())
-                        }
-                    })
-                    .collect::<PyResult<std::collections::VecDeque<_>>>()
+                    .into_iter()
+                    .map(
+                        |entry| Ok(Py::new(py, crate::values::EntryValue::new(entry)?)?.into_any()),
+                    )
+                    .collect::<PyResult<Vec<_>>>()
             })?;
             self.exhausted = output.is_empty();
             self.checkpoint = Some(checkpoint);
-            self.buffer = output;
+            return Ok(output);
         }
-        Ok(self.buffer.drain(..limit.min(self.buffer.len())).collect())
+        Ok(Vec::new())
     }
 }
 
-/// Parse caller policy without introducing wire-format maxima.
-pub fn limits(options: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<zstar::Limits> {
-    let mut result = zstar::Limits::default();
-    if let Some(options) = options {
-        for (key, value) in options {
-            let key: String = key.extract()?;
-            let field = match key.as_str() {
-                "max_frame_encoded_bytes" => &mut result.max_frame_encoded_bytes,
-                "max_frame_decoded_bytes" => &mut result.max_frame_decoded_bytes,
-                "max_window_bytes" => &mut result.max_window_bytes,
-                "max_entry_bytes" => &mut result.max_entry_bytes,
-                "max_extents" => &mut result.max_extents,
-                "max_pointer_bytes" => &mut result.max_pointer_bytes,
-                _ => {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "unknown limit: {key}"
-                    )));
-                }
-            };
-            *field = value.extract()?;
-        }
+/// Exact-range source using the explicit mode selected by the owning facade.
+struct ProtocolSource {
+    size: u64,
+    read: crate::dispatch::Callback,
+}
+#[async_trait::async_trait]
+impl zstar::AsyncRangeReader for ProtocolSource {
+    async fn size(&self) -> zstar::Result<u64> {
+        Ok(self.size)
     }
-    Ok(result)
+    async fn read_range(&self, range: std::ops::Range<u64>) -> zstar::Result<bytes::Bytes> {
+        let length = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(zstar::Error::Range)?;
+        zstar::backend::checked_range(range.start, length, self.size)?;
+        let args = Python::attach(|py| (range.start, length).into_pyobject(py).map(Bound::unbind))
+            .map_err(|error| zstar::Error::Io(py_io(error)))?;
+        let value = self
+            .read
+            .call(args)
+            .await
+            .map_err(|error| zstar::Error::Io(py_io(error)))?;
+        Python::attach(|py| {
+            let value = value.bind(py).cast::<PyBytes>()?;
+            if value.as_bytes().len() as u64 != length {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "range source must return exactly the requested bytes",
+                ));
+            }
+            // Share the immutable Python bytes instead of copying them.
+            Ok(bytes::Bytes::from_owner(
+                pyo3::pybacked::PyBackedBytes::from(value.clone()),
+            ))
+        })
+        .map_err(|error| zstar::Error::Io(py_io(error)))
+    }
 }
 
-pub fn python_source(
+pub fn protocol_open(
     py: Python<'_>,
     source: Py<PyAny>,
-    size: u64,
-) -> PyResult<Arc<dyn zstar::AsyncRangeReader>> {
-    let callback = crate::callback::AsyncCallback::detect(py, &source, "read_range")?;
-    let mut reader = PythonSource::new(source, size);
-    reader.callback = callback;
-    Ok(Arc::new(reader))
+    options: &crate::config::ReaderConfig,
+    asynchronous: bool,
+    owned: bool,
+) -> PyResult<impl Future<Output = PyResult<Session>> + Send + 'static> {
+    // Complete policy conversion and callable validation before any source I/O.
+    let scope = crate::dispatch::Scope::new(py, asynchronous)?;
+    let policy = options.bind(py, &scope)?;
+    let native = crate::sources::native_source(py, &source, asynchronous)?;
+    let callbacks = if native.is_none() {
+        Some((
+            scope.protocol_callback(py, source.clone_ref(py), "size")?,
+            scope.protocol_callback(py, source.clone_ref(py), "read_at")?,
+        ))
+    } else {
+        None
+    };
+    Ok(async move {
+        let native_source = native.clone();
+        let (source, native_owner, native_token): (Arc<dyn zstar::AsyncRangeReader>, _, _) =
+            if let Some(native) = native {
+                let token = native.token;
+                (native, Some(source), Some(token))
+            } else {
+                let (size, read) = callbacks.unwrap();
+                let args = Python::attach(|py| pyo3::types::PyTuple::empty(py).unbind());
+                let value = size
+                    .call(args)
+                    .await
+                    .map_err(|error| core_error(zstar::Error::Io(py_io(error))))?;
+                let size =
+                    Python::attach(|py| value.bind(py).extract::<crate::support::Unsigned>())?.0;
+                (Arc::new(ProtocolSource { size, read }), None, None)
+            };
+        Session::open_scoped(
+            source,
+            policy,
+            scope,
+            native_owner,
+            native_token,
+            native_source,
+            owned,
+        )
+        .await
+    })
 }

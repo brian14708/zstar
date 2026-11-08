@@ -45,7 +45,8 @@ sync with the programs. Missing regions fail the site build.
 ## Python API generation
 
 starlight-pydocs generates `/zstar/api/python/` from `python/src/` using locked
-Griffe static analysis. It follows public exports in `zstar` and `zstar.types`,
+Griffe static analysis. It follows public exports in `zstar`, `zstar.types`,
+and optional `zstar.fsspec`,
 including the fsspec filesystem, without a native build or installed wheel.
 
 The extraction adapter in `scripts/extract-python-api.py` resolves internal

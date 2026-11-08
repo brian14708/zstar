@@ -24,13 +24,13 @@ use zstar::http::{
 /// `ZstarError`. Best effort: with several concurrent failures the most recent
 /// exception wins.
 #[derive(Default)]
-pub struct FailureSlot(std::sync::Mutex<Option<PyErr>>);
+struct FailureSlot(std::sync::Mutex<Option<PyErr>>);
 impl FailureSlot {
     fn record(&self, error: PyErr) {
         let previous = crate::support::lock_state(&self.0).replace(error);
         drop(previous); // After the guard: dropping may run Python code.
     }
-    pub(crate) fn annotate(&self, error: PyErr) -> PyErr {
+    fn annotate(&self, error: PyErr) -> PyErr {
         Python::attach(|py| {
             if error.is_instance_of::<crate::support::ZstarError>(py)
                 && error
@@ -105,43 +105,87 @@ impl RequestProvider for PythonProvider {
         let value = future.await.map_err(|e| failed(&self.failures, e))?;
         // The callback completed. No cancellation is needed when parsing it.
         task.0 = None;
-        Python::attach(|py| -> PyResult<ExpiringRequest> {
-            let value = value.bind(py).cast::<PyDict>()?;
-            let url = value
-                .get_item("url")?
-                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing URL"))?
-                .extract::<String>()?;
-            let headers = value
-                .get_item("headers")?
-                .filter(|v| !v.is_none())
-                .map(|v| v.extract::<BTreeMap<String, String>>())
-                .transpose()?
-                .unwrap_or_default();
-            let expires_at = value
-                .get_item("expires_in")?
-                .filter(|v| !v.is_none())
-                .map(|v| -> PyResult<_> {
-                    let seconds = v.extract::<f64>()?;
-                    if !seconds.is_finite() || !(0.0..=604_800.0).contains(&seconds) {
-                        return Err(pyo3::exceptions::PyValueError::new_err("invalid expiry"));
-                    }
-                    Ok(Instant::now() + Duration::from_secs_f64(seconds))
-                })
-                .transpose()?;
-            Ok(ExpiringRequest {
-                request: PresignedRequest {
-                    method: method.into(),
-                    url,
-                    headers: headers.into_iter().collect(),
-                },
-                expires_at,
-            })
-        })
-        .map_err(|e| failed(&self.failures, e))
+        Python::attach(|py| parse_request(value.bind(py), method))
+            .map_err(|e| failed(&self.failures, e))
     }
 }
 
-pub fn source(
+fn parse_request(value: &Bound<'_, PyAny>, method: &str) -> PyResult<ExpiringRequest> {
+    let value = value.cast::<PyDict>()?;
+    let url = value
+        .get_item("url")?
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing URL"))?
+        .extract::<String>()?;
+    let headers = value
+        .get_item("headers")?
+        .filter(|v| !v.is_none())
+        .map(|v| v.extract::<BTreeMap<String, String>>())
+        .transpose()?
+        .unwrap_or_default();
+    let expires_at = value
+        .get_item("expires_in")?
+        .filter(|v| !v.is_none())
+        .map(|v| -> PyResult<_> {
+            let seconds = v.extract::<f64>()?;
+            if !seconds.is_finite() || !(0.0..=604_800.0).contains(&seconds) {
+                return Err(pyo3::exceptions::PyValueError::new_err("invalid expiry"));
+            }
+            Ok(Instant::now() + Duration::from_secs_f64(seconds))
+        })
+        .transpose()?;
+    Ok(ExpiringRequest {
+        request: PresignedRequest {
+            method: method.into(),
+            url,
+            headers: headers.into_iter().collect(),
+        },
+        expires_at,
+    })
+}
+
+struct ProtocolProvider(crate::dispatch::Callback);
+#[async_trait::async_trait]
+impl RequestProvider for ProtocolProvider {
+    async fn request(&self, method: &str, force_refresh: bool) -> std::io::Result<ExpiringRequest> {
+        let args =
+            Python::attach(|py| (method, force_refresh).into_pyobject(py).map(Bound::unbind))
+                .map_err(crate::support::py_io)?;
+        let value = self.0.call(args).await.map_err(crate::support::py_io)?;
+        Python::attach(|py| parse_request(value.bind(py), method)).map_err(crate::support::py_io)
+    }
+}
+pub fn protocol_source(
+    py: Python<'_>,
+    url: String,
+    headers: BTreeMap<String, String>,
+    provider: Option<Py<PyAny>>,
+    scope: &Arc<crate::dispatch::Scope>,
+) -> PyResult<HttpRangeSource> {
+    let transport = Arc::new(
+        ReqwestTransport::new().map_err(|error| crate::support::core_error(error.into()))?,
+    );
+    match provider {
+        None => Ok(HttpRangeSource::new(
+            transport,
+            PresignedRequest {
+                method: "GET".into(),
+                url,
+                headers: headers.into_iter().collect(),
+            },
+        )),
+        Some(provider) if headers.is_empty() => Ok(HttpRangeSource::with_provider(
+            transport,
+            Arc::new(ProtocolProvider(
+                scope.protocol_callback(py, provider, "__call__")?,
+            )),
+        )),
+        Some(_) => Err(pyo3::exceptions::PyValueError::new_err(
+            "signed providers supply their own headers",
+        )),
+    }
+}
+
+fn source(
     py: Python<'_>,
     method: &str,
     url: Option<String>,
@@ -161,24 +205,9 @@ pub fn source(
             },
         )),
         (None, Some(callback)) if headers.is_none() => {
-            let inspect = py.import("inspect")?;
-            let callable = callback.bind(py);
-            let asynchronous = inspect
-                .call_method1("iscoroutinefunction", (callable,))?
-                .is_truthy()?
-                || callable
-                    .getattr("__call__")
-                    .ok()
-                    .map(|call| -> PyResult<bool> {
-                        inspect
-                            .call_method1("iscoroutinefunction", (call,))?
-                            .is_truthy()
-                    })
-                    .transpose()?
-                    .unwrap_or(false);
-            if !asynchronous {
+            if !callback.bind(py).is_callable() {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "provider must be an async callable",
+                    "provider must be callable",
                 ));
             }
             Ok(HttpRangeSource::with_provider(
@@ -215,7 +244,8 @@ pub fn put_presigned<'py>(
     provider: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if data.len() > 64 << 20 {
-        return Err(crate::support::core_error(zstar::Error::Budget(
+        return Err(crate::support::core_error(zstar::Error::budget(
+            zstar::BudgetResource::ResponseBytes,
             "presigned PUT body",
         )));
     }

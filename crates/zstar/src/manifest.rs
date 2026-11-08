@@ -1,6 +1,6 @@
 //! Entry-oriented draft-v1 metadata. Wire tuples are deliberately separate from
 //! the typed API: callers never need to manipulate positional CBOR values.
-use crate::{Error, Result};
+use crate::{BudgetResource, Error, Result};
 use ciborium::Value;
 use std::collections::BTreeMap;
 
@@ -54,10 +54,6 @@ fn field<'a>(m: &'a [(Value, Value)], key: &str) -> Result<&'a Value> {
 pub fn decode_block(bytes: &[u8]) -> Result<Value> {
     crate::cbor::decode(bytes)
 }
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
 pub fn encode_block(value: &Value) -> Result<Vec<u8>> {
     crate::cbor::encode_checked(value)
 }
@@ -520,37 +516,10 @@ impl ManifestRoot {
     }
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-/// Decode and validate a complete manifest sequence. Storage segment
-/// boundaries are deliberately absent from this codec-independent operation.
-pub fn decode_document(bytes: &[u8], data_end: u64) -> Result<(ManifestRoot, Vec<Entry>)> {
-    decode_sequence(bytes, bytes.len() as u64, data_end)
-}
-
-pub(crate) fn decode_sequence(
-    reader: impl std::io::Read,
-    len: u64,
-    data_end: u64,
-) -> Result<(ManifestRoot, Vec<Entry>)> {
-    decode_sequence_budgeted(
-        reader,
-        len,
-        data_end,
-        RETAINED_ENTRIES_MAX,
-        0,
-        crate::Limits::default(),
-    )
-}
-
-/// Header item cap: the format does not bound root extensions, and a header
-/// item may span several metadata segments (see `manifest_io` tests), so this is
-/// a deliberate local parser budget.
+/// Default local parser budget for the manifest directory, whose extensions
+/// have no format-defined size limit.
+#[cfg(feature = "async")]
 pub(crate) const HEADER_MAX: u64 = 64 << 20;
-/// Default ceiling on estimated heap retained by the decoded entry vector.
-pub(crate) const RETAINED_ENTRIES_MAX: u64 = 4 << 30;
 
 /// True when `entry` (sorted after directory `dir`) can still be inside or
 /// adjacent to `dir`: it starts with `dir/` or sorts before `dir/` bytewise.
@@ -563,31 +532,6 @@ pub(crate) fn ancestor_retained(dir: &str, entry: &str) -> bool {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Equal => e.len() <= d.len() || e[d.len()] <= b'/',
     }
-}
-
-pub(crate) fn decode_sequence_budgeted(
-    reader: impl std::io::Read,
-    len: u64,
-    data_end: u64,
-    max_retained: u64,
-    max_entries: u64,
-    limits: crate::Limits,
-) -> Result<(ManifestRoot, Vec<Entry>)> {
-    let mut sequence = crate::cbor::SequenceDecoder::<_>::new(reader, len).with_item_limits(
-        HEADER_MAX,
-        if limits.max_entry_bytes == 0 {
-            u64::MAX
-        } else {
-            limits.max_entry_bytes
-        },
-    );
-    decode_values_budgeted(
-        std::iter::from_fn(move || sequence.next().transpose()),
-        data_end,
-        max_retained,
-        max_entries,
-        limits,
-    )
 }
 
 pub(crate) fn decode_values_budgeted(
@@ -633,7 +577,10 @@ pub(crate) fn decode_values_budgeted(
     let mut external = false;
     while let Some(value) = values.next().transpose()? {
         if max_entries != 0 && entries.len() as u64 >= max_entries {
-            return Err(Error::Budget("manifest entry count"));
+            return Err(Error::budget(
+                BudgetResource::MetadataEntries,
+                "manifest entry count",
+            ));
         }
         let entry = Entry::from_value(&value, data_end)?;
         limits.entry(&entry)?;
@@ -668,33 +615,12 @@ pub(crate) fn decode_values_budgeted(
         let entry_bytes = (std::mem::size_of::<Entry>() + std::mem::size_of::<usize>()) as u64;
         let slots = max_retained.saturating_sub(retained) / entry_bytes;
         if retained > max_retained || slots <= entries.len() as u64 {
-            return Err(Error::Budget("retained manifest entries"));
+            return Err(Error::budget(
+                BudgetResource::MetadataRetainedBytes,
+                "retained manifest entries",
+            ));
         }
-        if entries.capacity() as u64 > slots {
-            entries.shrink_to(entries.len());
-        }
-        if entries.len() == entries.capacity() {
-            // Leave half the available spare-slot budget for future owned
-            // paths/attributes, avoiding repeated compaction near a tight cap.
-            let minimum = entries.len() as u64 + 1;
-            let capacity_limit = minimum + (slots - minimum) / 2;
-            let desired = (entries.capacity().max(8) as u64)
-                .saturating_mul(2)
-                .min(capacity_limit)
-                .min(if max_entries == 0 {
-                    u64::MAX
-                } else {
-                    max_entries
-                });
-            let desired = usize::try_from(desired)
-                .map_err(|_| Error::Budget("manifest index address space"))?;
-            entries
-                .try_reserve_exact(desired - entries.len())
-                .map_err(|_| Error::Budget("retained manifest allocation"))?;
-        }
-        if entries.capacity() as u64 > slots {
-            return Err(Error::Budget("retained manifest entries"));
-        }
+        reserve_entries(&mut entries, slots, max_entries)?;
         external |= entry.is_external();
         entries.push(entry);
     }
@@ -703,6 +629,44 @@ pub(crate) fn decode_values_budgeted(
     }
     root.entry_count = entries.len() as u64;
     Ok((root, entries))
+}
+
+fn reserve_entries(entries: &mut Vec<Entry>, slots: u64, max_entries: u64) -> Result<()> {
+    if entries.capacity() as u64 > slots {
+        entries.shrink_to(entries.len());
+    }
+    if entries.len() == entries.capacity() {
+        // Leave half the available spare-slot budget for future owned
+        // paths/attributes, avoiding repeated compaction near a tight cap.
+        let minimum = entries.len() as u64 + 1;
+        let capacity_limit = minimum + (slots - minimum) / 2;
+        let desired = (entries.capacity().max(8) as u64)
+            .saturating_mul(2)
+            .min(capacity_limit)
+            .min(if max_entries == 0 {
+                u64::MAX
+            } else {
+                max_entries
+            });
+        let desired = usize::try_from(desired).map_err(|_| {
+            Error::budget(BudgetResource::IndexBytes, "manifest index address space")
+        })?;
+        entries
+            .try_reserve_exact(desired - entries.len())
+            .map_err(|_| {
+                Error::budget(
+                    BudgetResource::AllocationBytes,
+                    "retained manifest allocation",
+                )
+            })?;
+    }
+    if entries.capacity() as u64 > slots {
+        return Err(Error::budget(
+            BudgetResource::MetadataRetainedBytes,
+            "retained manifest entries",
+        ));
+    }
+    Ok(())
 }
 
 fn valid_feature(name: &str) -> bool {
@@ -743,13 +707,10 @@ fn validate_external_extents(extents: &[Extent]) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
 /// Serialize a standalone external reference with a logical size that fits uint64.
 /// No whole-file identity is stored.
-pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
+#[cfg(any(test, feature = "async"))]
+pub(crate) fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     validate_external_extents(extents)?;
     crate::cbor::encode_checked(&Value::Map(vec![
         (text("version"), number(1)),
@@ -760,11 +721,8 @@ pub fn encode_external_reference(extents: &[Extent]) -> Result<Vec<u8>> {
     ]))
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-pub fn decode_external_reference(bytes: &[u8]) -> Result<Vec<Extent>> {
+#[cfg(test)]
+pub(crate) fn decode_external_reference(bytes: &[u8]) -> Result<Vec<Extent>> {
     let value = crate::cbor::decode(bytes)?;
     let m = map(&value)?;
     if m.len() != 2 || unsigned(field(m, "version")?)? != 1 {
@@ -843,12 +801,8 @@ fn positive_offset<'de, D: serde::Deserializer<'de>>(
     Ok(value)
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
 /// Serialize a JSON content pointer, omitting zero offsets.
-pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
+pub(crate) fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
     validate_external_extents(extents)?;
     let chunks = extents
         .iter()
@@ -871,15 +825,13 @@ pub fn encode_pointer(extents: &[Extent]) -> Result<Vec<u8>> {
     .map_err(|e| Error::MalformedPointer(e.to_string()))
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
 /// Parse JSON pointer chunks with exact uint64 values and strict fields.
-pub fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
+#[cfg(test)]
+pub(crate) fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
     decode_pointer_bounded(bytes, usize::MAX)
 }
 
+#[cfg(any(test, all(feature = "fs", unix)))]
 pub(crate) fn decode_pointer_bounded(bytes: &[u8], maximum_chunks: usize) -> Result<Vec<Extent>> {
     struct ChunkVisitor(usize);
     impl<'de> serde::de::Visitor<'de> for ChunkVisitor {
@@ -964,7 +916,11 @@ pub(crate) fn entry_allocation(entry: &Entry) -> usize {
 }
 
 #[cfg(test)]
+mod hardening;
+
+#[cfg(test)]
 mod tests {
+    use super::hardening::decode_document;
     use super::*;
     #[test]
     fn document_rejects_missing_unknown_fields_and_trailing_items() {

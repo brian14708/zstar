@@ -1,10 +1,24 @@
 #![cfg(all(feature = "fs", unix))]
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path};
-use zstar::backend::SliceReader;
-use zstar::backend::{BlockingArchive, BlockingBuilder};
+use zstar::EntryKind;
+use zstar::blocking::Archive as BlockingArchive;
+use zstar::blocking::Builder as BlockingBuilder;
 use zstar::fs::{ExtractOptions, OmittedField, extract_with_report};
-use zstar::{Entry, EntryKind};
+use zstar::layout::Entry;
 
+fn header(entry: Entry, size: u64) -> zstar::Header {
+    let mut header = match entry.kind {
+        EntryKind::File => zstar::Header::file(entry.path, size),
+        EntryKind::Directory => zstar::Header::directory(entry.path),
+        EntryKind::Symlink => zstar::Header::symlink(entry.path, entry.linkname.unwrap()),
+    };
+    header.set_mode(entry.mode);
+    header.set_uid(entry.uid);
+    header.set_gid(entry.gid);
+    header.set_mtime_ns(entry.mtime_ns);
+    header.set_attributes(entry.attributes);
+    header
+}
 fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
     Entry {
         path: path.into(),
@@ -19,14 +33,14 @@ fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
     }
 }
 fn build(items: Vec<(Entry, Vec<u8>)>) -> Vec<u8> {
-    let mut writer = BlockingBuilder::new(Vec::new()).unwrap();
+    let mut writer = BlockingBuilder::try_new(Vec::new()).unwrap();
     for (entry, bytes) in items {
         if entry.kind == EntryKind::File {
             writer
-                .add_file(entry, bytes.len() as u64, &mut bytes.as_slice())
+                .append_data(header(entry, bytes.len() as u64), bytes.as_slice())
                 .unwrap();
         } else {
-            writer.add_metadata(entry).unwrap();
+            writer.append_header(header(entry, 0)).unwrap();
         }
     }
     writer.finish().unwrap()
@@ -35,13 +49,9 @@ fn run(
     bytes: &[u8],
     dest: &Path,
     options: ExtractOptions,
-) -> zstar::fs::AnyResult<zstar::fs::ExtractReport> {
-    let mut archive = BlockingArchive::open(
-        SliceReader::new(bytes),
-        zstar::backend::ManifestOptions::default(),
-    )
-    .unwrap();
-    extract_with_report(&mut archive, dest, None, options)
+) -> zstar::Result<zstar::fs::ExtractReport> {
+    let mut archive = BlockingArchive::from_bytes(bytes).unwrap();
+    extract_with_report(&mut archive, dest, options)
 }
 
 #[expect(
@@ -218,18 +228,9 @@ fn metadata_not_applied_is_reported_and_symlink_modes_do_not_abort() {
     assert_eq!(report.files, 2);
     assert_eq!(report.symlinks, 1);
     // Convenience extraction must expose the same omissions rather than discard them.
-    let mut archive = zstar::backend::BlockingArchive::open(
-        zstar::backend::SliceReader::new(&bytes),
-        zstar::backend::ManifestOptions::default(),
-    )
-    .unwrap();
-    let convenience = zstar::fs::extract_with_options(
-        &mut archive,
-        &temp.path().join("convenience"),
-        None,
-        ExtractOptions::default(),
-    )
-    .unwrap();
+    let mut archive = BlockingArchive::from_bytes(&bytes).unwrap();
+    let convenience =
+        zstar::fs::extract(&mut archive, &temp.path().join("convenience"), false).unwrap();
     assert_eq!(convenience.omitted_count(OmittedField::SpecialModeBits), 1);
     assert!(!convenience.is_lossless());
 

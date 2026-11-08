@@ -159,12 +159,18 @@ async fn http_encoded_object_resolver_fetches_bounded_complete_object() {
         resolver
             .get_encoded(address, 1, (encoded.len() - 1) as u64)
             .await,
-        Err(zstar::Error::Budget("encoded object size"))
+        Err(zstar::Error::Budget(zstar::BudgetError {
+            resource: zstar::BudgetResource::EncodedObjectBytes,
+            ..
+        }))
     ));
     assert_eq!(server.requests.lock().unwrap().len(), 3); // only the size probe
     assert!(matches!(
         resolver.get_encoded(address, 1, 0).await,
-        Err(zstar::Error::Budget("encoded object size"))
+        Err(zstar::Error::Budget(zstar::BudgetError {
+            resource: zstar::BudgetResource::EncodedObjectBytes,
+            ..
+        }))
     ));
     assert_eq!(server.requests.lock().unwrap().len(), 3);
 }

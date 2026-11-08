@@ -1,331 +1,94 @@
-"""Entry-oriented manifests use the same tuples in every SDK."""
-
-import asyncio
-import io
-import os
-import subprocess
-import sys
-from pathlib import Path
+"""Lazy typed readers preserve format validation, batching, and close semantics."""
 
 import pytest
 import zstar
-import zstar._native
-from zstar import ZstarError, _native
-from zstar._native import (
-    EntryArchiveWriter,
-    ManifestArchive,
-    decode_manifest_block,
-    encode_manifest_block,
-)
+from _support import pack_file
+from zstar import ReadRequest, ZstarError, _native
+from zstar.types import ReaderOptions
 
 
-@pytest.fixture
-def open_manifest(source_factory):
-    return lambda data, **options: ManifestArchive(source_factory(data), len(data), **options)
+def test_indexed_open_fetches_directory_then_selected_page_and_payload(source_factory):
+    source = source_factory(pack_file("data", b"hello"))
+    with zstar.open(source) as archive:
+        assert source.calls == 2
+        assert archive.entry("data").size == 5
+        assert source.calls == 3
+        assert archive.read("data", offset=5, length=0) == b""
+        assert source.calls == 3
+        assert archive.read("data", offset=1, length=3) == b"ell"
+        assert source.calls == 4
 
 
-def test_native_cbor_value_conversion():
-    value = {"x-values": (2**64 - 1, -(2**63), b"bytes", True, {"text": "value"})}
-    assert decode_manifest_block(encode_manifest_block(value)) == value
-    with pytest.raises((ZstarError, TypeError)):
-        encode_manifest_block({"x-float": 0.5})
+def test_source_short_reads_rejected_as_io_with_cause():
+    class Short:
+        def size(self):
+            return 100
 
-
-def test_native_lossless_metadata_remains_owned_and_validated():
-    fields = {"x-project": {"revision": 3, "tags": ("one", b"two")}}
-    entry = ("file", 0, 0o640, 12, 34, 123456789, (), fields)
-    output = io.BytesIO()
-    with EntryArchiveWriter(output, root_extensions=fields) as writer:
-        writer.add(entry, io.BytesIO(b"hello"), 5)
-    data = output.getvalue()
-    with _native.SyncArchive.from_bytes(data) as archive:
-        assert archive.root_extensions == fields
-        archive.root_extensions.clear()
-        assert archive.root_extensions == fields
-        saved = archive.entry("file")
-        assert saved[:6] == entry[:6]
-        assert saved[7] == fields
-        assert list(archive.iter_entries()) == [saved]
-
-    async def run():
-        async with await _native.AsyncArchive.from_bytes(data) as archive:
-            assert archive.root_extensions == fields
-            saved = await archive.entry("file")
-            assert saved[7] == fields
-            assert [entry async for entry in archive.iter_entries()] == [saved]
-            assert await archive.read("file") == b"hello"
-
-    asyncio.run(run())
-
-
-def test_iteration_and_owned_attributes(open_manifest):
-    output = io.BytesIO()
-    writer = EntryArchiveWriter(output, block_target=512, memory_bytes=1)
-    for i in range(100):
-        writer.add((f"f{i:04}", 0, 420, 0, 0, 0, (), {"x-map": {"v": i}}))
-    writer.close()
-    archive = open_manifest(output.getvalue(), memory_bytes=1)
-    assert archive.spilled
-    iterator = archive.iter_entries()
-    assert iter(iterator) is iterator
-    assert next(iterator)[0] == "f0000"
-    entry = archive.entry("f0020")
-    entry[7]["x-map"]["v"] = -1
-    assert archive.entry("f0020")[7]["x-map"]["v"] == 20
-    assert [e[0] for e in iterator] == [f"f{i:04}" for i in range(1, 100)]
-    assert list(iterator) == []
-
-    pending = archive.iter_entries()
-    archive.close()
-    with pytest.raises(ZstarError, match="closed"):
-        next(pending)
-    with pytest.raises(ZstarError, match="closed"):
-        archive.entry("f0000")
-
-
-def test_metadata_checksum_and_read_budget_are_mandatory(inline_data, open_manifest):
-    data = inline_data
-    with pytest.raises(ZstarError, match="integrity"):
-        open_manifest(data[:-45] + bytes([data[-45] ^ 1]) + data[-44:])
-    archive = open_manifest(data, max_read_bytes=1)
-    try:
-        with pytest.raises(ZstarError, match="budget"):
-            archive.read("a-b")
-    finally:
-        archive.close()
-
-
-def test_indexed_open_fetches_metadata_then_payload(source_factory):
-    data = _native.pack_file("x", b"hello")
-
-    source = source_factory(data)
-    archive = zstar._native.SyncArchive.from_source(source, len(data))
-    assert source.calls == 2  # Footer and directory.
-    assert [entry[0] for entry in archive.iter_entries()] == ["x"]
-    assert archive.read("x", 5, 0) == b""
-    assert source.calls == 4  # Complete scan rereads footer and metadata.
-    assert archive.read("x", 1, 3) == b"ell"
-    assert source.calls == 5
-
-
-def test_source_short_reads_are_rejected():
-    class ShortSource:
-        def read_range(self, offset, length):
+        def read_at(self, offset, length):
             return b""
 
-    with pytest.raises(ValueError, match="short range response"):
-        zstar._native.SyncArchive.from_source(ShortSource(), 100)
+    with pytest.raises(ZstarError) as caught:
+        zstar.open(Short())
+    assert caught.value.category == "io"
+    assert isinstance(caught.value.__cause__, ValueError)
 
 
-@pytest.mark.parametrize("archive_type", [ManifestArchive, zstar._native.SyncArchive.from_source])
-def test_resolver_errors_preserve_the_original_exception(archive_type, source_factory, thin_data):
+def test_resolver_failure_preserves_original_exception(thin_data):
     cause = RuntimeError("private resolver details")
 
-    class FailingResolver:
-        def get_encoded(self, address, hint, max_bytes):
+    class Resolver:
+        def get_encoded(self, address, hint, maximum):
             raise cause
 
+    options = ReaderOptions(resolver=Resolver())
     with (
-        archive_type(source_factory(thin_data), len(thin_data)) as archive,
-        pytest.raises(ZstarError, match="Python encoded-object resolver failed") as failure,
+        zstar.open(_native.Source.memory(thin_data), options=options) as archive,
+        pytest.raises(ZstarError) as caught,
     ):
-        archive.read("hello.txt", resolver=FailingResolver())
-    assert failure.value.category == "io"
-    assert failure.value.__cause__ is cause
-    assert "private resolver details" not in str(failure.value)
+        archive.read("hello.txt")
+    assert caught.value.category == "io" and caught.value.__cause__ is cause
+    assert "private resolver details" not in str(caught.value)
 
 
-@pytest.mark.parametrize("verify_external", [True, False])
-def test_indexed_external_policy_cannot_skip_archive_checksums(
-    verify_external, corpus_dir, source_factory
-):
-    data = (corpus_dir / "invalid/data-checksum.zstar").read_bytes()
-
-    archive = zstar._native.SyncArchive.from_source(
-        source_factory(data), len(data), verify_external=verify_external
-    )
-    with pytest.raises(zstar.ZstarError) as caught:
-        archive.read("a-b")
-    assert caught.value.category == "integrity-failure"
-    with pytest.raises(zstar.ZstarError):
-        archive.read_many([("a-b", 0, 5)])
-
-
-def test_indexed_external_policy_reports_and_isolates_unchecked_resolvers(
-    object_resolver, source_factory, thin_data
-):
-    data = thin_data
-
-    resolver = object_resolver
-    archive = zstar._native.SyncArchive.from_source(
-        source_factory(data), len(data), verify_external=False
-    )
-    payload, report = archive.read_with_report("hello.txt", 0, 6, resolver=resolver)
-    assert payload == b"hello\n"
-    assert report["metadata_validated"]
-    assert report["external_objects_unchecked"]
-    assert not report["external_objects_sha256_checked"]
-    assert archive.read_many([("repeat", 0, 12), ("world.txt", 0, 6)], resolver=resolver) == [
-        b"hello\nhello\n",
-        b"world\n",
-    ]
-    assert resolver.calls == 2  # shared within the batch, not across calls
-
-    class MissingResolver:
-        def get_encoded(self, address, hint, max_bytes):
-            raise FileNotFoundError(address)
-
-    with pytest.raises(zstar.ZstarError) as caught:
-        archive.read("hello.txt", 0, 6, resolver=MissingResolver())
-    assert caught.value.category == "missing-external-content"
-
-
-def test_indexed_batch_reads_share_frames_preserve_order_and_validate_first(source_factory):
+def test_batch_shares_frames_preserves_order_and_validates_before_content(source_factory):
     payload = bytes(range(251)) * 53
-    data = _native.pack_file("x", payload)
+    source = source_factory(pack_file("data", payload))
+    with zstar.open(source) as archive:
+        requests = [
+            ReadRequest("data", 10, 4),
+            ReadRequest("data", 0, len(payload)),
+            ReadRequest("data", len(payload), 0),
+            ReadRequest("data", 10, 4),
+        ]
+        assert archive.read_many(requests) == [payload[10:14], payload, b"", payload[10:14]]
+        assert source.calls == 4
+        assert archive.read_many([]) == []
+        with pytest.raises(ZstarError):
+            archive.read_many([ReadRequest("data", 0, 4), ReadRequest("data", len(payload), 1)])
+        with pytest.raises(ZstarError) as caught:
+            archive.read_many([ReadRequest("data", 0, 0)] * 4097)
+        assert caught.value.category == "resource-limit"
+        assert source.calls == 4
 
-    source = source_factory(data)
-    archive = zstar._native.SyncArchive.from_source(source, len(data))
-    requests = [("x", 10, 4), ("x", 0, len(payload)), ("x", len(payload), 0), ("x", 10, 4)]
-    assert archive.read_many(requests) == [payload[10:14], payload, b"", payload[10:14]]
-    assert source.calls == 4  # Footer, directory, entry page, one shared payload frame.
-    assert archive.read_many([]) == []
-    with pytest.raises(zstar.ZstarError):
-        archive.read_many([("x", 0, 4), ("x", len(payload), 1)])
-    with pytest.raises(zstar.ZstarError) as caught:
-        archive.read_many([("x", 0, 0)] * 4097)
-    assert caught.value.category == "resource-limit"
-    assert source.calls == 4
+        class Bounded:
+            def __len__(self):
+                return 2
 
-    class BoundedSequence:
-        def __len__(self):
-            return 2
+            def __getitem__(self, index):
+                return ReadRequest("data", index, 1)
 
-        def __getitem__(self, index):
-            return ("x", index, 1)
+            def __iter__(self):
+                raise AssertionError("must index the bounded sequence")
 
-        def __iter__(self):
-            raise AssertionError("batch must only index the bounded sequence")
-
-    assert archive.read_many(BoundedSequence()) == [payload[:1], payload[1:2]]
-    assert source.calls == 5
-
-
-def test_indexed_open_releases_spool_and_close_preserves_borrowed_source(source_factory):
-    data = _native.pack_file("x", b"hello")
-
-    def temporary_descriptors():
-        directory = Path("/proc/self/fd")
-        if not directory.exists():
-            return set()
-        result = set()
-        for path in list(directory.iterdir()):
-            try:
-                target = os.readlink(path)
-            except FileNotFoundError:
-                continue
-            if "(deleted)" in target:
-                result.add((path.name, target))
-        return result
-
-    source = source_factory(data)
-    before = temporary_descriptors()
-    with zstar._native.SyncArchive.from_source(source, len(data), memory_bytes=1) as archive:
-        assert archive.read("x") == b"hello"
-        assert not archive.closed
-        retained = temporary_descriptors() - before
-        if Path("/proc/self/fd").exists():
-            assert not retained, "decoded spool is released after building the entry index"
-    assert not source.closed
-    assert not retained.intersection(temporary_descriptors())
-    archive.close()
-    for operation in [
-        lambda: list(archive.iter_entries()),
-        lambda: archive.read("x"),
-        lambda: archive.read_with_report("x", 0, 1),
-        lambda: archive.read_many([("x", 0, 1)]),
-        lambda: archive.entry("x"),
-        archive.__enter__,
-    ]:
-        with pytest.raises(zstar.ZstarError, match="closed") as caught:
-            operation()
-        assert caught.value.category == "unsupported-operation"
+        assert archive.read_many(Bounded()) == [payload[:1], payload[1:2]]
 
 
-def test_indexed_close_preserves_admitted_read_and_rejects_new_calls():
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    data = _native.pack_file("x", b"hello")
-    started, release = threading.Event(), threading.Event()
-
-    class Source:
-        def read_range(self, offset, length):
-            if offset == 0 and length < len(data):
-                started.set()
-                assert release.wait(5), "read was not released"
-            return data[offset : offset + length]
-
-    archive = zstar._native.SyncArchive.from_source(Source(), len(data), memory_bytes=1)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(archive.read, "x")
-        try:
-            assert started.wait(5), "payload callback did not start"
-            archive.close()
-            assert archive.closed
-            with pytest.raises(zstar.ZstarError, match="closed"):
-                archive.read("x")
-        finally:
-            release.set()
-        assert future.result(timeout=5) == b"hello"
-
-
-@pytest.mark.parametrize("operation", ["close", "closed", "entry_count", "members"])
-def test_bytes_reader_locking_releases_gil_while_waiting_for_a_resolver(operation, corpus_dir):
-    script = """
-import threading
-from pathlib import Path
-import sys
-import zstar
-root = Path(sys.argv[1])
-archive = zstar.Archive((root / 'thin.zstar').read_bytes())
-started, release = threading.Event(), threading.Event()
-outputs = []
-class Resolver:
-    def get_encoded(self, address, hint, maximum):
-        started.set()
-        assert release.wait(5)
-        return (root / 'objects' / (address[7:] + '.zst')).read_bytes()
-def read():
-    outputs.append(archive.read('hello.txt', resolver=Resolver()))
-worker = threading.Thread(target=read)
-worker.start()
-assert started.wait(5)
-timer = threading.Timer(0.05, release.set)
-timer.start()
-operation = getattr(archive, sys.argv[2])
-if callable(operation):
-    result = operation()
-    if sys.argv[2] == 'members':
-        next(result)
-archive.close()
-worker.join(5)
-timer.join(5)
-assert not worker.is_alive() and outputs == [b'hello\\n']
-try:
-    archive.read('hello.txt')
-except ValueError:
-    pass
-else:
-    raise AssertionError('closed reader accepted a read')
-print('closed without GIL deadlock')
-"""
-    root = corpus_dir
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(root), operation],
-        timeout=10,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "closed without GIL deadlock"
+@pytest.mark.parametrize("verify", [False, True])
+def test_mandatory_archive_checksums_ignore_external_hash_policy(verify, corpus_dir):
+    with (
+        _native.open_source(str(corpus_dir / "invalid/data-checksum.zstar")) as source,
+        zstar.open(source, options=ReaderOptions(verify_external=verify)) as archive,
+    ):
+        with pytest.raises(ZstarError) as caught:
+            archive.read("a-b")
+        assert caught.value.category == "integrity-failure"

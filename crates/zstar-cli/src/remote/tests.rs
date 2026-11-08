@@ -1,4 +1,6 @@
-use super::{PART_BYTES, download, upload};
+use super::{download, upload};
+
+const PART_BYTES: u64 = zstar::s3::MIN_PART_BYTES as u64;
 use std::{
     io::{Read, Seek, SeekFrom, Write},
     sync::{Arc, Mutex},
@@ -21,7 +23,7 @@ struct State {
 }
 
 struct Server {
-    store: zstar::s3::AmazonS3,
+    store: Arc<zstar::s3::AmazonS3>,
     state: Arc<Mutex<State>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -134,7 +136,7 @@ async fn server() -> Server {
         }
     });
     Server {
-        store: store(&endpoint),
+        store: Arc::new(store(&endpoint)),
         state,
         task,
     }

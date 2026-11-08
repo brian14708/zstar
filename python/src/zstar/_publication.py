@@ -1,4 +1,4 @@
-"""Backend output publication shared by archives and external objects."""
+"""fsspec member spooling and transactional output publication."""
 
 from __future__ import annotations
 
@@ -6,15 +6,25 @@ import asyncio
 import tempfile
 from collections.abc import Callable
 from functools import partial
-from tarfile import TarInfo
-from typing import BinaryIO, Protocol, cast
+from typing import BinaryIO, Protocol, TypeVar, cast
 
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from typing_extensions import Buffer, Reader
 
 from . import _native
-from ._info import _from_entry
-from .types import WriterOptions
+from ._metadata import EntryKind, Header
+from ._ownership import _acleanup, _retain
+from ._writer import _writer_call
+from .types import AsyncObjectStore, FileInfo
+
+_T = TypeVar("_T")
+
+
+def _raise_errors(errors: list[BaseException]) -> None:
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("output cleanup failed", errors)
 
 
 class _AsyncOutput(Protocol):
@@ -23,127 +33,304 @@ class _AsyncOutput(Protocol):
 
 
 class _AsyncSink:
-    """Bridge native worker writes to a caller-supplied async backend."""
+    def __init__(self, output: _AsyncOutput):
+        self.output = output
 
-    def __init__(self, stream: _AsyncOutput, loop: asyncio.AbstractEventLoop):
-        self.stream, self.loop = stream, loop
+    async def write(self, data: bytes, /) -> int:
+        return await self.output.write(data)
 
-    def write(self, data: Buffer) -> int:
-        return asyncio.run_coroutine_threadsafe(self.stream.write(bytes(data)), self.loop).result()
-
-    def flush(self) -> None:
-        # Async streamed backends flush buffered output when closed.
+    async def flush(self) -> None:
+        # Streamed backends flush when closed.
         pass
-
-    def close(self) -> None:
-        asyncio.run_coroutine_threadsafe(self.stream.close(), self.loop).result()
 
 
 class _Publication:
-    """Own output closure and publication, including failure cleanup.
+    """Close before commit; discard transactional output on any failure."""
 
-    Async streams publish on close and cannot be rolled back. Transactional
-    fsspec outputs are closed before commit and discarded on failure.
-    """
-
-    def __init__(
-        self,
-        output: BinaryIO,
-        *,
-        transactional: bool = False,
-    ) -> None:
+    def __init__(self, output: BinaryIO | _AsyncOutput, *, asynchronous: bool = False):
         self.output = output
-        self._commit = getattr(output, "commit", None) if transactional else None
-        self._discard = getattr(output, "discard", None) if transactional else None
+        self.asynchronous = asynchronous
+        self.sink = (
+            _AsyncSink(cast(_AsyncOutput, output))
+            if asynchronous
+            else _native.BlockingAdapter(output)
+        )
         self._finished = False
 
     @classmethod
-    def open(
-        cls,
-        backend: AbstractFileSystem,
-        path: str,
-        loop: asyncio.AbstractEventLoop,
-    ) -> _Publication:
-        asynchronous = bool(getattr(backend, "asynchronous", False))
-        if asynchronous:
-            stream = cast(
-                _AsyncOutput,
-                asyncio.run_coroutine_threadsafe(backend.open_async(path, "wb"), loop).result(),
-            )
-            output = cast(BinaryIO, _AsyncSink(stream, loop))
-        else:
-            output = cast(BinaryIO, backend.open(path, "wb", autocommit=False))
+    async def open(cls, backend: AbstractFileSystem, path: str) -> _Publication:
+        if getattr(backend, "asynchronous", False):
+            return cls(await backend.open_async(path, "wb"), asynchronous=True)
 
-        return cls(output, transactional=not asynchronous)
+        def open_output() -> _Publication:
+            return cls(backend.open(path, "wb", autocommit=False))
 
-    def finish(self, *, abort: bool = False, errors: tuple[BaseException, ...] = ()) -> None:
+        return await _writer_call(
+            open_output, discard=lambda publication: publication._finish_sync(True, [])
+        )
+
+    async def finish(self, *, abort: bool = False, errors: tuple[BaseException, ...] = ()) -> None:
         if self._finished:
             return
         self._finished = True
         failures = list(errors)
         abort = abort or bool(failures)
-        if abort and self._discard is not None and isinstance(self.output, AbstractBufferedFile):
-            # Prevent close from uploading buffered output before it is discarded.
-            cast(AbstractBufferedFile, self.output).forced = True
+        if self.asynchronous:
+            try:
+                await cast(_AsyncOutput, self.output).close()
+            except BaseException as error:
+                failures.append(error)
+            _raise_errors(failures)
+        else:
+            await _writer_call(partial(self._finish_sync, abort, failures))
+
+    def _finish_sync(self, abort: bool, failures: list[BaseException]) -> None:
+        output = cast(BinaryIO, self.output)
+        commit, discard = getattr(output, "commit", None), getattr(output, "discard", None)
+        if abort and discard is not None and isinstance(output, AbstractBufferedFile):
+            output.forced = True
         try:
-            self.output.close()
+            output.close()
         except BaseException as error:
             failures.append(error)
             abort = True
-        if not abort and self._commit is not None:
+        if not abort and commit is not None:
             try:
-                self._commit()
+                commit()
             except BaseException as error:
                 failures.append(error)
                 abort = True
-        if abort and self._discard is not None:
+        if abort and discard is not None:
             try:
-                self._discard()
+                discard()
             except BaseException as error:
                 failures.append(error)
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise BaseExceptionGroup("output publication failed", failures)
+        _raise_errors(failures)
 
 
 class _WriteSession:
-    """Native member state with Python-owned backend publication."""
+    """Serialize staged members and emit them through the shared async writer."""
 
     def __init__(
         self,
         publication: _Publication,
+        writer: _native.WriterSession,
         spool_memory: int,
-        options: WriterOptions,
-        external: Callable[[str, bytes, int], int] | None = None,
+        external: AsyncObjectStore | None,
+        external_threshold: int,
+    ):
+        self.publication, self._writer = publication, writer
+        self._spool_memory = spool_memory
+        self._external, self._threshold = external, external_threshold
+        self._entries: dict[str, FileInfo] = {}
+        self._active: _StagedMember | None = None
+        self._failed = False
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    async def create(
+        cls,
+        publication: _Publication,
+        spool_memory: int,
+        options: _native.WriterConfig,
+        external: AsyncObjectStore | None = None,
         external_threshold: int = 16 << 20,
-    ) -> None:
-        self.publication = publication
-        self._session = _native.StagedWriter(
-            _native.EntryArchiveWriter(publication.output, **options),
-            partial(tempfile.SpooledTemporaryFile, max_size=spool_memory, mode="w+b"),
-            external,
-            external_threshold,
-            options.get("compression_level", 3),
-        )
+    ) -> _WriteSession:
+        try:
+            writer = await _native.WriterSession.ato_sink(publication.sink, options)
+        except BaseException as primary:
+            await _acleanup(primary, publication.finish(abort=True))
+            raise
+        return cls(publication, writer, spool_memory, external, external_threshold)
 
-    def mkdir(self, path: str, parents: bool = True, exist_ok: bool = False) -> None:
-        self._session.mkdir(path, parents, exist_ok)
+    def _check(self) -> None:
+        if self._failed:
+            raise ValueError("archive writer failed; discard this filesystem")
+        if self._closed:
+            raise ValueError("archive writer closed")
 
-    def open(self, path: str) -> _native.StagedMember:
-        return self._session.open(path)
+    async def _add(self, header: Header, body: Reader[bytes] | None = None) -> None:
+        try:
+            source = _native.BlockingAdapter(body) if body is not None else None
+            if self._external is not None and header.size > 0 and header.size >= self._threshold:
+                await self._writer.aappend_external_body(header, source, self._external)
+            else:
+                await self._writer.aappend(header, source)
+        except BaseException as primary:
+            self._failed = True
+            await _acleanup(primary, self._writer.aabort())
+            raise
+        self._entries[header.path] = {
+            "name": header.path,
+            "size": header.size,
+            "type": "directory" if header.kind is EntryKind.DIRECTORY else "file",
+        }
 
-    def add_file(self, path: str, body: Reader[bytes], size: int) -> None:
-        self._session.add_file(path, body, size)
+    async def _mkdir(self, path: str, parents: bool, exist_ok: bool) -> None:
+        self._check()
+        existing = self._entries.get(path)
+        if not path or existing is not None:
+            if exist_ok and (
+                not path or (existing is not None and existing["type"] == "directory")
+            ):
+                return
+            raise FileExistsError(path)
+        if self._active is not None and self._active.name == path:
+            raise FileExistsError(path)
+        ancestors = path.split("/")[:-1]
+        for index in range(1, len(ancestors) + 1):
+            parent = "/".join(ancestors[:index])
+            entry = self._entries.get(parent)
+            if entry is not None:
+                if entry["type"] != "directory":
+                    raise NotADirectoryError(parent)
+            elif parents:
+                await self._add(Header.directory(parent))
+            else:
+                raise FileNotFoundError(parent)
+        await self._add(Header.directory(path))
 
-    def snapshot(self) -> dict[str, TarInfo]:
-        entries = {}
-        for entry, size in self._session.snapshot():
-            info = _from_entry(entry)
-            info.size = size
-            entries[info.name] = info
-        return entries
+    async def mkdir(self, path: str, parents: bool = True, exist_ok: bool = False) -> None:
+        async with self._lock:
+            await self._mkdir(_native.member_name(path), parents, exist_ok)
 
-    def close(self, abort: bool = False) -> None:
-        abort, errors = self._session.finish(abort)
-        self.publication.finish(abort=abort, errors=tuple(errors))
+    async def _prepare(self, path: str) -> None:
+        self._check()
+        if not path:
+            raise IsADirectoryError(path)
+        if self._active is not None:
+            raise RuntimeError("close the active member before opening another")
+        if entry := self._entries.get(path):
+            if entry["type"] == "directory":
+                raise IsADirectoryError(path)
+            raise FileExistsError(path)
+        if "/" in path:
+            parent = path.rsplit("/", 1)[0]
+            if entry := self._entries.get(parent):
+                if entry["type"] != "directory":
+                    raise NotADirectoryError(parent)
+            else:
+                await self._mkdir(parent, True, True)
+
+    async def open(self, path: str) -> _StagedMember:
+        async with self._lock:
+            path = _native.member_name(path)
+            await self._prepare(path)
+            body = await _writer_call(
+                partial(tempfile.SpooledTemporaryFile, max_size=self._spool_memory, mode="w+b"),
+                discard=lambda spool: spool.close(),
+            )
+            self._active = _StagedMember(self, path, cast(BinaryIO, body))
+            return self._active
+
+    async def add_file(self, path: str, body: Reader[bytes], size: int) -> None:
+        async with self._lock:
+            path = _native.member_name(path)
+            await self._prepare(path)
+            await self._add(Header.file(path, size), body)
+
+    def snapshot(self) -> dict[str, FileInfo]:
+        self._check()
+        return {path: entry.copy() for path, entry in self._entries.items()}
+
+    async def close(self, abort: bool = False) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            errors: list[BaseException] = []
+            if self._active is not None:
+                member, self._active = self._active, None
+                member._closed = True
+                try:
+                    await _writer_call(member._body.close)
+                except BaseException as error:
+                    errors.append(error)
+                if not abort:
+                    errors.append(RuntimeError("archive closed with an open writable member"))
+            if self._failed and not abort and not errors:
+                errors.append(ValueError("archive writer failed"))
+            abort = abort or self._failed or bool(errors)
+            try:
+                if abort:
+                    await self._writer.aabort()
+                else:
+                    await self._writer.aclose()
+            except BaseException as error:
+                errors.append(error)
+                abort = True
+            await self.publication.finish(abort=abort, errors=tuple(errors))
+
+
+class _StagedMember:
+    mode = "wb"
+
+    def __init__(self, session: _WriteSession, name: str, body: BinaryIO):
+        self._session, self.name, self._body = session, name, body
+        self._closed = False
+
+    @property
+    def path(self) -> str:
+        return self.name
+
+    @property
+    def closed(self) -> bool:
+        return self._closed or self._session._closed
+
+    async def _io(self, operation: Callable[[], _T]) -> _T:
+        async with self._session._lock:
+            self._session._check()
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
+            return await _writer_call(operation)
+
+    async def write(self, data: Buffer) -> int:
+        return await self._io(partial(self._body.write, data))
+
+    async def seek(self, offset: int, whence: int = 0) -> int:
+        return await self._io(partial(self._body.seek, offset, whence))
+
+    async def tell(self) -> int:
+        return await self._io(self._body.tell)
+
+    async def flush(self) -> None:
+        await self._io(self._body.flush)
+
+    async def close(self, abort: bool = False) -> None:
+        async with self._session._lock:
+            if self.closed:
+                return
+            self._closed = True
+            self._session._active = None
+            errors: list[BaseException] = []
+            try:
+                self._session._check()
+                if abort:
+                    self._session._failed = True
+                else:
+
+                    def rewind() -> int:
+                        size = self._body.seek(0, 2)
+                        self._body.seek(0)
+                        return size
+
+                    size = await _writer_call(rewind)
+                    await self._session._add(Header.file(self.name, size), self._body)
+            except BaseException as error:
+                errors.append(error)
+            try:
+                await asyncio.shield(_retain(_writer_call(self._body.close)))
+            except BaseException as error:
+                errors.append(error)
+            if errors:
+                self._session._failed = True
+            _raise_errors(errors)
+
+    async def __aenter__(self) -> _StagedMember:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        return self
+
+    async def __aexit__(self, exc_type: object, *args: object) -> None:
+        await self.close(abort=exc_type is not None)

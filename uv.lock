@@ -962,12 +962,17 @@ name = "zstar-py"
 version = "0.0.1"
 source = { editable = "python" }
 dependencies = [
-    { name = "fsspec" },
     { name = "typing-extensions" },
+]
+
+[package.optional-dependencies]
+fsspec = [
+    { name = "fsspec" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "fsspec", specifier = ">=2026.9.0" },
+    { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2026.9.0" },
     { name = "typing-extensions", specifier = ">=4.16" },
 ]
+provides-extras = ["fsspec"]

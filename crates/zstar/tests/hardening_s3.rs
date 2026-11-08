@@ -2,7 +2,7 @@ use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{num::NonZeroUsize, sync::Arc};
-use zstar::Source;
+use zstar::layout::Source;
 use zstar::s3::{
     Path, S3BlobStore, S3RangeSource,
     object_store::{
@@ -312,7 +312,7 @@ async fn completed_archive_put_uses_content_headers_and_preserves_validation() {
         source,
         zstar::ReaderOptions {
             metadata: zstar::MetadataReaderOptions {
-                max_encoded_bytes: 1,
+                max_page_bytes: 1,
                 ..Default::default()
             },
             ..Default::default()

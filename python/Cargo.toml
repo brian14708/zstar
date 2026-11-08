@@ -22,10 +22,14 @@ abi3 = ["pyo3/abi3-py311"]
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 ciborium.workspace = true
+futures-util.workspace = true
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-async-runtimes = { workspace = true, features = ["tokio-runtime"] }
 tokio.workspace = true
+url.workspace = true
 zstar = { workspace = true, features = ["fs", "s3"] }
 
 [lints]

@@ -1,5 +1,5 @@
 //! Directory coverage and independent metadata page validation.
-use super::{Spool, invalid};
+use super::{ManifestOptions, MetadataBuffer, invalid};
 use crate::{Footer, Result};
 use ciborium::Value;
 
@@ -76,10 +76,11 @@ fn reference(value: &Value, entry: bool) -> Result<(Option<String>, (u64, u64, u
 }
 
 pub(super) fn decode_metadata(
-    spool: &mut Spool,
+    buffer: &MetadataBuffer,
     physical: &[(u64, u64, u64)],
     footer: &Footer,
     data_end: u64,
+    options: &ManifestOptions,
 ) -> Result<(crate::manifest::ManifestRoot, Vec<crate::manifest::Entry>)> {
     let directory = physical
         .last()
@@ -87,9 +88,9 @@ pub(super) fn decode_metadata(
     if directory.1 != footer.directory_encoded_len || directory.2 != footer.directory_decoded_len {
         return Err(invalid("directory length"));
     }
-    let raw = spool.read(footer.toc_decoded_len - directory.2, directory.2)?;
+    let raw = buffer.read(footer.toc_decoded_len - directory.2, directory.2)?;
     let archive_size = data_end + footer.toc_encoded_len + crate::FOOTER_SIZE as u64;
-    let directory = ManifestDirectory::decode(&raw, footer, archive_size)?;
+    let directory = ManifestDirectory::decode(raw, footer, archive_size)?;
     let references = directory.pages.iter().chain(&directory.extension_pages);
     if directory.pages.len() + directory.extension_pages.len() + 1 != physical.len() {
         return Err(invalid("metadata page coverage"));
@@ -105,27 +106,20 @@ pub(super) fn decode_metadata(
             return Err(invalid("page reference mismatch"));
         }
         if i >= directory.pages.len() {
-            crate::cbor::decode(&spool.read(raw_offset, reference.decoded_len)?)?;
+            crate::cbor::decode(buffer.read(raw_offset, reference.decoded_len)?)?;
         }
         raw_offset += reference.decoded_len;
     }
     let root = directory.root_value();
-    let limits = spool.options.limits;
-    let retained = spool
-        .options
-        .max_decoded_bytes
-        .saturating_mul(4)
-        .min(spool.options.max_retained_entry_bytes);
-    let max_entries = spool.options.max_entries;
     let mut offset = 0;
     let pages = directory
         .pages
         .iter()
         .enumerate()
         .map(|(index, reference)| {
-            let raw = spool.read(offset, reference.decoded_len)?;
+            let raw = buffer.read(offset, reference.decoded_len)?;
             offset += reference.decoded_len;
-            directory.entry_values(index, &raw)
+            directory.entry_values(index, raw)
         });
     let values = std::iter::once(Ok(root)).chain(pages.flat_map(|page| match page {
         Ok(entries) => entries.into_iter().map(Ok).collect::<Vec<_>>(),
@@ -134,9 +128,9 @@ pub(super) fn decode_metadata(
     crate::manifest::decode_values_budgeted(
         values,
         directory.data_end,
-        retained,
-        max_entries,
-        limits,
+        options.max_retained_entry_bytes,
+        options.max_entries,
+        options.limits,
     )
 }
 

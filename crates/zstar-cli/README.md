@@ -31,8 +31,8 @@ source metadata. Compression and metadata budgets are configurable through
 
 `inspect` validates metadata and prints manifest offsets, sizes, and entry count.
 Extraction also validates physical tar structure and refuses destination
-collisions. Ownership is not restored; special mode bits require
-`--allow-special-bits`. Omitted metadata is reported on stderr. The Rust
+collisions. Ownership is not restored. The sticky bit is restored; setuid and
+setgid bits require `--allow-special-bits`. Omitted metadata is reported on stderr. The Rust
 library's `zstar::fs` module documentation describes platform support and
 restoration behavior.
 

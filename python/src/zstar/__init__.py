@@ -10,17 +10,31 @@ except ModuleNotFoundError as _exc:
         "just check from the repository root to build and test a wheel."
     ) from _exc
 
-from ._archive import Archive as Archive
-from ._archive import AsyncArchive as AsyncArchive
-from ._fsspec import ZstarFileSystem as ZstarFileSystem
-from ._writer import ArchiveWriter as ArchiveWriter
-from ._writer import AsyncArchiveWriter as AsyncArchiveWriter
+from ._api import open as open  # noqa: A004 - canonical archive entry point.
+from ._file import ArchiveFile as ArchiveFile
+from ._file import AsyncArchiveFile as AsyncArchiveFile
+from ._metadata import Entry as Entry
+from ._metadata import EntryKind as EntryKind
+from ._metadata import Extent as Extent
+from ._metadata import Header as Header
+from ._reader_api import Archive as Archive
+from ._reader_api import AsyncArchive as AsyncArchive
+from ._request import ReadRequest as ReadRequest
+from ._writer_api import ArchiveWriter as ArchiveWriter
+from ._writer_api import AsyncArchiveWriter as AsyncArchiveWriter
 
 __all__ = [
     "Archive",
+    "ArchiveFile",
     "ArchiveWriter",
     "AsyncArchive",
+    "AsyncArchiveFile",
     "AsyncArchiveWriter",
+    "Entry",
+    "EntryKind",
+    "Extent",
+    "Header",
+    "ReadRequest",
     "ZstarError",
-    "ZstarFileSystem",
+    "open",
 ]

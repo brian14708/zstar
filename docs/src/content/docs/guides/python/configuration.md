@@ -5,6 +5,146 @@ title: Python advanced usage
 Use this guide to configure storage, ownership, and resource limits. Start with the
 [first archive tutorial](/zstar/tutorials/python/first-archive/) for a runnable example.
 
+## Direct archive interface
+
+`zstar.open(file, mode="r", *, async_=False, ...)` is the archive entry point.
+
+| Mode | Result | With `async_=True` |
+| --- | --- | --- |
+| `"r"` (default) | `Archive` | `AsyncArchive` |
+| `"w"` | `ArchiveWriter` | `AsyncArchiveWriter` |
+| `"x"` | `ArchiveWriter`, exclusive local creation | `AsyncArchiveWriter`, exclusive local creation |
+
+Async opening supports `async with` or `await`. Append and update modes are unsupported.
+The classes describe returned objects; open archives through `zstar.open`.
+
+Direct use has no fsspec dependency. `zstar.open(source)` accepts local paths,
+file/HTTP/S3 URLs, bytes-like archive data, seekable binary files, and custom range
+sources. Buffers become immutable snapshots; caller-supplied files and sources
+remain borrowed. `Path` objects always denote local paths, including names that
+look like URLs. Unknown URL schemes are rejected. HTTP sinks are unsupported.
+Native HTTP checks exact
+ranges, identity encoding, and strong ETag consistency. S3 pins conditional reads.
+
+```python
+import zstar
+from zstar.types import ReaderOptions
+
+options: ReaderOptions = {
+    "max_read_bytes": 8 << 20,
+    "concurrent_chunks": 4,
+    "limits": {"max_frame_decoded_bytes": 64 << 20},
+}
+with zstar.open("archive.tar.zst", options=options) as archive:
+    for entry in archive:
+        print(entry.path, entry.kind, entry.size)
+    print(archive.read("docs/readme.txt", offset=0, length=5))
+```
+
+Use `entry(path)` for a snapshot and `entries(prefix=None)` for listing. Listing
+scans and validates all metadata and retains the complete entry index before
+yielding the first entry, including when a prefix is supplied. Prefixes match
+literal UTF-8 bytes: `"dir/"` selects descendants and `"dir"` also matches
+`"directory"`. Use indexed lookup to avoid a complete scan.
+`get_entry(path, default=None)` returns a default for absent paths;
+`has_entry(path)` and sync `path in archive` use indexed lookup without listing.
+Async lookup methods are awaited.
+Entries own their metadata and remain usable after closure. Extents stay in Rust;
+Python wrappers are created as a read-only sequence is accessed. Extension getters
+return defensive copies, including nested containers. `Header` describes writer
+input without physical packing. `entry.to_header()` preserves logical metadata.
+
+`read(path)` returns the full member. `read(path, offset=..., length=...)` selects
+an exact byte range; omit `length` to read from the offset through EOF. `read_many([ReadRequest(...)])` shares selected frames/objects and
+preserves request order. `ReadRequest(path)` selects a complete member;
+`ReadRequest(path, offset)` reads through EOF. Exact ranges and complete members
+can share one batch, subject to the aggregate returned-read budget.
+Opening and empty reads do not certify unread content. Missing paths raise
+`KeyError`, directories raise `IsADirectoryError` for content operations, and
+symlink reads are rejected. Inspect `entry.linkname` for exact target text.
+
+Use `archive.open(path)` for independent member cursors. Sync streams implement
+`io.RawIOBase`. Reads, seeks, tell, and close are awaitable on async streams;
+use `async with archive.open(path) as member` or await it for explicit
+lifetime management. Allocating reads obey the 64 MiB
+returned-read budget. `readinto` can fill a larger writable contiguous caller
+buffer in bounded chunks. Partial progress can remain in the buffer on failure;
+the cursor advances only on success. Each stream serializes its cursor operations
+and privately retains at most one decoded source within 2 MiB. Archive positional
+reads can run concurrently; sync user callbacks are serialized per object.
+
+The async facade uses the same Rust archive and builder. It accepts async protocols
+whose methods return awaitables, including decorated methods. It confines callbacks
+to the opening loop and copies the initiating operation's `contextvars`.
+Custom async storage implements the protocols in `zstar.types`.
+Use `await zstar.open(file, async_=True)` to borrow a blocking seekable file.
+Sync callbacks execute on bounded workers and must support running away from the
+calling thread. Reentry into the object invoking a callback is rejected.
+
+Use `async_=True` for awaitable context management:
+
+```python
+import zstar
+
+async with zstar.open("archive.tar.zst", async_=True) as archive:
+    data = await archive.read("docs/readme.txt")
+```
+
+Use `archive = await zstar.open(..., async_=True)` to manage its lifetime
+explicitly. With `async_=True`, results are single-use awaitable context managers;
+acquisition starts on awaiting or entering.
+
+`zstar.open(destination, mode="w")` accepts local paths, file/S3 URLs, and binary
+writers. Opening a path or URL owns the storage. Supplied file objects, sources,
+sinks, bodies, resolvers, and stores remain borrowed:
+
+```python
+import zstar
+from zstar import Header
+
+with zstar.open("output.tar.zst", mode="x") as writer:
+    writer.ensure_directory("docs/nested")
+    writer.writestr(Header.file("docs/nested/readme.txt", 5, mode=0o600), b"hello")
+    writer.add("local-data", "data")
+```
+
+The writer validates exact declared body sizes, including at most one excess byte.
+Partial sink writes are supported; zero progress and oversized counts fail.
+Use `ensure_directory(path)` to create a directory and missing ancestors, retaining
+the metadata of directories already appended or captured. Call it before writing
+members beneath that path. File headers passed to `writestr` must declare
+the exact buffer length; mismatches fail before mutation. Finish rejects duplicates
+or ancestors omitted from explicit appends.
+Pre-mutation argument errors leave the writer usable; mutation failure or
+cancellation leaves only cleanup available. Successful context exit writes the
+footer and flushes. Owned writers then close their sink and publish an S3 upload;
+closure succeeds only after publication succeeds. Exceptional exit and admitted
+mutation failure abort owned output. Borrowed sinks remain open for caller-managed
+publication. Native file sinks handle exclusive creation,
+no-follow opening, and identity-checked cleanup. S3 sinks complete multipart uploads
+on successful close and abort on exceptional exit. Uploaded external objects may
+remain after writer failure; retention belongs to the caller.
+
+For local atomic replacement, use `zstar.open(path, atomic=True, mode="w")` or
+`await zstar.open(path, atomic=True, mode="w", async_=True)`. Output is staged in the same
+directory, flushed and synchronized, then published after successful finalization.
+Until publication, an existing destination keeps its original contents; failures
+discard the staging file. `mode="x", atomic=True` also checks exclusivity when
+publishing and never replaces a concurrent creator. New destinations remain
+absent until publication. File URLs use the same `mode` and `atomic` arguments. Atomic
+replacement creates a new inode with ordinary file-creation permissions and is
+supported for local files only.
+
+Cancellation cancels pending native I/O and Python awaitables. Running blocking
+callbacks cannot be interrupted: their permits remain held until they finish, and
+close/abort drains them before releasing borrowed resources. Use context managers
+or explicit `close` and `abort` to wait for cleanup. Await these methods on async objects.
+A cancelled owned close retains its cleanup operation; another close or abort
+joins it. The first cleanup operation determines whether to publish or abort.
+Once publication starts it continues despite cancellation of its waiter. A remote
+publication can succeed before a transport failure is reported; abort cannot undo
+an already published object. Primary and cleanup failures are reported together.
+
 ## Filesystem interface
 
 Open a filesystem with `mode="r"` to read (the default) or `mode="w"` to write.
@@ -32,10 +172,13 @@ copy regular-file bytes; they do not restore archived ownership, modes, timestam
 or symlinks. Symlink downloads are rejected by policy. `get_file()` also accepts a
 borrowed binary output stream and fsspec progress callbacks. `cat_ranges()` batches
 member ranges in Rust, supports negative offsets, and follows fsspec's per-range
-error handling. Pass `reader_options={"concurrent_chunks": 4, ...}` to tune native
-reader limits; use `external=` for external content and `verify_external=True`
-for SHA-256 checking. `reader_options` uses `FileSystemReaderOptions` and rejects
-`resolver` and `verify_external`; set object policy on the filesystem directly.
+error handling. Pass `options=ReaderOptions(concurrent_chunks=4)` to tune native
+reader limits. Use `external=` for external content and
+`options=ReaderOptions(verify_external=True)` for SHA-256 checking. Writer policy
+uses `options=WriterOptions(...)`. Import these shared types from `zstar.types`;
+they serve the direct API and both fsspec modes. Configure fsspec transport through
+`fs=` or `target_options`; nested `source` and `sink` settings are for the direct API.
+Custom resolvers use the direct archive API.
 
 Use `Path` objects or strings for local archives. `fo` may also be an owned
 binary sink, or a path understood by another fsspec filesystem. Pass a configured
@@ -101,8 +244,9 @@ with fsspec.filesystem("zstar", fo="bucket/archive.zstar", fs=s3, external=objec
 Objects are named `<lowercase sha256>.zst`. Files of 16 MiB or larger are split
 with FastCDC (2 MiB minimum, 8 MiB target, 16 MiB maximum). The external filesystem
 can use different storage or credentials and remains caller-owned. Zstar checks
-object availability and extent lengths; set `verify_external=True` to check
-SHA-256 too. Use low-level readers for custom `resolver=` implementations. Raw
+object availability and extent lengths; set
+`options=ReaderOptions(verify_external=True)` to check SHA-256 too. Use direct
+readers for custom `ReaderOptions.resolver` implementations. Raw
 `ArchiveWriter.add_external` also accepts custom raw chunk iterables and object
 writers. See [SDK customization](/zstar/guides/sdk-customization/).
 
@@ -130,159 +274,168 @@ awaited on the owning event loop.
 On failure, writers close owned files before removing unfinished output, including
 on Windows. Transactional fsspec outputs are discarded without committing them;
 caller-owned sinks passed to `ArchiveWriter` remain open. Use explicit `close()` /
-`aclose()` or context managers to wait for owned resources to close; garbage
+`await close()` or context managers to wait for owned resources to close; garbage
 collection cleanup is nonblocking and best effort.
 
-## Raw archive interface
+## Configuration and storage
 
-Use `Archive.from_file`, `Archive.from_source`, `Archive.from_bytes`, or
-`Archive.from_url` for sync reads. For async reads, await the corresponding
-`AsyncArchive` factories.
-Readers expose standard `tarfile.TarInfo` metadata. Lookup and file reads never
-follow symlinks. Opening a symlink as a member stream raises `tarfile.ExtractError`;
-use `read_link()` to inspect its exact stored target. The fsspec adapter likewise
-reports links as links and rejects opening them or traversing through them.
+Import all option TypedDicts from `zstar.types`. Use one `options=` dictionary:
+`ReaderOptions` for reading or `WriterOptions` for writing. Sync and async calls
+share these types. Nest `Limits`, `MetadataReaderOptions`, or
+`MetadataWriterOptions` under `limits` and `metadata`.
+`metadata.max_page_bytes` limits each encoded or decoded metadata page to 8 MiB
+by default. Total archive metadata may exceed that limit. Reader retained metadata
+is limited to 1 GiB by default; full scans also use that budget
+for their temporary metadata buffer. Writer `metadata.max_buffer_bytes` defaults
+to 128 MiB for each in-memory working buffer or sorting index. Metadata buffers
+never spill to files. Content concurrency defaults to eight. Zero frame/window
+limits disable those additional limits; page and memory budgets still apply.
 
-Use `getinfo(name)` for one `TarInfo`, `members(prefix=None)` to iterate metadata,
-and `names(prefix=None)` to iterate filenames. Prefixes select paths by their UTF-8
-byte prefix. Results are owned snapshots; changing them does not change the archive.
-`read_link()` returns a symlink's exact stored target, and
-`read_range(name, start, end)` reads a half-open member range.
+Omit keys to use Rust defaults. Rust validates values and rejects unknown keys,
+including in nested dictionaries, before storage I/O. Opening copies option values,
+root extensions, and optional extension pages into owned Rust values; subsequent
+dictionary changes do not affect the open archive. Complete listing validates optional
+pages skipped by selective reads. Compression workers and frame settings are shared by both modes.
 
-Opening validates the directory; lookups validate selected pages and ancestors.
-External SHA-256 checking defaults to disabled; pass `verify_external=True` when
-opening to enable it. Zstandard frame checksums and extent bounds always remain enabled. Reports identify external objects read without hashing.
-Reader options include
-`concurrent_chunks`; writer options include `workers`. Public option, report,
-and storage protocol types live in `zstar.types`.
+Transport option types also live in `zstar.types`. Nest them under
+`ReaderOptions.source` or `WriterOptions.sink`.
+S3 requires an explicit region and either `Credentials` or `anonymous=True`; native
+transports do not discover ambient credentials. Configure `endpoint` for compatible
+services. HTTP sources accept headers or a mode-appropriate `request_provider`.
+Providers return a signed URL, optional headers, and validity duration; the native
+transport refreshes expiring or denied requests.
 
-Write file metadata with `ArchiveWriter.addfile(tarinfo, body)` or its async
-counterpart. Use `getmetadata()` and `root_extensions` for extension metadata.
-`getinfo()` and `members()` emit
-`UserWarning` when their `TarInfo` projection omits entry or archive-level
-extensions, including when enumerating an empty archive. Rewriting that metadata
-loses those extensions. Use `getmetadata()` and pass its `extensions` to
-`addfile(..., extensions=...)`, and pass `root_extensions` when creating the writer,
-to preserve them. See [SDK customization](/zstar/guides/sdk-customization/).
+Use `entry.to_header()` to copy member metadata, including nanosecond timestamps
+and entry extensions, into a writer. Preserve archive root extensions separately
+with `WriterOptions.root_extensions`. Filesystem capture uses
+`writer.add(name, arcname=...)` and reuses native sorted no-follow traversal.
+
+See [SDK customization](/zstar/guides/sdk-customization/) for protocol examples.
+
+### Storage options
+
+`zstar.open` accepts one keyword-only `options=` dictionary. Put source settings
+under `ReaderOptions.source` and sink settings under `WriterOptions.sink`.
+All of these TypedDicts live in `zstar.types`:
+
+| Policy | Fields |
+| --- | --- |
+| `SourceOptions` | `headers`, mode-appropriate `request_provider`, `s3`, `range_cache` |
+| `SinkOptions` | `s3`; shared by both writers |
+| `S3Options` | Required `region`; optional `endpoint`, `anonymous`, `credentials` |
+| `Credentials` | Required `access_key_id`, `secret_access_key`; optional `session_token` |
+| `RangeCacheOptions` | Integer fields in the cache table below |
+
+S3 requires exactly one of explicit credentials or `anonymous=True`. No environment,
+profile, or instance-role discovery occurs. HTTP providers supply their own headers,
+so they cannot be combined with nonempty `headers`. HTTP policy applies only to
+HTTP sources, S3 policy only to S3 locations. Inapplicable settings fail before I/O.
+HTTP uploads and exclusive S3 creation are unsupported.
+Writer opening flags are direct arguments: `mode="w"` or `"x"`, and
+`atomic=True` for local output. Supplied sinks reject exclusive and atomic
+opening flags because the caller manages their storage. Nested `source` and
+`sink` settings apply only to path and URL inputs; borrowed objects manage their
+own transport and reject these settings, including an empty dictionary.
 
 ```python
-from pathlib import Path
+import zstar
+from zstar.types import Credentials, ReaderOptions, S3Options, WriterOptions
+
+s3 = S3Options(
+    region="us-east-1",
+    credentials=Credentials(access_key_id="...", secret_access_key="..."),
+)
+with zstar.open(
+    "s3://bucket/archive.tar.zst", options=WriterOptions(sink={"s3": s3}), mode="w"
+) as writer:
+    writer.writestr("hello.txt", b"hello")
+with zstar.open("s3://bucket/archive.tar.zst", options=ReaderOptions(source={"s3": s3})) as archive:
+    assert archive.read("hello.txt") == b"hello"
+```
+
+### Native compressed range cache
+
+Omit `source.range_cache` for no additional cache decorator; `RangeCacheOptions()` enables
+the default cache. This cache also works without fsspec installed.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `capacity_bytes` | `16 << 20` | Maximum retained compressed payload |
+| `max_entries` | `1024` | Maximum retained intervals |
+| `read_ahead_bytes` | `0` | Extra forward bytes on a miss |
+| `max_fetch_bytes` | `8 << 20` | Maximum expanded fetch length |
+| `max_in_flight` | `8` | Maximum outstanding fetch intervals |
+
+```python
+import zstar
+from zstar.types import ReaderOptions
+
+with zstar.open(
+    "https://example.com/archive.tar.zst",
+    options=ReaderOptions(
+        max_read_bytes=8 << 20,
+        source={
+            "headers": {"Authorization": "Bearer ..."},
+            "range_cache": {"capacity_bytes": 64 << 20, "read_ahead_bytes": 256 << 10},
+        },
+    ),
+) as archive:
+    data = archive.read("hello.txt", offset=0, length=5)
+```
+
+Values must be nonnegative integers fitting native `usize`; booleans are rejected.
+`max_entries` and `max_fetch_bytes` must be positive, and `max_in_flight` must be
+between 1 and 1024. Zero capacity disables completed-range retention while keeping
+in-flight sharing. Requests exceeding `max_fetch_bytes` are fetched exactly,
+without expansion. Keep expansion within native transport bounds: 64 MiB for S3,
+and 256 MiB plus eight bytes for HTTP responses.
+
+Containing intervals serve smaller ranges; arbitrary overlapping intervals are
+not stitched together. The cache shares in-flight fetches and evicts retained
+intervals in LRU order. Cached hits do not revalidate remote objects. Keep source
+contents immutable while open; actual requests preserve HTTP/S3 snapshot checks.
+
+Capacity covers retained compressed payload only. Outstanding fetches, returned
+buffers, bookkeeping, metadata, codec workspaces, and decoded member caches use
+additional memory. `concurrent_chunks` limits content work; `max_in_flight` limits
+fetches through this source decorator. External object resolvers remain separate.
+Native compressed caching, fsspec backend caches (including persistent disk caches),
+and each member stream's fixed 2 MiB decoded cache are independent layers.
+
+### Ownership and async opening
+
+| Input | Storage ownership |
+| --- | --- |
+| Local path, URL, or reader buffer snapshot | Owned by the archive/writer |
+| Range source, seekable binary file, or binary writer | Borrowed, including native handles |
+
+```python
 import zstar
 
-with zstar.Archive.from_file(Path("archive.zstar")) as archive:
-    for info in archive.members():
-        print(info.name, info.size)
-    print(archive.read("docs/readme.txt"))
+
+async def round_trip() -> bytes:
+    async with zstar.open("archive.tar.zst", mode="w", async_=True) as writer:
+        await writer.writestr("hello.txt", b"hello")
+    async with zstar.open("archive.tar.zst", async_=True) as archive:
+        return await archive.read("hello.txt")
 ```
 
-Create a writer with `ArchiveWriter.from_file(...)` or
-`await AsyncArchiveWriter.from_file(...)`. Import both classes from `zstar`.
+With `async_=True`, opening starts when awaited or entered and retains ownership
+across cancellation during acquisition. Borrow seekable binary files with `zstar.open(file)`
+or `await zstar.open(file, async_=True)`. Custom storage implements the sync or
+async protocols in `zstar.types`. Native storage binds directly to Rust.
 
-Archive member streams and backend streams use structural byte-stream protocols. A
-reader needs `read()`, and a seekable source additionally needs `seek()` and `tell()`;
-a writer sink needs `write()` and `flush()`. Core readers borrow supplied streams;
-`ZstarFileSystem` owns and closes supplied file objects. Caller-supplied filesystems
-remain available after the archive closes.
+`Path` inputs are local even when they contain `://` or start with `file:`. String
+inputs recognize file, HTTP(S), and S3 URL schemes. Filesystem
+symlink and `..` traversal retain their normal meaning. Mode `"w"` selects writing.
+Without `atomic=True`, this truncates an existing file immediately;
+failure cleanup cannot restore prior contents. Set `atomic=True` to publish only
+after finalization. Use `"x"` for exclusive creation. Cleanup removes an unfinished
+name only while its file identity matches.
 
-Raw S3 reads require explicit configuration. They do not read AWS environment
-variables or discover credentials from profiles, containers, or instance metadata:
-
-```python
-from zstar import Archive
-
-with Archive.from_s3(
-    "bucket",
-    "archive.zstar",
-    region="us-east-1",
-    access_key_id=credentials.access_key,
-    secret_access_key=credentials.secret_key,
-    session_token=credentials.token,
-) as archive:
-    data = archive.read("hello.txt")
-```
-
-Use `anon=True` instead of credentials for public objects. `endpoint` selects a
-custom S3 endpoint; `object_prefix` optionally resolves external content. The
-async factory accepts the same keywords. fsspec/s3fs retains its normal credential
-chain and is configured independently through `target_options` or `fs=`.
-
-## Performance
-
-Writers accept entries in any order. UTF-8 path order avoids an additional
-native manifest sorting spool at close. Native filesystem capture uses this
-path automatically.
-
-Keep the archive or filesystem open across reads to reuse parsed metadata. Use
-`read_many()` or fsspec's `cat_ranges()` to share work across related ranges.
-Direct archive reads do not retain decoded content. Member streams reuse one
-validated decoded source within a private 2 MiB cache. The async interface uses
-the same optimization.
-
-Filename and member iteration uses bounded native batches without constructing
-Python extent or extension objects. Prefer `names()` when only filenames are
-needed.
-
-Both interfaces use Rust for decoding, validation, and compression. Direct path
-reads use native file I/O; fsspec and supplied Python streams add callbacks.
-Sync calls release the GIL while waiting but still block the calling thread.
-Use `AsyncArchive` in event-loop code. Closing async readers waits for active work.
-
-Use `put_file()` for local files and `pipe_file()` for bytes to stream known-size
-inputs directly. Writable `open()` members spool until their size is known;
-`member_spool_bytes` sets when they spill to disk. `addfile(TarInfo, body)` avoids
-filesystem dispatch for direct writes. Members are written serially, so more
-async uploads do not speed up insertion into one archive.
-
-`AsyncArchiveWriter` runs native work off the event loop, with at most eight
-active jobs across writers. Cancellation waits for running work before cleaning
-up. The `workers` option controls compression parallelism separately.
-
-Configure storage object metadata on the backend output sink before passing it
-to a writer.
-
-## Resource limits
-
-Opening retains the directory and caches entry pages on demand.
-Spooling does not reduce memory held by the directory or cached pages.
-
-Pass `limits` to bound frame and window bytes, entry bytes, extent counts, and
-pointer bytes. Zero or omission disables each additional limit; metadata and
-index budgets are separate. For example,
-`limits={"max_frame_decoded_bytes": 64 << 20, "max_extents": 100_000}` sets limits
-for your application without changing which archives are valid.
-
-Default frame and window limits are disabled, so defaults do not provide a
-finite aggregate content-memory ceiling. Peak memory includes the directory and cached pages,
-up to `concurrent_chunks` encoded inputs, decoded sources and codec workspaces,
-member caches, and returned buffers. For example:
-
-```python
-options = {
-    "concurrent_chunks": 4,
-    "max_read_bytes": 8 << 20,
-    "limits": {
-        "max_frame_encoded_bytes": 64 << 20,
-        "max_frame_decoded_bytes": 64 << 20,
-        "max_window_bytes": 64 << 20,
-    },
-}
-with Archive.from_file("archive.zstar", **options) as archive:
-    data = archive.read("hello.txt")
-```
-
-The [format specification](/zstar/reference/spec/core/) defines the format and validation rules.
-
-Optional extension pages can be written with `extension_pages`, a map from `x-` group
-names to lists of CBOR values. Each value is encoded as a separate page.
-Readers skip unknown optional groups during selective reads and validate them
-during complete metadata scans.
-
-Native S3 readers discover size and snapshot identity with a suffix GET and
-retain up to 128 KiB for metadata and content reads. Small archives can therefore
-open and read with a single GET and no HEAD. This prioritizes fewer round trips
-over minimum transferred bytes; uncached ranges still use the pinned identity.
-Archive discovery uses the terminal footer; no Zstar-specific S3 object metadata
-is written or required.
-Local file readers read the footer and directory separately, then load entry
-pages on demand using positional reads. Raw-byte caching belongs to the supplied
-source or fsspec backend; the archive does not retain encoded ranges across operations.
+Borrowed readers preserve the file cursor and read the complete source from byte
+zero. Borrowed writers start at the current output position and do not truncate
+existing trailing data. When embedding an archive, reopen the exact archive slice
+rather than the containing file. `io.BytesIO` output stays available after writer
+finalization. Pass the source or destination directly to `zstar.open`; use
+`archive.open(path)` for files inside an archive.

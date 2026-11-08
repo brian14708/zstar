@@ -7,21 +7,23 @@ import os
 import random
 import sys
 import threading
+import warnings
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
-from tarfile import TarInfo
 from typing import ClassVar
 
 import fsspec
 import pytest
 import zstar
-from zstar import ArchiveWriter, ZstarFileSystem, _native
+from _support import pack_directory, pack_file
+from zstar import Header
+from zstar.fsspec import ZstarFileSystem
+from zstar.types import ReaderOptions, WriterOptions
 
 
 def test_filesystem_reads_seeks_and_lists():
-    fs = ZstarFileSystem(fo=io.BytesIO(_native.pack_file("hello.txt", b"hello world")))
+    fs = ZstarFileSystem(fo=io.BytesIO(pack_file("hello.txt", b"hello world")))
     try:
         assert fs.ls("") == [{"name": "hello.txt", "size": 11, "type": "file"}]
         assert fs.info("zstar:///") == {"name": "", "size": 0, "type": "directory"}
@@ -45,7 +47,7 @@ def test_filesystem_chained_local_paths_and_globs(tmp_path):
     (root / "dir" / "file.txt").write_bytes(b"hello")
     (root / "dir" / "nested" / "file.txt").write_bytes(b"hidden")
     path = tmp_path / "test.zstar"
-    path.write_bytes(_native.pack_directory(root))
+    path.write_bytes(pack_directory(root))
     fs, member = fsspec.core.url_to_fs(f"zstar://dir/file.txt::{path.as_uri()}")
     try:
         assert member == "dir/file.txt"
@@ -70,7 +72,7 @@ def test_filesystem_chained_local_paths_and_globs(tmp_path):
 
 def test_filesystems_are_not_instance_cached(tmp_path):
     path = tmp_path / "test.zstar"
-    path.write_bytes(_native.pack_file("x", b"hello"))
+    path.write_bytes(pack_file("x", b"hello"))
     first = fsspec.filesystem("zstar", fo=path)
     second = fsspec.filesystem("zstar", fo=path)
     assert first is not second
@@ -95,7 +97,7 @@ def test_sparse_reads_avoid_unrequested_logical_bytes(monkeypatch, cache_type, e
         return original(self, start, end)
 
     monkeypatch.setattr(_MemberFile, "_fetch_range", fetch)
-    fs = ZstarFileSystem(fo=io.BytesIO(_native.pack_file("x", b"x" * (16 << 20))))
+    fs = ZstarFileSystem(fo=io.BytesIO(pack_file("x", b"x" * (16 << 20))))
     try:
         options = {} if cache_type is None else {"cache_type": cache_type}
         with fs.open("x", **options) as handle:
@@ -111,11 +113,8 @@ def test_sparse_reads_avoid_unrequested_logical_bytes(monkeypatch, cache_type, e
 @pytest.mark.parametrize("nanoseconds", [0, 1234567890, -1, -(1 << 63), (1 << 63) - 1])
 def test_modified_uses_exact_member_timestamp_and_utc(nanoseconds):
     sink = io.BytesIO()
-    with ArchiveWriter(sink) as writer:
-        info = TarInfo("x")
-        info.size = 1
-        info.pax_headers["mtime"] = str(Decimal(nanoseconds) / 1_000_000_000)
-        writer.addfile(info, io.BytesIO(b"x"))
+    with zstar.open(sink, options=WriterOptions(), mode="w") as writer:
+        writer.addfile(Header.file("x", 1, mtime_ns=nanoseconds), io.BytesIO(b"x"))
     fs = ZstarFileSystem(fo=io.BytesIO(sink.getvalue()))
     try:
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
@@ -128,7 +127,7 @@ def test_modified_uses_exact_member_timestamp_and_utc(nanoseconds):
 
 
 def test_close_owns_streams_and_is_terminal():
-    source = io.BytesIO(_native.pack_file("x", b"hello"))
+    source = io.BytesIO(pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo=source)
     handle = fs.open("x")
     assert handle.read(2) == b"he"
@@ -151,7 +150,7 @@ def test_cleanup_errors_preserve_primary_failure():
             super().close()
             raise OSError("source cleanup failed")
 
-    fs = ZstarFileSystem(fo=FailingClose(_native.pack_file("x", b"hello")))
+    fs = ZstarFileSystem(fo=FailingClose(pack_file("x", b"hello")))
     assert fs.info("x")["size"] == 5
     with pytest.raises(OSError, match="source cleanup failed"):
         fs.close()
@@ -173,7 +172,7 @@ def test_dropping_filesystem_releases_owned_source(loaded):
             super().close()
             closed.set()
 
-    source = Source(_native.pack_file("x", b"hello"))
+    source = Source(pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo=source)
     if loaded:
         assert fs.info("x")["size"] == 5
@@ -184,7 +183,7 @@ def test_dropping_filesystem_releases_owned_source(loaded):
 
 def test_close_drains_admitted_loads_and_rejects_new_work(monkeypatch):
     entered, release = threading.Event(), threading.Event()
-    source = io.BytesIO(_native.pack_file("x", b"hello"))
+    source = io.BytesIO(pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo=source)
     original = fs._open_archive
 
@@ -224,12 +223,10 @@ def test_external_members_expose_logical_bytes(thin_data, corpus_dir):
     )
     fs = ZstarFileSystem(fo=io.BytesIO(thin_data), external=objects)
     try:
-        with pytest.warns(UserWarning, match="TarInfo omits .*extensions") as recorded:
+        # Reading filesystem metadata must not warn about extension loss.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
             assert fs.info("hello.txt")["size"] == 6
-        assert {str(warning.message) for warning in recorded} == {
-            "TarInfo omits archive-level Zstar extensions; rewriting metadata loses extensions",
-            "TarInfo omits Zstar manifest extensions; rewriting this metadata loses extensions",
-        }
         with fs.open("hello.txt", block_size=3) as member:
             assert member.read(2) == b"he"
             member.seek(1)
@@ -259,13 +256,13 @@ def test_external_missing_object(thin_data):
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot replace an open Python file")
 def test_local_snapshot_survives_atomic_path_replacement(tmp_path):
     path = tmp_path / "snapshot.zstar"
-    path.write_bytes(_native.pack_file("x", b"AAAAAA"))
+    path.write_bytes(pack_file("x", b"AAAAAA"))
     fs = ZstarFileSystem(fo=path)
     try:
         with fs.open("x", block_size=1) as member:
             assert member.read(6) == b"AAAAAA"
             replacement = tmp_path / "new.zstar"
-            replacement.write_bytes(_native.pack_file("x", b"BBBBBB"))
+            replacement.write_bytes(pack_file("x", b"BBBBBB"))
             replacement.replace(path)
             member.seek(0)
             assert member.read(6) == b"AAAAAA"
@@ -278,7 +275,7 @@ def test_symlink_metadata_is_preserved_without_following_links(tmp_path):
     (root / "dir" / "nested").mkdir(parents=True)
     (root / "dir" / "x").write_bytes(b"hello")
     (root / "link").symlink_to("dir", target_is_directory=True)
-    fs = ZstarFileSystem(fo=io.BytesIO(_native.pack_directory(root)))
+    fs = ZstarFileSystem(fo=io.BytesIO(pack_directory(root)))
     try:
         assert fs.info("link")["type"] == "link"
         assert fs.ls("link", detail=False) == ["link"]
@@ -300,7 +297,7 @@ def test_symlink_metadata_is_preserved_without_following_links(tmp_path):
 
 def test_generic_memory_backend_supports_range_reads():
     backend = fsspec.filesystem("memory")
-    backend.pipe("zstar-test/archive", _native.pack_file("x", b"hello"))
+    backend.pipe("zstar-test/archive", pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo="memory://zstar-test/archive", fs=backend)
     try:
         with fs.open("x") as handle:
@@ -314,7 +311,7 @@ def test_backend_options_survive_chaining(tmp_path, monkeypatch):
     import fsspec.core
 
     path = tmp_path / "archive.zstar"
-    path.write_bytes(_native.pack_file("x", b"hello"))
+    path.write_bytes(pack_file("x", b"hello"))
     original = fsspec.filesystem
     received = []
 
@@ -324,7 +321,9 @@ def test_backend_options_survive_chaining(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fsspec, "filesystem", capture)
     fs, member = fsspec.core.url_to_fs(
-        f"zstar://x::{path.as_uri()}", file={"auto_mkdir": True}, zstar={"verify_external": True}
+        f"zstar://x::{path.as_uri()}",
+        file={"auto_mkdir": True},
+        zstar={"options": ReaderOptions(verify_external=True)},
     )
     try:
         assert fs.info(member)["size"] == 5
@@ -343,7 +342,7 @@ def test_async_filesystem_metadata_ranges_and_member_handles(tmp_path):
     root = tmp_path / "input"
     (root / "dir").mkdir(parents=True)
     (root / "dir" / "x").write_bytes(b"hello world")
-    data = _native.pack_directory(root)
+    data = pack_directory(root)
 
     async def exercise():
         from fsspec.asyn import AsyncFileSystem
@@ -364,10 +363,9 @@ def test_async_filesystem_metadata_ranges_and_member_handles(tmp_path):
                 buffer = bytearray(5)
                 assert await handle.readinto(buffer) == 5
                 assert buffer == b"world"
-            with pytest.raises(RuntimeError, match="aclose"):
-                fs.close()
+            await fs.close()
         assert source.closed
-        await fs.aclose()
+        await fs.close()
         with pytest.raises(ValueError, match="filesystem closed"):
             await fs._info("dir/x")
 
@@ -376,7 +374,7 @@ def test_async_filesystem_metadata_ranges_and_member_handles(tmp_path):
 
 def test_cancelled_async_waiter_does_not_cancel_shared_load(monkeypatch):
     async def exercise():
-        fs = ZstarFileSystem(fo=io.BytesIO(_native.pack_file("x", b"hello")), asynchronous=True)
+        fs = ZstarFileSystem(fo=io.BytesIO(pack_file("x", b"hello")), asynchronous=True)
         entered, release = asyncio.Event(), asyncio.Event()
         original = fs._open_archive
         loads = []
@@ -397,7 +395,7 @@ def test_cancelled_async_waiter_does_not_cancel_shared_load(monkeypatch):
         release.set()
         assert await second == b"hello"
         assert loads == [True]
-        await fs.aclose()
+        await fs.close()
 
     asyncio.run(exercise())
 
@@ -406,7 +404,7 @@ def test_cancelled_async_waiter_does_not_cancel_shared_load(monkeypatch):
 def test_dropping_member_on_io_loop_closes_owned_filesystem(loaded):
     from fsspec.asyn import sync
 
-    source = io.BytesIO(_native.pack_file("x", b"hello"))
+    source = io.BytesIO(pack_file("x", b"hello"))
     fs = ZstarFileSystem(fo=source)
     handles = [fs.open("x") if loaded else fs]
     loop = fs.loop
@@ -439,11 +437,11 @@ def test_cleanup_survives_collection_while_suspended(monkeypatch, finalize):
             finished.set()
 
         monkeypatch.setattr(ZstarFileSystem, "_drain_close", suspended_close)
-        source = io.BytesIO(_native.pack_file("x", b"hello"))
+        source = io.BytesIO(pack_file("x", b"hello"))
         fs = ZstarFileSystem(fo=source, asynchronous=True)
         assert await fs._cat_file("x") == b"hello"
         if not finalize:
-            close = asyncio.create_task(fs.aclose())
+            close = asyncio.create_task(fs.close())
             await asyncio.wait_for(started.wait(), 5)
             close.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -499,14 +497,14 @@ class RangeFileSystem(fsspec.spec.AbstractFileSystem):
 
 
 def test_chaining_uses_resolved_filesystem_and_exact_ranges(monkeypatch):
-    data = bytes(_native.pack_file("x", b"hello" * (1 << 20)))
+    data = bytes(pack_file("x", b"hello" * (1 << 20)))
     credential = object()
     fsspec.register_implementation(RangeFileSystem.protocol, RangeFileSystem, clobber=True)
 
     async def reject_native(*args, **kwargs):
         raise AssertionError("generic chaining must use its fsspec filesystem")
 
-    monkeypatch.setattr(zstar.AsyncArchive, "from_s3", reject_native)
+    monkeypatch.setattr(zstar._native, "aopen_source", reject_native)
     with fsspec.open(
         "zstar://x::zstar-test-range://archive",
         **{"zstar-test-range": {"data": data, "credential": credential}},
@@ -523,7 +521,7 @@ def test_chaining_uses_resolved_filesystem_and_exact_ranges(monkeypatch):
 
 
 def test_injected_filesystem_is_borrowed_and_keeps_credentials():
-    backend = RangeFileSystem(bytes(_native.pack_file("x", b"hello")), credential=object())
+    backend = RangeFileSystem(bytes(pack_file("x", b"hello")), credential=object())
     fs = ZstarFileSystem(fo="archive", fs=backend)
     try:
         assert fs.cat_file("x") == b"hello"
@@ -536,9 +534,7 @@ def test_injected_filesystem_is_borrowed_and_keeps_credentials():
 
 @pytest.mark.parametrize("cache_type", ["none", "blockcache"])
 def test_source_honors_backend_cache_defaults(cache_type):
-    backend = RangeFileSystem(
-        bytes(_native.pack_file("x", b"hello" * 1000)), default_cache_type=cache_type
-    )
+    backend = RangeFileSystem(bytes(pack_file("x", b"hello" * 1000)), default_cache_type=cache_type)
     with ZstarFileSystem(fo="archive", fs=backend) as fs:
         assert fs.cat_file("x", start=0, end=5) == b"hello"
         requests = len(backend.ranges)
@@ -551,7 +547,7 @@ def test_source_honors_backend_cache_defaults(cache_type):
 
 def test_disk_blockcache_chaining_reuses_source_across_opens(tmp_path):
     payload = random.Random(0).randbytes(5 << 20)
-    data = bytes(_native.pack_file("x", payload))
+    data = bytes(pack_file("x", payload))
     fsspec.register_implementation(RangeFileSystem.protocol, RangeFileSystem, clobber=True)
     options = {
         "blockcache": {
@@ -563,27 +559,32 @@ def test_disk_blockcache_chaining_reuses_source_across_opens(tmp_path):
     }
     url = "zstar://x::blockcache::zstar-test-range://archive"
     fs, path = fsspec.core.url_to_fs(url, **options)
-    with fs, fs.open(path) as member:
+    # fsspec MMapCache._makefile finalizes its backing file after creating the mmap.
+    with pytest.warns(ResourceWarning, match="unclosed file"), fs, fs.open(path) as member:
         assert member.read(5) == payload[:5]
     backend = RangeFileSystem.instances[-1]
     assert backend.ranges
     assert sum(end - start for start, end in backend.ranges) < len(data) + (128 << 10)
     fs, path = fsspec.core.url_to_fs(url, **options)
-    with fs, fs.open(path) as member:
+    with pytest.warns(ResourceWarning, match="unclosed file"), fs, fs.open(path) as member:
         assert member.read(5) == payload[:5]
     reopened_backend = RangeFileSystem.instances[-1]
     assert reopened_backend is not backend
     assert not reopened_backend.ranges
 
 
-def test_fsspec_is_required_and_s3fs_is_separate():
+def test_fsspec_is_optional_and_s3fs_is_separate():
     from importlib.metadata import requires
 
     from packaging.requirements import Requirement
 
     dependencies = [Requirement(value) for value in requires("zstar-py")]
     assert any(
-        requirement.name == "fsspec" and requirement.marker is None for requirement in dependencies
+        requirement.name == "fsspec"
+        and requirement.marker is not None
+        and requirement.marker.evaluate({"extra": "fsspec"})
+        and not requirement.marker.evaluate({"extra": ""})
+        for requirement in dependencies
     )
     assert all(requirement.name != "s3fs" for requirement in dependencies)
 
@@ -591,7 +592,7 @@ def test_fsspec_is_required_and_s3fs_is_separate():
 def test_injected_async_filesystem_uses_exact_ranges():
     from fsspec.asyn import AsyncFileSystem
 
-    data = bytes(_native.pack_file("x", b"hello"))
+    data = bytes(pack_file("x", b"hello"))
 
     class AsyncRanges(AsyncFileSystem):
         async_impl = True
@@ -634,14 +635,14 @@ def test_s3_preserves_backend_credentials(monkeypatch, source):
         protocol = "s3"
 
     monkeypatch.setitem(import_module("fsspec.registry")._registry, "s3", MockS3)
-    data = bytes(_native.pack_file("x", b"hello"))
+    data = bytes(pack_file("x", b"hello"))
     credential = object()
     backend = MockS3(data, credential=credential)
 
     async def reject_native(*args, **kwargs):
         raise AssertionError("fsspec S3 access must use its selected filesystem")
 
-    monkeypatch.setattr(zstar.AsyncArchive, "from_s3", reject_native)
+    monkeypatch.setattr(zstar._native, "aopen_source", reject_native)
     if source == "direct":
         path = "zstar://x"
         options = {
@@ -665,9 +666,9 @@ def test_s3_preserves_backend_credentials(monkeypatch, source):
 
 def test_bulk_helpers_and_batched_ranges(tmp_path, monkeypatch):
     output = io.BytesIO()
-    with ArchiveWriter(output) as writer:
-        writer.write_bytes("a.txt", b"hello")
-        writer.write_bytes("b.txt", b"world")
+    with zstar.open(output, options=WriterOptions(), mode="w") as writer:
+        writer.writestr("a.txt", b"hello")
+        writer.writestr("b.txt", b"world")
     batches = []
     original = zstar.AsyncArchive.read_many
 
@@ -688,37 +689,44 @@ def test_bulk_helpers_and_batched_ranges(tmp_path, monkeypatch):
             fs.cat_ranges(["missing"], 0, 2, on_error="raise")
         assert fs.cat(["a.txt", "b.txt"]) == {"a.txt": b"hello", "b.txt": b"world"}
         assert fs.find("") == ["a.txt", "b.txt"]
-        fs.get("a.txt", str(tmp_path / "copy.txt"))
-        assert (tmp_path / "copy.txt").read_bytes() == b"hello"
+        destination = tmp_path / "copy.txt"
+        if os.name == "posix":
+            fs.get("a.txt", str(destination))
+            assert destination.read_bytes() == b"hello"
+        else:
+            with pytest.raises(NotImplementedError, match="descriptor-relative no-follow I/O"):
+                fs.get("a.txt", str(destination))
+            assert not destination.exists()
         assert dict(fs.get_mapper())["b.txt"] == b"world"
-
-
-@pytest.mark.parametrize("verify_external", [False, True])
-@pytest.mark.parametrize("nested", [False, True])
-def test_hash_policy_has_one_configuration_path(verify_external, nested):
-    with pytest.raises(TypeError, match="use verify_external="):
-        ZstarFileSystem(
-            fo=io.BytesIO(),
-            verify_external=verify_external,
-            reader_options={"verify_external": nested},
-        )
 
 
 def test_reader_options_apply_to_fsspec():
     with ZstarFileSystem(
-        fo=io.BytesIO(_native.pack_file("x", b"hello")),
-        reader_options={"max_read_bytes": 2, "concurrent_chunks": 1},
+        fo=io.BytesIO(pack_file("x", b"hello")),
+        options=ReaderOptions(max_read_bytes=2, concurrent_chunks=1),
     ) as fs:
         assert fs.cat_file("x") == b"hello"  # Streaming reads obey the per-read budget.
         assert fs.cat_ranges(["x"], 0, 2) == [b"he"]
         assert fs.cat_ranges(["x"], 0, 5) == [b"hello"]
 
 
+@pytest.mark.parametrize("mode", ["r", "w"])
+def test_fsspec_rejects_unknown_policy_keys(mode):
+    with pytest.raises(TypeError, match="unknown option"):
+        ZstarFileSystem(fo=io.BytesIO(), mode=mode, options={"typo": 1})
+
+
+@pytest.mark.parametrize("mode,field", [("r", "source"), ("w", "sink")])
+def test_fsspec_rejects_direct_transport_settings(mode, field):
+    with pytest.raises(ValueError, match="fs= or target_options"):
+        ZstarFileSystem(fo=io.BytesIO(), mode=mode, options={field: {}})
+
+
 def test_get_file_borrowed_output_and_callbacks():
     from fsspec.callbacks import Callback
 
     data = b"hello world"
-    with ZstarFileSystem(fo=io.BytesIO(_native.pack_file("x", data))) as fs:
+    with ZstarFileSystem(fo=io.BytesIO(pack_file("x", data))) as fs:
         target = io.BytesIO()
         callback = Callback()
         fs.get_file("x", outfile=target, callback=callback)
@@ -729,7 +737,7 @@ def test_get_file_borrowed_output_and_callbacks():
 def test_async_batched_ranges():
     async def run():
         async with ZstarFileSystem(
-            fo=io.BytesIO(_native.pack_file("x", b"hello")), asynchronous=True
+            fo=io.BytesIO(pack_file("x", b"hello")), asynchronous=True
         ) as fs:
             assert await fs._cat_ranges(["x", "x"], [0, 2], [2, None]) == [b"he", b"llo"]
 
@@ -740,8 +748,8 @@ def test_async_batched_ranges():
 @pytest.mark.parametrize("parent_link", [False, True])
 def test_download_rejects_destination_symlinks(tmp_path, parent_link):
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
-        writer.write_bytes("file", b"replacement")
+    with zstar.open(output, options=WriterOptions(), mode="w") as writer:
+        writer.writestr("file", b"replacement")
     outside = tmp_path / "outside"
     outside.mkdir()
     victim = outside / "file"
@@ -752,7 +760,7 @@ def test_download_rejects_destination_symlinks(tmp_path, parent_link):
     else:
         destination.mkdir()
         (destination / "file").symlink_to(victim)
-    with zstar.ZstarFileSystem(io.BytesIO(output.getvalue())) as fs, pytest.raises(OSError):
+    with ZstarFileSystem(io.BytesIO(output.getvalue())) as fs, pytest.raises(OSError):
         fs.get_file("file", destination / "file")
     assert victim.read_bytes() == b"original"
 
@@ -762,8 +770,8 @@ def test_download_parent_replacement_cannot_redirect_write(tmp_path, monkeypatch
     from zstar import _fsspec
 
     output = io.BytesIO()
-    with zstar.ArchiveWriter(output) as writer:
-        writer.write_bytes("file", b"replacement")
+    with zstar.open(output, options=WriterOptions(), mode="w") as writer:
+        writer.writestr("file", b"replacement")
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "file").write_bytes(b"original")
@@ -782,7 +790,7 @@ def test_download_parent_replacement_cannot_redirect_write(tmp_path, monkeypatch
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(_fsspec.os, "open", swap_before_leaf)
-    with zstar.ZstarFileSystem(io.BytesIO(output.getvalue())) as fs:
+    with ZstarFileSystem(io.BytesIO(output.getvalue())) as fs:
         fs.get_file("file", destination / "file")
     assert replaced
     assert (outside / "file").read_bytes() == b"original"

@@ -7,7 +7,7 @@ fn invalid(message: &str) -> Error {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Value> {
-    let mut parser = SequenceDecoder::<_, true>::new(bytes, bytes.len() as u64);
+    let mut parser = SequenceDecoder::new(bytes, bytes.len() as u64);
     let value = parser.next()?.ok_or_else(|| invalid("empty CBOR"))?;
     if parser.next()?.is_some() {
         return Err(invalid("trailing CBOR bytes"));
@@ -15,66 +15,27 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
-// Complete blocks benefit from bounded preallocation. Streaming documents
-// retain Vec's growth policy; exact reservations regress large archive opens.
-pub struct SequenceDecoder<R, const PREALLOCATE: bool = false> {
+pub struct SequenceDecoder<R> {
     reader: R,
     remaining: u64,
     items: usize,
-    // Per-top-level-item byte caps, enforced before any allocation. The
-    // first item (manifest header) and later items (entries) differ.
-    first_max: u64,
-    item_max: u64,
-    index: u64,
-    consumed: u64,
 }
-impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> {
+impl<R: std::io::Read> SequenceDecoder<R> {
     pub(crate) const fn new(reader: R, remaining: u64) -> Self {
         Self {
             reader,
             remaining,
             items: 0,
-            first_max: u64::MAX,
-            item_max: u64::MAX,
-            index: 0,
-            consumed: 0,
         }
-    }
-    /// Cap the encoded bytes of the first top-level item and of every later one.
-    pub(crate) const fn with_item_limits(mut self, first_max: u64, item_max: u64) -> Self {
-        self.first_max = first_max;
-        self.item_max = item_max;
-        self
-    }
-    const fn charge(&mut self, len: u64) -> Result<()> {
-        let cap = if self.index == 0 {
-            self.first_max
-        } else {
-            self.item_max
-        };
-        self.consumed = self.consumed.saturating_add(len);
-        if self.consumed > cap {
-            // Header and entry item caps are local parser budgets.
-            return Err(if self.index == 0 {
-                Error::Budget("manifest header size")
-            } else {
-                Error::Budget("CBOR item size")
-            });
-        }
-        Ok(())
     }
     pub(crate) fn next(&mut self) -> Result<Option<Value>> {
         if self.remaining == 0 {
             return Ok(None);
         }
         self.items = 0;
-        self.consumed = 0;
-        let value = self.item(0)?;
-        self.index += 1;
-        Ok(Some(value))
+        self.item(0).map(Some)
     }
     fn take(&mut self, len: usize) -> Result<Vec<u8>> {
-        self.charge(len as u64)?;
         if len as u64 > self.remaining {
             return Err(invalid("truncated CBOR"));
         }
@@ -83,17 +44,7 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         self.remaining -= len as u64;
         Ok(value)
     }
-    // Bytes still permitted for the current top-level item.
-    const fn item_room(&self) -> u64 {
-        let cap = if self.index == 0 {
-            self.first_max
-        } else {
-            self.item_max
-        };
-        cap.saturating_sub(self.consumed)
-    }
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.charge(N as u64)?;
         if N as u64 > self.remaining {
             return Err(invalid("truncated CBOR"));
         }
@@ -102,13 +53,12 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
         self.remaining -= N as u64;
         Ok(bytes)
     }
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep the ordered validation or protocol operation together."
-    )]
     fn item(&mut self, depth: usize) -> Result<Value> {
         if depth > 64 || self.items >= 16_000_000 {
-            return Err(Error::Budget("CBOR nesting or item budget"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::CborItems,
+                "CBOR nesting or item budget",
+            ));
         }
         self.items += 1;
         let head = self.fixed::<1>()?[0];
@@ -170,30 +120,22 @@ impl<R: std::io::Read, const PREALLOCATE: bool> SequenceDecoder<R, PREALLOCATE> 
                 }
             }
             4 => {
-                if n > self.remaining || n > self.item_room() {
+                if n > self.remaining {
                     return Err(invalid("CBOR array length"));
                 }
                 // Avoid repeated growth for ordinary tuples without trusting
                 // an untrusted length to request an arbitrarily large buffer.
-                let mut values = if PREALLOCATE {
-                    Vec::with_capacity(n.min(1024) as usize)
-                } else {
-                    Vec::new()
-                };
+                let mut values = Vec::with_capacity(n.min(1024) as usize);
                 for _ in 0..n {
                     values.push(self.item(depth + 1)?);
                 }
                 Ok(Value::Array(values))
             }
             5 => {
-                if n > self.remaining / 2 || n > self.item_room() / 2 {
+                if n > self.remaining / 2 {
                     return Err(invalid("CBOR map length"));
                 }
-                let mut values: Vec<(Value, Value)> = if PREALLOCATE {
-                    Vec::with_capacity(n.min(1024) as usize)
-                } else {
-                    Vec::new()
-                };
+                let mut values: Vec<(Value, Value)> = Vec::with_capacity(n.min(1024) as usize);
                 for _ in 0..n {
                     let key = self.item(depth + 1)?;
                     let Value::Text(text) = &key else {
@@ -258,7 +200,10 @@ pub fn encoded_len(value: &Value) -> Result<usize> {
 pub fn encoded_len_at(value: &Value, depth: usize) -> Result<usize> {
     fn visit(value: &Value, depth: usize, items: &mut usize) -> Result<usize> {
         if depth > 64 || *items >= 16_000_000 {
-            return Err(Error::Budget("CBOR nesting or item budget"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::CborItems,
+                "CBOR nesting or item budget",
+            ));
         }
         *items += 1;
         Ok(match value {
@@ -434,23 +379,18 @@ mod tests {
     use super::*;
     #[test]
     fn oversized_item_is_rejected_before_allocation() {
-        // Claims a 4 GiB byte string but supplies nothing: must fail on the cap
-        // (not on read_exact after allocating).
+        // Claims a 4 GiB byte string but supplies nothing: reject its length
+        // before allocating or attempting to read its body.
         let mut raw = vec![0x5b];
         raw.extend((4u64 << 30).to_be_bytes());
-        let mut d = SequenceDecoder::<_>::new(raw.as_slice(), u64::MAX).with_item_limits(16, 16);
-        assert!(matches!(d.next(), Err(Error::Budget(_))));
-        let mut d = SequenceDecoder::<_>::new(raw.as_slice(), u64::MAX).with_item_limits(99, 16);
-        d.index = 1;
-        assert!(matches!(d.next(), Err(Error::Budget(_))));
-        // Per-item, not cumulative: many small items pass.
+        assert!(decode(&raw).is_err());
+        // Sequential items each use the remaining input bounds.
         let many = vec![0x01; 100];
-        let mut d = SequenceDecoder::<_>::new(many.as_slice(), 100).with_item_limits(16, 1);
+        let mut d = SequenceDecoder::new(many.as_slice(), many.len() as u64);
         while d.next().unwrap().is_some() {}
-        // Array/map counts are bounded by the item cap.
+        // Array/map counts are bounded by the remaining bytes.
         let arr = [0x9a, 0x00, 0x10, 0x00, 0x00];
-        let mut d = SequenceDecoder::<_>::new(arr.as_slice(), u64::MAX).with_item_limits(16, 16);
-        assert!(d.next().is_err());
+        assert!(decode(&arr).is_err());
     }
     #[test]
     fn text_key_order_matches_encoded_bytes_at_width_and_utf8_boundaries() {
