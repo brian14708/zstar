@@ -23,9 +23,6 @@ aws-runtime.workspace = true
 aws-types.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
-quick-xml.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
@@ -33,6 +30,7 @@ url.workspace = true
 zstar = { workspace = true, features = ["fs", "s3"] }
 
 [dev-dependencies]
+reqwest.workspace = true
 zstd.workspace = true
 
 [lints]

@@ -6,14 +6,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
-use zstar::backend::BlockingBuilder;
+use zstar::blocking::Builder as BlockingBuilder;
 use zstar::http::{HttpRangeSource, ReqwestTransport};
+use zstar::layout::Source;
 use zstar::s3::object_store::buffered::BufWriter;
 use zstar::s3::{
     AmazonS3, AmazonS3Builder, Path, S3BlobStore, S3RangeSource, S3RequestProvider,
     object_store::{ObjectStore, ObjectStoreExt, signer::Signer},
 };
-use zstar::{Archive, AsyncRangeReader, Entry, ReaderOptions, Source};
+use zstar::{Archive, AsyncRangeReader, ReaderOptions};
 
 #[expect(
     clippy::too_many_lines,
@@ -70,31 +71,27 @@ async fn native_s3_presigned_ranges_objects_and_multipart() {
         .await
         .unwrap();
     assert_eq!(
-        zstar::backend::decode_frame(&encoded, object.len()).unwrap(),
+        zstd::bulk::decompress(&encoded, object.len()).unwrap(),
         object
     );
-    let mut writer = BlockingBuilder::with_options(
+    let mut writer = BlockingBuilder::try_with_options(
         Vec::new(),
-        1024,
-        3,
-        zstar::backend::ManifestOptions::default(),
+        zstar::WriterOptions {
+            frame_size: 1024,
+            ..Default::default()
+        },
     )
     .unwrap();
-    writer
-        .add_file(Entry::file("inline"), 12, &mut b"hello RustFS".as_slice())
-        .unwrap();
-    let mut link = Entry::file("link");
-    link.kind = zstar::EntryKind::Symlink;
-    link.mode = 0o777;
-    link.linkname = Some(".././inline".into());
-    writer.add_metadata(link).unwrap();
-    let mut remote = Entry::file("remote");
-    remote.extents = vec![zstar::Extent {
+    writer.append_bytes("inline", b"hello RustFS").unwrap();
+    writer.append_symlink("link", ".././inline").unwrap();
+    let extents = vec![zstar::layout::Extent {
         size: 15,
         offset: 11,
         ..whole
     }];
-    writer.add_metadata(remote).unwrap();
+    writer
+        .append_external(zstar::Header::file("remote", 15), extents)
+        .unwrap();
     let archive = Bytes::from(writer.finish().unwrap());
     let path = Path::from("archive.zstar");
     zstar::s3::put_archive(store.as_ref(), &path, archive.clone())

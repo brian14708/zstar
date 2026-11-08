@@ -88,15 +88,15 @@ async fn tar_style_roundtrip_ranges_and_metadata() {
     assert!(archive.open_file("dir").await.is_err());
     assert_eq!(archive.read_link("link").await.unwrap(), "../dir/file");
     let file = archive.open_file("dir/file").await.unwrap();
-    assert_eq!(file.metadata().mode, 0o640);
-    assert_eq!(file.metadata().uid, 42);
-    assert_eq!(file.metadata().gid, 13);
-    assert_eq!(file.metadata().mtime_ns, -123);
+    assert_eq!(file.metadata().mode(), 0o640);
+    assert_eq!(file.metadata().uid(), 42);
+    assert_eq!(file.metadata().gid(), 13);
+    assert_eq!(file.metadata().mtime_ns(), -123);
     assert_eq!(
-        file.metadata().attributes["x-note"],
+        file.metadata().attributes()["x-note"],
         ciborium::Value::Text("retained".into())
     );
-    assert_eq!(archive.entry("dir").await.unwrap().unwrap().mode, 0o750);
+    assert_eq!(archive.entry("dir").await.unwrap().unwrap().mode(), 0o750);
     let (_, report) = archive
         .read_range_with_report("dir/file", 1000..1100)
         .await
@@ -132,7 +132,9 @@ async fn handles_seek_across_frames_and_survive_archive_drop() {
 #[tokio::test]
 async fn archive_cursors_read_across_extents() {
     let archive = Archive::from_bytes(fixture().await).await.unwrap();
-    let cursor = archive.open_cursor("dir/file").await.unwrap();
+    let cursor = zstar::backend::open_cursor(&archive, "dir/file")
+        .await
+        .unwrap();
     let expected = payload();
     for (offset, length) in [(0, 1), (500, 2048), (1000, 6000), (8190, 3), (8193, 0)] {
         assert_eq!(
@@ -154,7 +156,9 @@ async fn archive_cursors_reject_other_archives() {
     let bytes = fixture().await;
     let archive = Archive::from_bytes(bytes.clone()).await.unwrap();
     let other = Archive::from_bytes(bytes).await.unwrap();
-    let cursor = archive.open_cursor("dir/file").await.unwrap();
+    let cursor = zstar::backend::open_cursor(&archive, "dir/file")
+        .await
+        .unwrap();
     assert_eq!(cursor.read(&archive, 0, 1).await.unwrap(), payload()[..1]);
     assert!(matches!(
         cursor.read(&other, 0, 1).await,
@@ -185,10 +189,10 @@ async fn owned_stream_combinators_and_large_seek_indexes() {
         .await
         .unwrap();
     let stream = archive.entries();
+    let entries: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(entries[0].size(), bytes.len() as u64);
+    let mut file = archive.open_file(entries[0].path()).await.unwrap();
     drop(archive);
-    let mut files: Vec<_> = stream.try_collect().await.unwrap();
-    let file = &mut files[0];
-    assert!(file.metadata().extents.len() > 64);
     file.seek(SeekFrom::End(-100)).await.unwrap();
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).await.unwrap();
@@ -274,38 +278,6 @@ fn idle_builders_do_not_occupy_blocking_worker_slots() {
         .await
         .unwrap();
     });
-}
-
-#[tokio::test]
-async fn panicking_codec_callbacks_do_not_strand_output_waits() {
-    let mut builder = Builder::try_with_options(
-        Vec::new(),
-        WriterOptions {
-            metadata: zstar::MetadataWriterOptions {
-                spool: zstar::SpoolOptions {
-                    memory_bytes: 1,
-                    create_store: Some(zstar::SpillFactory::new(|| {
-                        panic!("spill callback failed")
-                    })),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        timeout(
-            Duration::from_secs(2),
-            builder.append_bytes("file", b"data")
-        )
-        .await
-        .unwrap()
-        .is_err()
-    );
-    assert!(builder.finish().await.is_err());
 }
 
 impl AsyncRead for StalledInput {
@@ -492,7 +464,9 @@ async fn cancelled_cursor_reads_and_stream_seeks_release_pending_io() {
     )
     .await
     .unwrap();
-    let cursor = archive.open_cursor("dir/file").await.unwrap();
+    let cursor = zstar::backend::open_cursor(&archive, "dir/file")
+        .await
+        .unwrap();
     let mut file = archive.open_file("dir/file").await.unwrap();
     source.stall.store(true, Ordering::SeqCst);
     {
@@ -594,8 +568,8 @@ async fn cursor_decoded_caches_belong_to_retained_handles() {
         calls: AtomicUsize::new(0),
     });
     let archive = Archive::open(source.clone()).await.unwrap();
-    let first = archive.open_cursor("file").await.unwrap();
-    let second = archive.open_cursor("file").await.unwrap();
+    let first = zstar::backend::open_cursor(&archive, "file").await.unwrap();
+    let second = zstar::backend::open_cursor(&archive, "file").await.unwrap();
     source.calls.store(0, Ordering::SeqCst);
     for (offset, expected) in (0..3).zip(b"abc") {
         assert_eq!(
@@ -607,7 +581,7 @@ async fn cursor_decoded_caches_belong_to_retained_handles() {
     assert_eq!(second.read(&archive, 0, 1).await.unwrap(), b"a"[..]);
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     drop(first);
-    let reopened = archive.open_cursor("file").await.unwrap();
+    let reopened = zstar::backend::open_cursor(&archive, "file").await.unwrap();
     assert_eq!(reopened.read(&archive, 0, 1).await.unwrap(), b"a"[..]);
     assert_eq!(source.calls.load(Ordering::SeqCst), 3);
     for _ in 0..2 {
@@ -645,11 +619,13 @@ async fn external_chunks_accept_boxed_writers_and_reject_bad_sizes() {
     struct Store;
     #[async_trait::async_trait]
     impl zstar::chunking::ObjectWriter for Store {
-        async fn put_chunk(&mut self, raw: Bytes) -> Result<zstar::Extent> {
+        async fn put_chunk(&mut self, raw: Bytes) -> Result<zstar::layout::Extent> {
             tokio::task::yield_now().await;
-            Ok(zstar::Extent {
+            Ok(zstar::layout::Extent {
                 size: raw.len() as u64,
-                source: zstar::Source::Object(*zstar::backend::Digest::sha256(&raw).as_bytes()),
+                source: zstar::layout::Source::Object(
+                    *zstar::backend::Digest::sha256(&raw).as_bytes(),
+                ),
                 encoded_size: zstar::backend::encode_frame(&raw, 3)?.len() as u64,
                 offset: 0,
             })

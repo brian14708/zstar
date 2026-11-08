@@ -3373,6 +3373,7 @@ dependencies = [
  "hex",
  "object_store",
  "proptest",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
@@ -3394,9 +3395,7 @@ dependencies = [
  "aws-types",
  "clap",
  "futures-util",
- "quick-xml",
  "reqwest",
- "serde",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -3411,10 +3410,14 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "cap-fs-ext",
+ "cap-std",
  "ciborium",
+ "futures-util",
  "pyo3",
  "pyo3-async-runtimes",
  "tokio",
+ "url",
  "zstar",
 ]
 

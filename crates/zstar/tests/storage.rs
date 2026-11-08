@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use std::{num::NonZeroUsize, sync::Arc};
+use zstar::layout::Source;
 use zstar::s3::{
     Path, S3BlobStore, S3RangeSource,
     object_store::{ObjectStoreExt, memory::InMemory},
 };
-use zstar::{Archive, AsyncRangeReader, Builder, Error, ReaderOptions, Source};
+use zstar::{Archive, AsyncRangeReader, Builder, Error, ReaderOptions};
 
 #[tokio::test]
 async fn conditional_ranges_reject_replaced_objects_and_enforce_budgets() {
@@ -42,16 +43,18 @@ async fn encoded_objects_use_actual_sizes_and_reader_owned_verification() {
     };
     let encoded = blobs.get_encoded(digest, 1, 17 << 20).await.unwrap();
     assert_eq!(encoded.len() as u64, extent.encoded_size);
-    assert_eq!(zstar::backend::decode_frame(&encoded, 4).unwrap(), b"aaaa");
+    assert_eq!(zstd::bulk::decompress(&encoded, 4).unwrap(), b"aaaa");
     assert!(matches!(
         blobs.get_encoded(digest, extent.encoded_size, 1).await,
         Err(Error::Budget(_))
     ));
     let mut writer = Builder::try_new(Vec::new()).await.unwrap();
-    let mut entry = zstar::Entry::file("remote");
-    entry.extents = vec![extent];
-    entry.extents[0].encoded_size = 1;
-    writer.append_external(entry).await.unwrap();
+    let mut extents = vec![extent];
+    extents[0].encoded_size = 1;
+    writer
+        .append_external(zstar::Header::file("remote", 4), extents)
+        .await
+        .unwrap();
     let archive = Bytes::from(writer.finish().await.unwrap());
     let archive_path = Path::from("archive");
     store.put(&archive_path, archive.into()).await.unwrap();

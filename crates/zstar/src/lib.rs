@@ -1,9 +1,9 @@
-//! Format primitives and async I/O for indexed tar archives.
+//! Format primitives, blocking I/O, and async I/O for indexed tar archives.
 //!
 //! Storage sources and external object resolvers keep transport policy separate
 //! from the archive format.
 
-#![cfg_attr(feature = "async", doc = include_str!("../README.md"))]
+#![doc = include_str!("../README.md")]
 
 /// Local archive sources, capture, and restoration. Requires the `fs` feature.
 #[cfg(feature = "fs")]
@@ -20,22 +20,45 @@ use thiserror::Error;
 /// workspace consumers and is not part of the supported SDK interface.
 #[doc(hidden)]
 pub mod backend;
-#[cfg(any(feature = "fs", all(test, feature = "disk")))]
+#[cfg(any(feature = "fs", test))]
 mod capture;
 mod cbor;
 pub mod chunking;
 mod decoded_body;
+pub(crate) mod frame;
+mod writer_engine;
+#[cfg(test)]
+pub(crate) use frame::decode_bounded;
+pub(crate) use frame::decode_bounded_with_limits;
+/// Blocking archives, builders, and storage interfaces; available without Tokio.
+pub mod blocking;
+mod budget;
+mod header;
 mod limits;
-mod options;
+mod metadata;
+pub(crate) mod options;
+pub(crate) mod read_plan;
+mod report;
+mod request;
+pub use budget::{BudgetError, BudgetResource};
+pub use header::Header;
 pub use limits::Limits;
-pub use options::{MetadataReaderOptions, MetadataWriterOptions, SpoolOptions};
+pub use metadata::EntryMetadata;
+pub use options::{MetadataReaderOptions, MetadataWriterOptions, WriterOptions};
+pub use report::ReadReport;
+pub use request::{MAX_BATCH_REQUESTS, ReadRequest};
 #[expect(
     clippy::redundant_pub_crate,
     reason = "Crate-only helpers must stay out of backend's public manifest reexports."
 )]
 mod manifest;
 mod manifest_io;
-pub use manifest::{Entry, EntryKind, Extent, Source};
+pub use manifest::EntryKind;
+/// Advanced physical member layouts for external content and format tooling.
+pub mod layout {
+    pub use crate::manifest::{Entry, Extent, Source};
+}
+pub(crate) use layout::{Entry, Extent, Source};
 pub type Extensions = std::collections::BTreeMap<String, ciborium::Value>;
 #[cfg(feature = "async")]
 mod archive;
@@ -48,32 +71,47 @@ mod io;
 #[cfg(feature = "async")]
 mod range_cache;
 #[cfg(feature = "async")]
-pub use archive::{Archive, ObjectResolver, ReadReport, ReaderOptions};
+pub use archive::{Archive, ObjectResolver, ReaderOptions};
 #[cfg(feature = "async")]
-pub use builder::{Builder, Header, WriterOptions};
+pub use builder::Builder;
 #[cfg(feature = "async")]
-pub use file::{File, FileCursor};
+pub use file::File;
 #[cfg(feature = "async")]
-pub use io::{AsyncRangeReader, MAX_BATCH_REQUESTS, ReadRequest};
+pub use io::AsyncRangeReader;
 #[cfg(feature = "async")]
 pub use range_cache::{CachedRangeReader, RangeCacheOptions, RangeCacheStats};
 mod parallel;
 mod primitives;
-#[cfg(test)]
-use primitives::SliceReader;
+#[cfg(any(test, feature = "s3"))]
+pub(crate) use primitives::{Digest, encode_frame};
 mod tar;
 mod tar_encode;
-pub(crate) use manifest_io::{ManifestOptions, ManifestReader};
-pub use manifest_io::{SpillFactory, SpillStore, SpoolBudget};
+pub(crate) use manifest_io::ManifestOptions;
+#[cfg(feature = "async")]
+pub(crate) use manifest_io::ManifestReader;
 pub(crate) use primitives::{
-    Digest, FOOTER_SIZE, Footer, RangeReader, TOC_MAGIC, checked_range, encode_footer,
-    encode_frame, parse_footer, verify_sha256,
+    FOOTER_SIZE, Footer, RangeReader, TOC_MAGIC, checked_range, encode_footer, parse_footer,
+    verify_sha256,
 };
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("local resource budget exceeded: {0}")]
-    Budget(&'static str),
+    Budget(#[source] BudgetError),
+    #[error("invalid option {option}: {reason}")]
+    InvalidOptions {
+        option: &'static str,
+        reason: &'static str,
+    },
+    #[error("invalid input: {0}")]
+    InvalidInput(&'static str),
+    #[error("{path}: {source}")]
+    Filesystem {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("archive is not a Zstar file")]
     NotZstar,
     #[error("malformed footer: {0}")]
@@ -111,12 +149,33 @@ pub enum Error {
 }
 
 impl Error {
+    /// Creates a typed resource rejection with operation context.
+    #[must_use]
+    pub const fn budget(resource: BudgetResource, context: &'static str) -> Self {
+        Self::Budget(BudgetError::new(resource, context))
+    }
+    /// Creates a typed resource rejection with numeric accounting.
+    #[must_use]
+    pub const fn budget_exceeded(
+        resource: BudgetResource,
+        context: &'static str,
+        limit: u64,
+        requested: u64,
+    ) -> Self {
+        Self::Budget(BudgetError::exceeded(resource, context, limit, requested))
+    }
     /// Structural copy for sharing one failure among waiters. I/O errors keep
     /// their kind and message but not their source chain.
     #[cfg(feature = "async")]
     pub(crate) fn duplicate(&self) -> Self {
         match self {
-            Self::Budget(m) => Self::Budget(m),
+            Self::Budget(m) => Self::Budget(*m),
+            Self::InvalidOptions { option, reason } => Self::InvalidOptions { option, reason },
+            Self::InvalidInput(m) => Self::InvalidInput(m),
+            Self::Filesystem { path, source } => Self::Filesystem {
+                path: path.clone(),
+                source: std::io::Error::new(source.kind(), source.to_string()),
+            },
             Self::NotZstar => Self::NotZstar,
             Self::MalformedFooter(m) => Self::MalformedFooter(m),
             Self::MalformedToc(m) => Self::MalformedToc(m.clone()),
@@ -141,6 +200,8 @@ impl Error {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::Budget(_) => "resource-limit",
+            Self::InvalidOptions { .. } => "invalid-options",
+            Self::InvalidInput(_) => "invalid-input",
             Self::NotZstar => "not-zstar",
             Self::MalformedFooter(_) => "malformed-footer",
             Self::MalformedToc(_) | Self::Encoding(_) => "malformed-toc",
@@ -156,7 +217,7 @@ impl Error {
             Self::Range => "invalid-range",
             Self::MissingEntry(_) => "missing-entry",
             Self::Unsupported(_) => "unsupported-operation",
-            Self::Io(_) => "io",
+            Self::Io(_) | Self::Filesystem { .. } => "io",
         }
     }
 }
@@ -170,129 +231,17 @@ impl From<Error> for std::io::Error {
             return error;
         }
         let kind = match &error {
+            Error::Filesystem { source, .. } => source.kind(),
+            Error::InvalidOptions { .. } | Error::InvalidInput(_) | Error::Range => {
+                ErrorKind::InvalidInput
+            }
             Error::MissingEntry(_) | Error::MissingObject(_) => ErrorKind::NotFound,
-            Error::Range => ErrorKind::InvalidInput,
             Error::Unsupported(_) => ErrorKind::Unsupported,
             Error::Budget(_) => ErrorKind::Other,
             _ => ErrorKind::InvalidData,
         };
         Self::new(kind, error)
     }
-}
-
-pub(crate) fn decode_frame_into(
-    encoded: &[u8],
-    expected_size: usize,
-    decoded: &mut Vec<u8>,
-    context: &mut zstd::zstd_safe::DCtx<'static>,
-) -> Result<()> {
-    if expected_size == 0 {
-        return Err(Error::MalformedFrame("frame size limit".into()));
-    }
-    let start = decoded.len();
-    decode_bounded_into(encoded, expected_size, decoded, context, Limits::default())?;
-    if decoded.len() - start != expected_size {
-        return Err(Error::MalformedFrame("decoded size mismatch".into()));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn decode_bounded(encoded: &[u8], limit: usize) -> Result<Vec<u8>> {
-    decode_bounded_with_limits(encoded, limit, Limits::default())
-}
-pub(crate) fn decode_bounded_with_limits(
-    encoded: &[u8],
-    limit: usize,
-    limits: Limits,
-) -> Result<Vec<u8>> {
-    limits.frame(encoded)?;
-    let mut decoded = Vec::new();
-    let mut context = zstd::zstd_safe::DCtx::create();
-    decode_bounded_into(encoded, limit, &mut decoded, &mut context, limits)?;
-    decoded.shrink_to_fit();
-    Ok(decoded)
-}
-
-// The streaming codec exposes its stable Zstandard error name through io::Error.
-fn frame_decode_error(error: &std::io::Error) -> Error {
-    if error.to_string() == "Restored data doesn't match checksum" {
-        Error::Integrity
-    } else {
-        Error::MalformedFrame(error.to_string())
-    }
-}
-
-fn decode_bounded_into(
-    encoded: &[u8],
-    limit: usize,
-    decoded: &mut Vec<u8>,
-    context: &mut zstd::zstd_safe::DCtx<'static>,
-    limits: Limits,
-) -> Result<()> {
-    use std::io::Read;
-    if !encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-        || zstd::zstd_safe::find_frame_compressed_size(encoded)
-            .map_err(|_| Error::MalformedFrame("invalid frame".into()))?
-            != encoded.len()
-    {
-        return Err(Error::MalformedFrame(
-            "expected exactly one Zstandard frame".into(),
-        ));
-    }
-    if zstd::zstd_safe::get_dict_id_from_frame(encoded).is_some() {
-        return Err(Error::MalformedFrame("dictionary identifier".into()));
-    }
-    let declared = zstd::zstd_safe::get_frame_content_size(encoded)
-        .map_err(|_| Error::MalformedFrame("invalid content size".into()))?;
-    if declared.is_some_and(|size| size > limit as u64) {
-        return Err(Error::Budget("decoded frame size"));
-    }
-    context
-        .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
-        .map_err(|e| Error::MalformedFrame(zstd::zstd_safe::get_error_name(e).into()))?;
-    let mut frame_decoder =
-        zstd::stream::read::Decoder::with_context(encoded, context).single_frame();
-    let window_log = if limits.max_window_bytes == 0 {
-        31
-    } else {
-        // Zstandard accepts powers of two; inspect the exact declared window
-        // separately so a non-power-of-two budget is not rounded up.
-        (limits.max_window_bytes.max(1024) - 1).bit_width()
-    };
-    frame_decoder
-        .window_log_max(window_log.min(31))
-        .map_err(|error| frame_decode_error(&error))?;
-    let start = decoded.len();
-    if let Some(size) = declared {
-        let size = usize::try_from(size).map_err(|_| Error::Budget("decoded frame size"))?;
-        decoded
-            .try_reserve_exact(size)
-            .map_err(|_| Error::Budget("decoded frame allocation"))?;
-        decoded.resize(start + size, 0);
-        frame_decoder
-            .read_exact(&mut decoded[start..])
-            .map_err(|error| frame_decode_error(&error))?;
-        // Read through EOF to verify the checksum without growing the output
-        // allocation just to discover that a full frame has ended.
-        let mut extra = [0];
-        if frame_decoder
-            .read(&mut extra)
-            .map_err(|error| frame_decode_error(&error))?
-            != 0
-        {
-            return Err(Error::MalformedFrame("decoded size mismatch".into()));
-        }
-    } else {
-        frame_decoder
-            .take(limit as u64 + 1)
-            .read_to_end(decoded)
-            .map_err(|error| frame_decode_error(&error))?;
-    }
-    if decoded.len() - start > limit {
-        return Err(Error::Budget("decoded frame size"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

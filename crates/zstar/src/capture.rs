@@ -1,6 +1,6 @@
 //! Temporary sorted capture metadata. Payload lengths never become entry fields.
 use crate::manifest::Entry;
-use crate::manifest_io::{ManifestOptions, Spool, sort_records};
+use crate::manifest_io::{MetadataBuffer, sort_records};
 use crate::{Error, Result};
 use ciborium::Value;
 
@@ -20,19 +20,16 @@ fn key(value: &Value) -> Result<String> {
     Ok(path.clone())
 }
 
-/// An unsorted capture stream with bounded in-memory sorting runs and native
-/// temporary-file spill. Input entries contain no inline extents yet.
-pub struct CaptureSpool {
-    records: Spool,
-    options: ManifestOptions,
+/// An unsorted capture stream with bounded in-memory metadata records. Input entries contain no inline extents yet.
+pub struct CaptureBuffer {
+    records: MetadataBuffer,
     encoded: Vec<u8>,
 }
-impl CaptureSpool {
+impl CaptureBuffer {
     #[must_use]
-    pub fn new(options: ManifestOptions) -> Self {
+    pub const fn new(max_bytes: u64) -> Self {
         Self {
-            records: Spool::new(options.clone()),
-            options,
+            records: MetadataBuffer::new(max_bytes),
             encoded: Vec::new(),
         }
     }
@@ -57,7 +54,7 @@ impl CaptureSpool {
     }
     pub fn sorted(self) -> Result<CapturedEntries> {
         Ok(CapturedEntries {
-            records: sort_records(self.records, self.options, key)?,
+            records: sort_records(self.records, key)?,
             at: 0,
             failed: false,
         })
@@ -66,7 +63,7 @@ impl CaptureSpool {
 
 /// Sorted, owned entries, each paired with its temporary capture length.
 pub struct CapturedEntries {
-    records: Spool,
+    records: MetadataBuffer,
     at: u64,
     failed: bool,
 }
@@ -104,13 +101,14 @@ impl Iterator for CapturedEntries {
 
 impl std::iter::FusedIterator for CapturedEntries {}
 
-#[cfg(all(test, feature = "disk"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::EntryKind;
+    use crate::manifest_io::ManifestOptions;
     #[test]
     fn typed_capture_records_preserve_canonical_bytes_and_optional_metadata() {
-        let mut spool = CaptureSpool::new(ManifestOptions::default());
+        let mut buffer = CaptureBuffer::new(ManifestOptions::default().max_buffer_bytes);
         let mut at = 0;
         for (kind, size) in [
             (EntryKind::File, u64::MAX),
@@ -134,22 +132,20 @@ mod tests {
                 Value::Integer(size.into()),
             ]))
             .unwrap();
-            spool.add(entry, size).unwrap();
-            let length = u32::from_le_bytes(spool.records.read(at, 4).unwrap().try_into().unwrap());
+            buffer.add(entry, size).unwrap();
+            let length =
+                u32::from_le_bytes(buffer.records.read(at, 4).unwrap().try_into().unwrap());
             assert_eq!(length as usize, expected.len());
             assert_eq!(
-                spool.records.read(at + 4, u64::from(length)).unwrap(),
+                buffer.records.read(at + 4, u64::from(length)).unwrap(),
                 expected
             );
             at += 4 + u64::from(length);
         }
     }
     #[test]
-    fn spilled_capture_sorts_utf8_paths_across_runs_and_keeps_payload_lengths() {
-        let mut spool = CaptureSpool::new(ManifestOptions {
-            memory_bytes: 1,
-            ..Default::default()
-        });
+    fn capture_sorts_utf8_paths_and_keeps_payload_lengths() {
+        let mut buffer = CaptureBuffer::new(ManifestOptions::default().max_buffer_bytes);
         let mut expected = Vec::new();
         for (index, path) in (0..5000).rev().map(|i| (i, format!("f{i:04}"))).chain(
             ["é", "a/file", "a-b", "a", "z"]
@@ -172,12 +168,11 @@ mod tests {
                 linkname: None,
                 attributes: std::collections::BTreeMap::default(),
             };
-            spool.add(entry, index).unwrap();
+            buffer.add(entry, index).unwrap();
             expected.push((path, index));
         }
-        assert!(spool.records.spilled());
         expected.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let actual: Vec<_> = spool
+        let actual: Vec<_> = buffer
             .sorted()
             .unwrap()
             .map(|v| {
@@ -189,13 +184,13 @@ mod tests {
     }
     #[test]
     fn corrupt_last_capture_record_errors_instead_of_ending_iteration() {
-        let mut spool = CaptureSpool::new(ManifestOptions::default());
-        spool
+        let mut buffer = CaptureBuffer::new(ManifestOptions::default().max_buffer_bytes);
+        buffer
             .records
             .append_record(&Value::Text("bad record".into()))
             .unwrap();
         let mut entries = CapturedEntries {
-            records: spool.records,
+            records: buffer.records,
             at: 0,
             failed: false,
         };

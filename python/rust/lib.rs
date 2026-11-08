@@ -1,30 +1,37 @@
 //! Python adapters for native archive readers, writers, and storage.
 use pyo3::prelude::*;
+mod adapters;
 mod async_archive;
-mod callback;
+mod completion;
+mod config;
+mod dispatch;
 mod external;
-mod fs;
 mod manifest;
+mod protocol_io;
 mod reader;
 mod request;
-mod s3;
-mod staged_writer;
+mod sinks;
+mod sources;
+mod storage;
 mod support;
 mod sync_archive;
-mod writer;
+mod values;
+mod writer_session;
 
 /// All classes are internally synchronized. Callback gates reject reentry and
 /// state locks are released before Python callbacks, including without the GIL.
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ZstarError", m.py().get_type::<support::ZstarError>())?;
-    fs::register(m)?;
-    manifest::register(m)?;
-    m.add_class::<writer::EntryArchiveWriter>()?;
-    m.add_function(wrap_pyfunction!(writer::_writer_call, m)?)?;
-    m.add_class::<staged_writer::StagedWriter>()?;
-    m.add_class::<staged_writer::StagedMember>()?;
-    m.add_function(wrap_pyfunction!(staged_writer::member_name, m)?)?;
+    m.add_class::<adapters::BlockingAdapter>()?;
+    values::register(m)?;
+    config::register(m)?;
+    dispatch::register(m)?;
+    sources::register(m)?;
+    sinks::register(m)?;
+    m.add_class::<writer_session::WriterSession>()?;
+    m.add_function(wrap_pyfunction!(support::_writer_call, m)?)?;
+    m.add_function(wrap_pyfunction!(support::member_name, m)?)?;
     m.add_function(wrap_pyfunction!(request::put_presigned, m)?)?;
     m.add_class::<sync_archive::SyncArchive>()?;
     m.add_class::<sync_archive::SyncEntries>()?;

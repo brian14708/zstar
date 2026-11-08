@@ -1,22 +1,32 @@
-//! One deterministic manifest sequence with bounded compression segments and disk spooling.
-use crate::manifest::{BLOCK_TARGET, Entry, ManifestRoot, entry_allocation, valid_path};
+//! Deterministic manifest pages with bounded in-memory metadata buffers.
+use crate::manifest::{BLOCK_TARGET, Entry, ManifestRoot, valid_path};
 use crate::{Error, Footer, RangeReader, Result, TOC_MAGIC};
 use ciborium::Value;
 use std::collections::BTreeMap;
 use std::io::Write;
-#[cfg(test)]
-use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 mod paged;
 #[cfg(feature = "async")]
 pub use paged::ManifestDirectory;
-mod spool;
-pub use spool::sort_records;
-pub use spool::{SpillFactory, SpillStore, Spool, SpoolBudget};
+mod buffer;
+pub use buffer::MetadataBuffer;
+pub use buffer::sort_records;
 
-const MEMORY_DEFAULT: u64 = 8 << 20;
-const TOTAL_DEFAULT: u64 = 4 << 30;
+const PAGE_DEFAULT: u64 = 8 << 20;
+const BUFFER_DEFAULT: u64 = 128 << 20;
+
+pub const fn check_page_size(size: u64, maximum: u64) -> Result<()> {
+    if size > maximum {
+        return Err(Error::budget_exceeded(
+            crate::BudgetResource::MetadataPageBytes,
+            "metadata page size",
+            maximum,
+            size,
+        ));
+    }
+    Ok(())
+}
 
 fn invalid(reason: &str) -> Error {
     Error::MalformedToc(reason.into())
@@ -25,9 +35,8 @@ fn invalid(reason: &str) -> Error {
 #[derive(Clone, Debug)]
 pub struct ManifestOptions {
     pub limits: crate::Limits,
-    pub memory_bytes: u64,
-    pub max_encoded_bytes: u64,
-    pub max_decoded_bytes: u64,
+    pub max_page_bytes: u64,
+    pub max_buffer_bytes: u64,
     /// Maximum bytes returned by one selective content read.
     pub max_read_bytes: u64,
     /// Estimated retained typed index, including vector capacity (default 1 GiB).
@@ -38,43 +47,32 @@ pub struct ManifestOptions {
     pub extension_pages: BTreeMap<String, Vec<Value>>,
     /// Target decoded bytes per entry page, at least 512 bytes.
     pub block_target: usize,
-    /// Native default spills to an automatically removed temporary file.
-    pub allow_disk: bool,
-    /// Shared quota for retained logical spool bytes. Cloned options share it.
-    pub spool_budget: Arc<SpoolBudget>,
-    /// Create an empty, exclusively used store when the memory threshold is crossed.
-    pub create_spill_store: Option<SpillFactory>,
 }
 impl Default for ManifestOptions {
     fn default() -> Self {
         Self {
             limits: crate::Limits::default(),
-            memory_bytes: MEMORY_DEFAULT,
-            max_encoded_bytes: TOTAL_DEFAULT,
-            max_decoded_bytes: TOTAL_DEFAULT,
+            max_page_bytes: PAGE_DEFAULT,
+            max_buffer_bytes: BUFFER_DEFAULT,
             max_read_bytes: 64 << 20,
             max_retained_entry_bytes: 1 << 30,
             max_entries: 0,
             block_target: BLOCK_TARGET,
             extension_pages: BTreeMap::new(),
-            allow_disk: cfg!(feature = "disk"),
-            spool_budget: Arc::new(SpoolBudget::new(TOTAL_DEFAULT)),
-            create_spill_store: None,
         }
     }
 }
 
-/// Disk-spooled, unknown-count producer of a deterministic manifest sequence.
-/// Entries already in path order reuse their spool; arbitrary input is sorted at finish.
+/// In-memory producer of a deterministic manifest sequence.
+/// Entries already in path order reuse their buffer; arbitrary input is sorted at finish.
 pub struct ManifestEncoder<W: Write> {
     output: W,
     start: u64,
     position: u64,
     decoded: u64,
-    records: Spool,
+    records: MetadataBuffer,
     records_ordered: bool,
     previous_path: Option<String>,
-    count: u64,
     external: bool,
     level: i32,
     compressor: Option<zstd::bulk::Compressor<'static>>,
@@ -83,18 +81,20 @@ pub struct ManifestEncoder<W: Write> {
     options: ManifestOptions,
 }
 impl<W: Write> ManifestEncoder<W> {
-    pub fn new(output: W, data_end: u64, compression_level: i32, options: ManifestOptions) -> Self {
-        let mut spool_options = options.clone();
-        spool_options.max_encoded_bytes = options.max_decoded_bytes;
+    pub const fn new(
+        output: W,
+        data_end: u64,
+        compression_level: i32,
+        options: ManifestOptions,
+    ) -> Self {
         Self {
             output,
             start: data_end,
             position: data_end,
             decoded: 0,
-            records: Spool::new(spool_options),
+            records: MetadataBuffer::new(options.max_buffer_bytes),
             records_ordered: true,
             previous_path: None,
-            count: 0,
             external: false,
             level: compression_level,
             compressor: None,
@@ -103,20 +103,7 @@ impl<W: Write> ManifestEncoder<W> {
             options,
         }
     }
-    const fn validate_target(&self) -> Result<()> {
-        if self.options.block_target < 512 {
-            return Err(Error::Unsupported(
-                "metadata segment target must be at least 512 bytes",
-            ));
-        }
-        Ok(())
-    }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     pub fn add_entry(&mut self, entry: Entry) -> Result<()> {
-        self.validate_target()?;
         entry.validate(self.start)?;
         // Page map, entries array, entry tuple, and attributes map precede values.
         for value in entry.attributes.values() {
@@ -126,10 +113,6 @@ impl<W: Write> ManifestEncoder<W> {
         self.entry_buffer.clear();
         entry.append_encoded(&mut self.entry_buffer)?;
         self.records.append_encoded_record(&self.entry_buffer)?;
-        self.count = self
-            .count
-            .checked_add(1)
-            .ok_or_else(|| invalid("entry count overflow"))?;
         self.external |= entry.is_external();
         if self.records_ordered {
             self.records_ordered = self
@@ -148,24 +131,24 @@ impl<W: Write> ManifestEncoder<W> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        check_page_size(self.pending.len() as u64, self.options.max_page_bytes)?;
         crate::Limits::check(
             self.pending.len() as u64,
             self.options.limits.max_frame_decoded_bytes,
             "decoded metadata frame size",
+            crate::BudgetResource::DecodedFrameBytes,
         )?;
         self.decoded = self
             .decoded
             .checked_add(self.pending.len() as u64)
             .ok_or_else(|| invalid("decoded metadata overflow"))?;
-        if self.decoded > self.options.max_decoded_bytes {
-            return Err(Error::Budget("decoded manifest size"));
-        }
         if self.compressor.is_none() {
             let mut compressor = zstd::bulk::Compressor::new(self.level)?;
             compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
             self.compressor = Some(compressor);
         }
         let encoded = self.compressor.as_mut().unwrap().compress(&self.pending)?;
+        check_page_size(encoded.len() as u64, self.options.max_page_bytes)?;
         self.options.limits.frame(&encoded)?;
         if encoded.len() > u32::MAX as usize {
             return Err(invalid("metadata wrapper length"));
@@ -175,9 +158,6 @@ impl<W: Write> ManifestEncoder<W> {
             .position
             .checked_add(size)
             .ok_or_else(|| invalid("metadata offset overflow"))?;
-        if end - self.start > self.options.max_encoded_bytes {
-            return Err(Error::Budget("encoded manifest size"));
-        }
         self.output.write_all(&TOC_MAGIC.to_le_bytes())?;
         self.output
             .write_all(&(encoded.len() as u32).to_le_bytes())?;
@@ -187,10 +167,6 @@ impl<W: Write> ManifestEncoder<W> {
         Ok(())
     }
     #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    #[expect(
         clippy::too_many_lines,
         reason = "Keep the ordered validation or protocol operation together."
     )]
@@ -199,7 +175,6 @@ impl<W: Write> ManifestEncoder<W> {
         mut requires: Vec<String>,
         extensions: BTreeMap<String, Value>,
     ) -> Result<(W, Footer)> {
-        self.validate_target()?;
         for (group, values) in &self.options.extension_pages {
             if !group.starts_with("x-") || values.is_empty() {
                 return Err(invalid("extension page group"));
@@ -216,17 +191,17 @@ impl<W: Write> ManifestEncoder<W> {
         requires.dedup();
         let root = ManifestRoot {
             requires,
-            entry_count: self.count,
+            entry_count: 0,
             extensions,
         };
         root.validate()?;
-        let placeholder = Spool::new(self.records.options.clone());
+        let placeholder = MetadataBuffer::new(self.options.max_buffer_bytes);
         let records = std::mem::replace(&mut self.records, placeholder);
-        let mut records = if self.records_ordered {
+        let records = if self.records_ordered {
             // Keep the namespace validation below even when no sorting is needed.
             records
         } else {
-            sort_records(records, self.records.options.clone(), |v| {
+            sort_records(records, |v| {
                 let Value::Array(fields) = v else {
                     return Err(invalid("entry tuple"));
                 };
@@ -390,34 +365,29 @@ pub struct ManifestReader {
     entries: Vec<Entry>,
     extent_offsets: Vec<usize>,
     extent_ends: Vec<u64>,
-    spilled: bool,
     cursor_owner: Arc<()>,
 }
 /// Segments are validated as bytes before the sequence is parsed.
 pub struct ManifestIngest {
     footer: Footer,
     start: u64,
-    spool: Spool,
+    buffer: MetadataBuffer,
+    options: ManifestOptions,
     at: u64,
     end: u64,
     decoded: u64,
     pages: Vec<(u64, u64, u64)>,
 }
 impl ManifestIngest {
-    pub(crate) fn new(footer: Footer, source_size: u64, mut spool: Spool) -> Result<Self> {
+    pub(crate) fn new(footer: Footer, source_size: u64, options: ManifestOptions) -> Result<Self> {
         let range = footer.metadata_range(source_size)?;
-        if footer.toc_encoded_len > spool.options.max_encoded_bytes
-            || footer.toc_decoded_len > spool.options.max_decoded_bytes
-        {
-            return Err(Error::Budget("manifest size"));
-        }
-        spool.options.max_encoded_bytes = spool.options.max_decoded_bytes;
         Ok(Self {
             start: range.start,
             at: range.start,
             end: range.end,
             footer,
-            spool,
+            buffer: MetadataBuffer::new(options.max_buffer_bytes),
+            options,
             decoded: 0,
             pages: Vec::new(),
         })
@@ -445,10 +415,12 @@ impl ManifestIngest {
         if len == 0 || len > self.end - self.at - 8 {
             return Err(invalid("encoded metadata bounds"));
         }
+        check_page_size(len, self.options.max_page_bytes)?;
         crate::Limits::check(
             len,
-            self.spool.options.limits.max_frame_encoded_bytes,
+            self.options.limits.max_frame_encoded_bytes,
             "encoded metadata frame size",
+            crate::BudgetResource::EncodedFrameBytes,
         )?;
         Ok(len)
     }
@@ -460,19 +432,24 @@ impl ManifestIngest {
         if encoded.len() < 5 || encoded[4] & 4 == 0 {
             return Err(invalid("missing metadata checksum"));
         }
-        let limits = self.spool.options.limits;
-        let limit = limits.decoded_limit().min(
-            usize::try_from(
-                self.spool
-                    .options
-                    .max_decoded_bytes
-                    .saturating_sub(self.decoded),
-            )
-            .unwrap_or(usize::MAX),
-        );
+        let limits = self.options.limits;
+        let limit = limits
+            .decoded_limit()
+            .min(usize::try_from(self.options.max_page_bytes).unwrap_or(usize::MAX));
         let raw =
             crate::decode_bounded_with_limits(encoded, limit, limits).map_err(
                 |error| match error {
+                    Error::Budget(crate::BudgetError {
+                        resource: crate::BudgetResource::DecodedFrameBytes,
+                        ..
+                    }) if limits.max_frame_decoded_bytes == 0
+                        || self.options.max_page_bytes <= limits.max_frame_decoded_bytes =>
+                    {
+                        Error::budget(
+                            crate::BudgetResource::MetadataPageBytes,
+                            "decoded metadata page size",
+                        )
+                    }
                     crate::Error::Budget(_) | crate::Error::Integrity => error,
                     other => invalid(&other.to_string()),
                 },
@@ -484,53 +461,54 @@ impl ManifestIngest {
             .decoded
             .checked_add(raw.len() as u64)
             .ok_or_else(|| invalid("decoded manifest overflow"))?;
-        if self.decoded > self.spool.options.max_decoded_bytes {
-            return Err(Error::Budget("decoded manifest size"));
-        }
         if self.decoded > self.footer.toc_decoded_len {
             return Err(invalid("decoded manifest length"));
         }
         self.pages
             .push((self.at - self.start, 8 + len, raw.len() as u64));
-        self.spool.append(&raw)?;
+        self.buffer.append(&raw)?;
         self.at += 8 + len;
         Ok(())
     }
-    pub(crate) fn finish(mut self) -> Result<ManifestReader> {
+    pub(crate) fn finish(self) -> Result<ManifestReader> {
         if self.at != self.end || self.decoded != self.footer.toc_decoded_len {
             return Err(invalid("decoded manifest length"));
         }
-        let (root, entries) =
-            paged::decode_metadata(&mut self.spool, &self.pages, &self.footer, self.start)?;
-        ManifestReader::from_entries(root, entries, self.spool.spilled())
+        let (root, entries) = paged::decode_metadata(
+            &self.buffer,
+            &self.pages,
+            &self.footer,
+            self.start,
+            &self.options,
+        )?;
+        ManifestReader::from_entries(root, entries)
     }
 }
 impl ManifestReader {
-    pub(crate) fn from_entries(
-        root: ManifestRoot,
-        entries: Vec<Entry>,
-        spilled: bool,
-    ) -> Result<Self> {
+    pub(crate) fn from_entries(root: ManifestRoot, entries: Vec<Entry>) -> Result<Self> {
         let extent_count = entries.iter().try_fold(0_usize, |count, entry| {
             count
                 .checked_add(entry.extents.len())
-                .ok_or(Error::Budget("manifest range index"))
+                .ok_or(crate::Error::budget(
+                    crate::BudgetResource::IndexBytes,
+                    "manifest range index",
+                ))
         })?;
         let mut extent_offsets = Vec::new();
         if !entries.is_empty() {
             extent_offsets
-                .try_reserve_exact(
-                    entries
-                        .len()
-                        .checked_add(1)
-                        .ok_or(Error::Budget("manifest range index"))?,
-                )
-                .map_err(|_| Error::Budget("manifest range index"))?;
+                .try_reserve_exact(entries.len().checked_add(1).ok_or(crate::Error::budget(
+                    crate::BudgetResource::IndexBytes,
+                    "manifest range index",
+                ))?)
+                .map_err(|_| {
+                    crate::Error::budget(crate::BudgetResource::IndexBytes, "manifest range index")
+                })?;
         }
         let mut extent_ends = Vec::new();
-        extent_ends
-            .try_reserve_exact(extent_count)
-            .map_err(|_| Error::Budget("manifest range index"))?;
+        extent_ends.try_reserve_exact(extent_count).map_err(|_| {
+            crate::Error::budget(crate::BudgetResource::IndexBytes, "manifest range index")
+        })?;
         for entry in &entries {
             extent_offsets.push(extent_ends.len());
             let mut end = 0_u64;
@@ -547,7 +525,6 @@ impl ManifestReader {
             entries,
             extent_offsets,
             extent_ends,
-            spilled,
             cursor_owner: Arc::new(()),
         })
     }
@@ -559,30 +536,16 @@ impl ManifestReader {
         &self.root
     }
     /// Borrow immutable entries in path order using standard iterator adapters.
+    #[cfg(any(feature = "async", feature = "fs", test))]
     pub fn iter(&self) -> std::slice::Iter<'_, Entry> {
         self.entries.iter()
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     pub fn open<R: RangeReader>(
         source: &mut R,
         footer: &Footer,
         options: ManifestOptions,
     ) -> Result<Self> {
-        Self::open_with_spool(source, footer, Spool::new(options))
-    }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    pub fn open_with_spool<R: RangeReader>(
-        source: &mut R,
-        footer: &Footer,
-        spool: Spool,
-    ) -> Result<Self> {
-        let mut ingest = ManifestIngest::new(footer.clone(), source.len(), spool)?;
+        let mut ingest = ManifestIngest::new(footer.clone(), source.len(), options)?;
         while !ingest.complete() {
             let at = ingest.position();
             let header = source.read_range(ingest.header_range()?)?;
@@ -591,26 +554,6 @@ impl ManifestReader {
             ingest.push(&header, &encoded)?;
         }
         ingest.finish()
-    }
-    #[must_use]
-    pub const fn spilled(&self) -> bool {
-        self.spilled
-    }
-    /// Retained decoded entries, including owned paths, extents and attributes.
-    #[must_use]
-    pub fn retained_lookup_bytes(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<Entry>()
-            + self.entries.iter().map(entry_allocation).sum::<usize>()
-            + self.extent_offsets.capacity() * std::mem::size_of::<usize>()
-            + self.extent_ends.capacity() * std::mem::size_of::<u64>()
-    }
-    #[must_use]
-    pub fn cursor(&self) -> EntryCursor {
-        EntryCursor {
-            owner: self.cursor_owner.clone(),
-            item: 0,
-            end: self.entries.len(),
-        }
     }
     /// Creates a bounded cursor over paths beginning with `prefix` using the sorted index.
     #[must_use]
@@ -625,10 +568,6 @@ impl ManifestReader {
             end,
         }
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     pub fn next_entry(&self, cursor: &mut EntryCursor) -> Result<Option<Entry>> {
         if !Arc::ptr_eq(&self.cursor_owner, &cursor.owner) {
             return Err(Error::Unsupported("cursor belongs to another manifest"));
@@ -641,19 +580,8 @@ impl ManifestReader {
         }
         Ok(entry)
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    pub fn entry(&self, path: &str) -> Result<Option<Entry>> {
-        if !valid_path(path) {
-            return Ok(None);
-        }
-        Ok(self
-            .entries
-            .binary_search_by(|e| e.path.as_bytes().cmp(path.as_bytes()))
-            .ok()
-            .map(|i| self.entries[i].clone()))
+    pub fn entry(&self, path: &str) -> Option<Entry> {
+        self.range_entry(path).map(|(entry, _)| entry.clone())
     }
     pub(crate) fn range_entry(&self, path: &str) -> Option<(&Entry, &[u64])> {
         if !valid_path(path) {
@@ -670,51 +598,54 @@ impl ManifestReader {
     }
     #[cfg(feature = "async")]
     pub(crate) fn entry_cached(&self, path: &str) -> EntryLookup {
-        if !valid_path(path) {
-            return EntryLookup::Ready(None);
-        }
-        let selected = self
-            .entries
-            .binary_search_by(|e| e.path.as_bytes().cmp(path.as_bytes()))
-            .ok()
-            .map(|i| &self.entries[i]);
+        let selected = self.range_entry(path).map(|(entry, _)| entry);
         if selected.is_some_and(|e| !e.attributes.is_empty() || e.extents.len() > 64) {
             return EntryLookup::NeedsWorker;
         }
         EntryLookup::Ready(selected.cloned())
-    }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    pub fn visit_entries(&self, mut visitor: impl FnMut(Entry) -> Result<()>) -> Result<()> {
-        for entry in &self.entries {
-            visitor(entry.clone())?;
-        }
-        Ok(())
-    }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
-    pub fn collect_entries(&self) -> Result<Vec<Entry>> {
-        Ok(self.entries.clone())
-    }
-}
-
-impl<'a> IntoIterator for &'a ManifestReader {
-    type Item = &'a Entry;
-    type IntoIter = std::slice::Iter<'a, Entry>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::EntryKind;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::manifest::{EntryKind, entry_allocation};
+
+    #[test]
+    fn writer_limits_entry_extension_and_directory_pages() {
+        for kind in 0..3 {
+            let mut options = ManifestOptions {
+                block_target: 512,
+                max_page_bytes: 512,
+                ..Default::default()
+            };
+            let padding = Value::Bytes(vec![7; 1024]);
+            if kind == 1 {
+                options
+                    .extension_pages
+                    .insert("x-page".into(), vec![padding.clone()]);
+            }
+            let mut writer = ManifestEncoder::new(vec![0], 1, 3, options);
+            if kind == 0 {
+                let mut entry = Entry::file("file");
+                entry.attributes.insert("x-padding".into(), padding.clone());
+                writer.add_entry(entry).unwrap();
+            }
+            let extensions = if kind == 2 {
+                BTreeMap::from([("x-padding".into(), padding)])
+            } else {
+                BTreeMap::new()
+            };
+            assert!(matches!(
+                writer.finish(vec![], extensions),
+                Err(Error::Budget(crate::BudgetError {
+                    resource: crate::BudgetResource::MetadataPageBytes,
+                    limit: Some(512),
+                    ..
+                }))
+            ));
+        }
+    }
 
     #[test]
     fn entry_extensions_are_validated_at_page_depth() {
@@ -734,47 +665,14 @@ mod tests {
             }
             result.unwrap();
             let (bytes, footer) = writer.finish(vec![], BTreeMap::new()).unwrap();
-            let reader =
-                ManifestReader::open(&mut crate::SliceReader::new(&bytes), &footer, options)
-                    .unwrap();
-            assert_eq!(reader.collect_entries().unwrap(), vec![entry]);
+            let reader = ManifestReader::open(
+                &mut crate::blocking::MemorySource::new(&bytes),
+                &footer,
+                options,
+            )
+            .unwrap();
+            assert_eq!(reader.iter().as_slice(), &[entry]);
         }
-    }
-
-    #[test]
-    fn sorted_manifest_finishes_with_only_one_record_spool_budget() {
-        let entries: Vec<_> = (0..300)
-            .map(|i| Entry {
-                path: format!("f{i:04}"),
-                kind: EntryKind::File,
-                mode: 420,
-                uid: 0,
-                gid: 0,
-                mtime_ns: 0,
-                extents: vec![],
-                linkname: None,
-                attributes: BTreeMap::from([("x-padding".into(), Value::Bytes(vec![7; 512]))]),
-            })
-            .collect();
-        let retained: u64 = entries
-            .iter()
-            .map(|entry| crate::cbor::encode(&entry.to_value()).unwrap().len() as u64 + 4)
-            .sum();
-        let budget = Arc::new(SpoolBudget::new(retained));
-        let options = ManifestOptions {
-            spool_budget: budget.clone(),
-            ..Default::default()
-        };
-        let mut writer = ManifestEncoder::new(vec![0], 1, 3, options.clone());
-        for entry in &entries {
-            writer.add_entry(entry.clone()).unwrap();
-        }
-        assert_eq!(budget.used(), retained);
-        let (bytes, footer) = writer.finish(vec![], BTreeMap::new()).unwrap();
-        assert_eq!(budget.used(), 0);
-        let reader =
-            ManifestReader::open(&mut crate::SliceReader::new(&bytes), &footer, options).unwrap();
-        assert_eq!(reader.collect_entries().unwrap(), entries);
     }
 
     #[test]
@@ -793,16 +691,12 @@ mod tests {
             })
             .collect();
         let mut expected = None;
-        for memory_bytes in [64, MEMORY_DEFAULT] {
+        for max_buffer_bytes in [256 << 10, BUFFER_DEFAULT] {
             for order in 0..3 {
                 let options = ManifestOptions {
-                    memory_bytes,
-                    create_spill_store: Some(SpillFactory::new(|| {
-                        Ok(Box::new(Cursor::new(Vec::<u8>::new())))
-                    })),
+                    max_buffer_bytes,
                     ..Default::default()
                 };
-                let budget = options.spool_budget.clone();
                 let mut writer = ManifestEncoder::new(vec![0], 1, 3, options);
                 let mut input: Vec<_> = entries.iter().collect();
                 match order {
@@ -814,7 +708,6 @@ mod tests {
                     writer.add_entry(entry.clone()).unwrap();
                 }
                 let (bytes, _) = writer.finish(vec![], BTreeMap::new()).unwrap();
-                assert_eq!(budget.used(), 0);
                 if let Some(expected) = &expected {
                     assert_eq!(&bytes, expected);
                 } else {
@@ -920,158 +813,6 @@ mod tests {
             }
         }
     }
-
-    #[expect(
-        clippy::needless_collect,
-        reason = "Spawn all workers before joining; lazy iteration would deadlock the barrier."
-    )]
-    #[test]
-    fn concurrent_spools_cannot_overbook_shared_storage() {
-        let budget = Arc::new(SpoolBudget::new(4));
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        std::thread::scope(|threads| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    let options = ManifestOptions {
-                        spool_budget: budget.clone(),
-                        ..Default::default()
-                    };
-                    let barrier = barrier.clone();
-                    threads.spawn(move || {
-                        let mut spool = Spool::new(options);
-                        barrier.wait();
-                        let accepted = spool.append(b"x").is_ok();
-                        // Keep successful reservations live until all attempts finish.
-                        barrier.wait();
-                        (spool, accepted)
-                    })
-                })
-                .collect();
-            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            assert_eq!(results.iter().filter(|(_, accepted)| *accepted).count(), 4);
-            assert_eq!(budget.used(), 4);
-            drop(results);
-            assert_eq!(budget.used(), 0);
-        });
-    }
-    #[test]
-    fn record_quota_rejection_does_not_append_a_length_prefix() {
-        let budget = Arc::new(SpoolBudget::new(6));
-        let mut spool = Spool::new(ManifestOptions {
-            spool_budget: budget.clone(),
-            ..Default::default()
-        });
-        spool.append(b"a").unwrap();
-        assert!(matches!(
-            spool.append_encoded_record(b"bc"),
-            Err(Error::Budget(_))
-        ));
-        assert_eq!(spool.len(), 1);
-        assert_eq!(spool.read(0, 1).unwrap(), b"a");
-        assert_eq!(budget.used(), 1);
-        spool.append_encoded_record(b"b").unwrap();
-        assert_eq!(spool.read(1, 5).unwrap(), b"\x01\x00\x00\x00b");
-    }
-    #[test]
-    fn shared_spool_quota_precedes_store_io_and_is_released_on_drop() {
-        let opened = Arc::new(AtomicU64::new(0));
-        let calls = opened.clone();
-        let budget = Arc::new(SpoolBudget::new(5));
-        let options = ManifestOptions {
-            memory_bytes: 1,
-            allow_disk: false,
-            spool_budget: budget.clone(),
-            create_spill_store: Some(SpillFactory::new(move || {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
-            })),
-            ..Default::default()
-        };
-        let mut first = Spool::new(options.clone());
-        let mut second = Spool::new(options.clone());
-        first.append(b"abc").unwrap();
-        second.append(b"de").unwrap();
-        assert_eq!(budget.used(), 5);
-        assert_eq!(first.read(0, 3).unwrap(), b"abc");
-        assert!(first.spilled() && second.spilled());
-        let mut third = Spool::new(options);
-        assert!(matches!(third.append(b"f"), Err(Error::Budget(_))));
-        assert_eq!(opened.load(Ordering::Relaxed), 2);
-        assert!(!third.spilled());
-        drop(first);
-        assert_eq!(budget.used(), 2);
-        second.append(b"g").unwrap();
-        assert_eq!(second.read(0, 3).unwrap(), b"deg");
-        drop(second);
-        drop(third);
-        assert_eq!(budget.used(), 0);
-    }
-    #[test]
-    fn spill_creation_failure_preserves_existing_bytes_and_returns_reservation() {
-        let budget = Arc::new(SpoolBudget::new(8));
-        let mut spool = Spool::new(ManifestOptions {
-            memory_bytes: 1,
-            spool_budget: budget.clone(),
-            create_spill_store: Some(SpillFactory::new(|| {
-                Ok(Box::new(Cursor::new(b"nonempty".to_vec())))
-            })),
-            ..Default::default()
-        });
-        spool.append(b"a").unwrap();
-        assert!(matches!(spool.append(b"bc"), Err(Error::Unsupported(_))));
-        assert_eq!(spool.read(0, 1).unwrap(), b"a");
-        assert_eq!(budget.used(), 1);
-        spool.options.create_spill_store = Some(SpillFactory::new(|| panic!("factory panic")));
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| spool.append(b"bc"))).is_err()
-        );
-        assert_eq!(budget.used(), 1);
-        drop(spool);
-        assert_eq!(budget.used(), 0);
-    }
-    #[test]
-    fn partial_write_keeps_a_conservative_charge_until_store_drop() {
-        struct Partial(Cursor<Vec<u8>>);
-        impl Read for Partial {
-            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                self.0.read(out)
-            }
-        }
-        impl Seek for Partial {
-            fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
-                self.0.seek(at)
-            }
-        }
-        impl Write for Partial {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.0.get_ref().is_empty() {
-                    self.0.write(&bytes[..1])
-                } else {
-                    Err(std::io::Error::other("store failed after a partial write"))
-                }
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let budget = Arc::new(SpoolBudget::new(4));
-        let options = ManifestOptions {
-            spool_budget: budget.clone(),
-            ..Default::default()
-        };
-        let mut failed =
-            Spool::with_store(options.clone(), Box::new(Partial(Cursor::new(vec![])))).unwrap();
-        assert!(matches!(failed.append(b"abcd"), Err(Error::Io(_))));
-        assert_eq!(failed.len(), 0);
-        assert_eq!(budget.used(), 4);
-        let mut other = Spool::new(options);
-        assert!(matches!(other.append(b"e"), Err(Error::Budget(_))));
-        drop(failed);
-        other.append(b"e").unwrap();
-        assert_eq!(budget.used(), 1);
-        drop(other);
-        assert_eq!(budget.used(), 0);
-    }
     #[test]
     fn document_lookup_and_cursor_keep_validation_and_ownership() {
         let options = ManifestOptions {
@@ -1096,12 +837,12 @@ mod tests {
         }
         let (metadata, footer) = writer.finish(vec![], BTreeMap::new()).unwrap();
         let bytes = [vec![0; 1000], metadata].concat();
-        let mut source = crate::SliceReader::new(&bytes);
+        let mut source = crate::blocking::MemorySource::new(&bytes);
         let reader = ManifestReader::open(&mut source, &footer, options.clone()).unwrap();
-        let mut entry = reader.entry("f0020").unwrap().unwrap();
+        let mut entry = reader.entry("f0020").unwrap();
         entry.mode = 0;
-        assert_eq!(reader.entry("f0020").unwrap().unwrap().mode, 420);
-        let mut cursor = reader.cursor();
+        assert_eq!(reader.entry("f0020").unwrap().mode, 420);
+        let mut cursor = reader.cursor_prefix("");
         let mut count = 0;
         while let Some(entry) = reader.next_entry(&mut cursor).unwrap() {
             assert_eq!(entry.path, format!("f{count:04}"));
@@ -1144,111 +885,15 @@ mod tests {
             + reader.extent_offsets.capacity() * std::mem::size_of::<usize>()
             + reader.extent_ends.capacity() * std::mem::size_of::<u64>())
             as u64;
-        let compact = ManifestReader::open(&mut source, &footer, limited.clone()).unwrap();
-        assert!(compact.retained_lookup_bytes() as u64 <= limited.max_retained_entry_bytes);
+        let compact = ManifestReader::open(&mut source, &footer, limited).unwrap();
+        assert_eq!(compact.entries.capacity(), 100);
 
         let other = ManifestReader::open(&mut source, &footer, options).unwrap();
         assert!(other.next_entry(&mut cursor).is_err());
     }
     #[test]
-    fn external_sort_releases_all_stores_on_success_and_late_namespace_failure() {
-        struct Tracked(Cursor<Vec<u8>>, Arc<AtomicU64>);
-        impl Read for Tracked {
-            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-                self.0.read(b)
-            }
-        }
-        impl Write for Tracked {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.write(b)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl Seek for Tracked {
-            fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-                self.0.seek(p)
-            }
-        }
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                self.1.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        for bad in ["", "duplicate", "ancestor", "quota"] {
-            let live = Arc::new(AtomicU64::new(0));
-            let calls = live.clone();
-            let options = ManifestOptions {
-                memory_bytes: 1,
-                spool_budget: Arc::new(SpoolBudget::new(if bad == "quota" {
-                    400_000
-                } else {
-                    8 << 20
-                })),
-                create_spill_store: Some(SpillFactory::new(move || {
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(Box::new(Tracked(Cursor::new(Vec::new()), calls.clone())))
-                })),
-                ..Default::default()
-            };
-            let budget = options.spool_budget.clone();
-            let mut writer = ManifestEncoder::new(Vec::new(), 1, 3, options);
-            for i in (0..300).rev() {
-                writer
-                    .add_entry(Entry {
-                        path: format!("f{i:04}"),
-                        kind: EntryKind::File,
-                        mode: 420,
-                        uid: 0,
-                        gid: 0,
-                        mtime_ns: 0,
-                        extents: vec![],
-                        linkname: None,
-                        attributes: BTreeMap::from([(
-                            "x-padding".into(),
-                            Value::Bytes(vec![0; 1024]),
-                        )]),
-                    })
-                    .unwrap();
-            }
-            if bad == "duplicate" || bad == "ancestor" {
-                writer
-                    .add_entry(Entry {
-                        path: if bad == "duplicate" {
-                            "f0000"
-                        } else {
-                            "missing/child"
-                        }
-                        .into(),
-                        kind: EntryKind::File,
-                        mode: 420,
-                        uid: 0,
-                        gid: 0,
-                        mtime_ns: 0,
-                        extents: vec![],
-                        linkname: None,
-                        attributes: BTreeMap::new(),
-                    })
-                    .unwrap();
-            }
-            assert_eq!(
-                writer.finish(vec![], BTreeMap::new()).is_ok(),
-                bad.is_empty()
-            );
-            assert_eq!(live.load(Ordering::Relaxed), 0);
-            assert_eq!(budget.used(), 0);
-        }
-    }
-    #[test]
-    fn document_checksum_spill_and_lookup() {
-        let options = ManifestOptions {
-            memory_bytes: 64,
-            create_spill_store: Some(SpillFactory::new(|| {
-                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
-            })),
-            ..Default::default()
-        };
+    fn document_checksum_and_lookup() {
+        let options = ManifestOptions::default();
         let mut writer = ManifestEncoder::new(Vec::new(), 1000, 3, options.clone());
         for i in (0..300).rev() {
             writer
@@ -1271,33 +916,23 @@ mod tests {
         let (metadata, footer) = writer.finish(vec![], BTreeMap::default()).unwrap();
         let mut archive = vec![0; 1000];
         archive.extend(&metadata);
-        let mut source = crate::SliceReader::new(&archive);
+        let mut source = crate::blocking::MemorySource::new(&archive);
         let reader = ManifestReader::open(&mut source, &footer, options).unwrap();
-        assert!(reader.spilled());
-        assert_eq!(
-            reader.entry("file-0299").unwrap().unwrap().path,
-            "file-0299"
-        );
-        assert!(reader.entry("file-0300").unwrap().is_none());
-        assert_eq!(reader.collect_entries().unwrap().len(), 300);
+        assert_eq!(reader.entry("file-0299").unwrap().path, "file-0299");
+        assert!(reader.entry("file-0300").is_none());
+        assert_eq!(reader.iter().len(), 300);
         let mut corrupted = archive;
         let checksum = corrupted.len() - crate::FOOTER_SIZE - 1;
         corrupted[checksum] ^= 1;
-        let mut source = crate::SliceReader::new(&corrupted);
+        let mut source = crate::blocking::MemorySource::new(&corrupted);
         assert!(matches!(
             ManifestReader::open(&mut source, &footer, ManifestOptions::default()),
             Err(Error::Integrity)
         ));
     }
     #[test]
-    fn spooled_document_spans_many_segments() {
-        let options = ManifestOptions {
-            memory_bytes: 1 << 20,
-            create_spill_store: Some(SpillFactory::new(|| {
-                Ok(Box::new(Cursor::new(Vec::<u8>::new())))
-            })),
-            ..Default::default()
-        };
+    fn buffered_document_spans_many_segments() {
+        let options = ManifestOptions::default();
         let mut writer = ManifestEncoder::new(Vec::new(), 1, 3, options.clone());
         for i in 0..3 {
             writer
@@ -1321,19 +956,19 @@ mod tests {
         assert!(footer.toc_decoded_len > options.block_target as u64);
         let mut archive = vec![0];
         archive.extend(metadata);
-        let mut source = crate::SliceReader::new(&archive);
+        let mut source = crate::blocking::MemorySource::new(&archive);
         let reader = ManifestReader::open(&mut source, &footer, options).unwrap();
         assert_eq!(reader.root.entry_count, 3);
         assert_eq!(
-            reader.entry("file-2").unwrap().unwrap().attributes["x-bytes"],
+            reader.entry("file-2").unwrap().attributes["x-bytes"],
             Value::Bytes(vec![2; 6 << 20])
         );
     }
     #[test]
-    fn header_item_can_exceed_segment_maximum() {
+    fn directory_can_exceed_page_target_within_page_limit() {
         let options = ManifestOptions {
-            memory_bytes: 32 << 20,
-            allow_disk: false,
+            max_page_bytes: 32 << 20,
+            max_buffer_bytes: 32 << 20,
             ..Default::default()
         };
         let extensions =
@@ -1341,7 +976,7 @@ mod tests {
         let (bytes, footer) = ManifestEncoder::new(vec![0], 1, 3, options.clone())
             .finish(vec![], extensions.clone())
             .unwrap();
-        let mut source = crate::SliceReader::new(&bytes);
+        let mut source = crate::blocking::MemorySource::new(&bytes);
         let reader = ManifestReader::open(&mut source, &footer, options).unwrap();
         assert_eq!(reader.root.extensions, extensions);
         assert_eq!(reader.root.entry_count, 0);
@@ -1353,14 +988,13 @@ mod tests {
             .unwrap();
         let mut archive = vec![0];
         archive.extend(metadata);
-        let mut source = crate::SliceReader::new(&archive);
+        let mut source = crate::blocking::MemorySource::new(&archive);
         let reader =
             ManifestReader::open(&mut source, &footer, ManifestOptions::default()).unwrap();
-        assert!(reader.entry("anything").unwrap().is_none());
-        assert_eq!(reader.collect_entries().unwrap(), Vec::<Entry>::new());
+        assert!(reader.entry("anything").is_none());
+        assert_eq!(reader.iter().len(), 0);
         let options = ManifestOptions {
-            memory_bytes: 1,
-            allow_disk: false,
+            max_buffer_bytes: 1,
             ..Default::default()
         };
         assert!(matches!(

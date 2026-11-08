@@ -6,10 +6,22 @@ use std::{
     path::Path,
     process::{Command, Output},
 };
-use zstar::backend::SliceReader;
-use zstar::backend::manifest::{Entry, EntryKind};
-use zstar::backend::{BlockingArchive, BlockingBuilder};
+use zstar::blocking::{Archive as BlockingArchive, Builder as BlockingBuilder};
+use zstar::{EntryKind, layout::Entry};
 
+fn header(entry: Entry, size: u64) -> zstar::Header {
+    let mut header = match entry.kind {
+        EntryKind::File => zstar::Header::file(entry.path, size),
+        EntryKind::Directory => zstar::Header::directory(entry.path),
+        EntryKind::Symlink => zstar::Header::symlink(entry.path, entry.linkname.unwrap()),
+    };
+    header.set_mode(entry.mode);
+    header.set_uid(entry.uid);
+    header.set_gid(entry.gid);
+    header.set_mtime_ns(entry.mtime_ns);
+    header.set_attributes(entry.attributes);
+    header
+}
 fn entry(path: &str, kind: EntryKind, mode: u64) -> Entry {
     Entry {
         path: path.into(),
@@ -44,12 +56,12 @@ impl FixtureArchive {
         self.0.insert(path.into(), (metadata, vec![]));
     }
     fn finish(self) -> zstar::Result<Vec<u8>> {
-        let mut writer = BlockingBuilder::new(Vec::new())?;
+        let mut writer = BlockingBuilder::try_new(Vec::new())?;
         for (_, (entry, bytes)) in self.0 {
             if entry.kind == EntryKind::File {
-                writer.add_file(entry, bytes.len() as u64, &mut bytes.as_slice())?;
+                writer.append_data(header(entry, bytes.len() as u64), bytes.as_slice())?;
             } else {
-                writer.add_metadata(entry)?;
+                writer.append_header(header(entry, 0))?;
             }
         }
         writer.finish()
@@ -350,22 +362,18 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
         String::from_utf8_lossy(&result.stderr)
     );
     let bytes = fs::read(output).unwrap();
-    let mut archive = BlockingArchive::open(
-        SliceReader::new(&bytes),
-        zstar::backend::ManifestOptions::default(),
-    )
-    .unwrap();
+    let mut archive = BlockingArchive::from_bytes(&bytes).unwrap();
 
     let link = archive.entry("link").unwrap().unwrap();
-    assert_eq!(link.linkname.as_deref(), Some("/missing/.././target"));
-    assert_eq!(link.uid, u64::from(link_meta.uid()));
-    assert_eq!(link.gid, u64::from(link_meta.gid()));
+    assert_eq!(link.linkname(), Some("/missing/.././target"));
+    assert_eq!(link.uid(), u64::from(link_meta.uid()));
+    assert_eq!(link.gid(), u64::from(link_meta.gid()));
     assert_eq!(
-        link.mtime_ns,
+        link.mtime_ns(),
         link_meta.mtime() * 1_000_000_000 + link_meta.mtime_nsec()
     );
     assert_eq!(
-        archive.read("back\\slash", 0, 17, None, true).unwrap(),
+        archive.read_range("back\\slash", 0..17).unwrap(),
         b"literal backslash"
     );
 }
@@ -378,7 +386,10 @@ fn pack_captures_link_metadata_and_preserves_unix_filename_identity() {
 fn metadata_inspection_accepts_large_sources_without_claiming_unread_tar_validity() {
     use std::io::{Seek, SeekFrom, Write};
     let temp = tempfile::tempdir().unwrap();
-    let bytes = BlockingBuilder::new(Vec::new()).unwrap().finish().unwrap();
+    let bytes = BlockingBuilder::try_new(Vec::new())
+        .unwrap()
+        .finish()
+        .unwrap();
     let footer =
         zstar::backend::parse_footer(&bytes[bytes.len() - zstar::backend::FOOTER_SIZE..]).unwrap();
     let old_start = footer.metadata_range(bytes.len() as u64).unwrap().start;
@@ -408,21 +419,28 @@ fn capture_controls_and_destination_handle_limits_are_local_policies() {
     fs::write(input.join("a/file"), [7; 5000]).unwrap();
     fs::write(input.join("a-b"), b"sibling sorts before slash").unwrap();
     let archive = root.path().join("archive.zstar");
-    let packed = run(&[
-        Path::new("pack"),
-        &input,
-        &archive,
-        Path::new("--metadata-memory-bytes"),
-        Path::new("1"),
-        Path::new("--metadata-block-size"),
-        Path::new("512"),
-        Path::new("--frame-size"),
-        Path::new("2048"),
-        Path::new("--compression-level"),
-        Path::new("1"),
-        Path::new("--workers"),
-        Path::new("1"),
-    ]);
+    let pack = |memory: &str| {
+        run(&[
+            Path::new("pack"),
+            &input,
+            &archive,
+            Path::new("--metadata-memory-bytes"),
+            Path::new(memory),
+            Path::new("--metadata-block-size"),
+            Path::new("512"),
+            Path::new("--frame-size"),
+            Path::new("2048"),
+            Path::new("--compression-level"),
+            Path::new("1"),
+            Path::new("--workers"),
+            Path::new("1"),
+        ])
+    };
+    let rejected = pack("1");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("MetadataBufferBytes"));
+    assert!(!archive.exists());
+    let packed = pack("4096");
     assert!(
         packed.status.success(),
         "{}",

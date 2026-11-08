@@ -34,7 +34,10 @@ class MemorySource:
         self.calls = 0
         self.closed = False
 
-    def read_range(self, offset, length):
+    def size(self):
+        return len(self.data)
+
+    def read_at(self, offset, length):
         self.calls += 1
         return self.data[offset : offset + length]
 

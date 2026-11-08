@@ -1,5 +1,5 @@
 //! Internal wire-format and codec helpers.
-use crate::{Error, Result, decode_frame_into};
+use crate::{Error, Result};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::ops::Range;
 
@@ -7,8 +7,15 @@ pub const FOOTER_SIZE: usize = 44;
 pub const FOOTER_MAGIC: u32 = 0x184D_2A5F;
 pub const TOC_MAGIC: u32 = 0x184D_2A5E;
 
+/// Exact half-open ranges from one immutable archive snapshot.
+///
+/// Implementations own their mutable I/O position and need not be `Send` or
+/// `Sync`. Return errors for reversed/out-of-bounds ranges and short reads.
+/// Contents and length must remain unchanged for the lifetime of the archive.
 pub trait RangeReader {
+    /// Returns the recorded immutable archive length.
     fn len(&self) -> u64;
+    /// Whether the immutable archive is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -16,6 +23,7 @@ pub trait RangeReader {
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
+    /// Returns exactly the requested byte range or an error.
     fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>>;
 }
 
@@ -34,10 +42,6 @@ impl Digest {
     }
 }
 
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
 /// Verify a complete byte sequence against a SHA-256 digest.
 pub fn verify_sha256(bytes: &[u8], expected: [u8; 32]) -> Result<()> {
     if Digest::sha256(bytes).0 == expected {
@@ -151,44 +155,6 @@ pub fn encode_frame(data: &[u8], level: i32) -> Result<Vec<u8>> {
     let mut encoder = zstd::bulk::Compressor::new(level)?;
     encoder.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
     encoder.compress(data).map_err(Error::Io)
-}
-
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-pub fn decode_frame(encoded: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    let mut decoded = Vec::new();
-    let mut context = zstd::zstd_safe::DCtx::create();
-    decode_frame_into(encoded, expected_size, &mut decoded, &mut context)?;
-    Ok(decoded)
-}
-
-pub struct SliceReader<'a> {
-    bytes: &'a [u8],
-}
-impl<'a> SliceReader<'a> {
-    #[must_use]
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-}
-impl RangeReader for SliceReader<'_> {
-    fn len(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-    )]
-    fn read_range(&mut self, range: Range<u64>) -> Result<Vec<u8>> {
-        checked_range(
-            range.start,
-            range.end.checked_sub(range.start).ok_or(Error::Range)?,
-            self.len(),
-        )?;
-        Ok(self.bytes[range.start as usize..range.end as usize].to_vec())
-    }
 }
 
 #[cfg(test)]

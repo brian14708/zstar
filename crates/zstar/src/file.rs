@@ -1,6 +1,6 @@
 //! Owned logical file handles over an immutable, shared archive.
-use crate::archive::Key;
-use crate::{Archive, AsyncRangeReader, Entry, EntryKind, Error, Result};
+use crate::read_plan::{Key, Selection};
+use crate::{Archive, AsyncRangeReader, Entry, EntryMetadata, Error, Result};
 use bytes::Bytes;
 use std::future::Future;
 use std::io::{self, SeekFrom};
@@ -17,9 +17,7 @@ type Load = Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>;
 // Immutable entry metadata and extent interpretation shared by both handles.
 // Logical stream position and pending I/O remain with File.
 struct FileSelection {
-    entry: Entry,
-    ends: Vec<u64>,
-    size: u64,
+    selected: Selection,
     cache: Arc<DecodedCache>,
 }
 struct CachedSource {
@@ -52,26 +50,10 @@ impl DecodedCache {
 }
 impl FileSelection {
     fn new(entry: Entry) -> Result<Self> {
-        entry.validate(u64::MAX)?;
-        let size = entry.size()?;
-        let mut ends = Vec::new();
-        ends.try_reserve_exact(entry.extents.len())
-            .map_err(|_| Error::Budget("file cursor index"))?;
-        let mut position = 0_u64;
-        for extent in &entry.extents {
-            position = position.checked_add(extent.size).ok_or(Error::Range)?;
-            ends.push(position);
-        }
         Ok(Self {
-            entry,
-            ends,
-            size,
+            selected: Selection::new(entry)?,
             cache: Arc::new(DecodedCache::default()),
         })
-    }
-
-    fn extent_index(&self, offset: u64) -> usize {
-        self.ends.partition_point(|end| *end <= offset)
     }
 
     #[expect(
@@ -87,24 +69,34 @@ impl FileSelection {
         // Prepare synchronously so the pending future owns only its selected
         // extent or read plan, without cloning the handle's complete metadata.
         let prepared = (|| -> Result<Load> {
-            crate::checked_range(offset, length, self.size)?;
+            crate::checked_range(offset, length, self.selected.size)?;
             if length > archive.max_read_bytes() {
-                return Err(Error::Budget("returned read size"));
+                return Err(crate::Error::budget_exceeded(
+                    crate::BudgetResource::ReadBytes,
+                    "returned read size",
+                    archive.max_read_bytes(),
+                    length,
+                ));
             }
-            let length =
-                usize::try_from(length).map_err(|_| Error::Budget("returned read size"))?;
+            let length = usize::try_from(length).map_err(|_| {
+                crate::Error::budget(crate::BudgetResource::ReadBytes, "returned read size")
+            })?;
             if length == 0 {
                 return Ok(Box::pin(std::future::ready(Ok(Bytes::new()))));
             }
-            let index = self.extent_index(offset);
-            let first = &self.entry.extents[index];
-            let start = if index == 0 { 0 } else { self.ends[index - 1] };
+            let index = self.selected.extent_index(offset);
+            let first = &self.selected.entry.extents[index];
+            let start = if index == 0 {
+                0
+            } else {
+                self.selected.ends[index - 1]
+            };
             let within = offset - start;
             if length as u64 > first.size - within {
                 // Plan from retained metadata, preserving bounded batch execution.
                 return Ok(Box::pin(archive.read_entry_range(
-                    &self.entry,
-                    &self.ends,
+                    &self.selected.entry,
+                    &self.selected.ends,
                     offset,
                     length as u64,
                     self.cache.clone(),
@@ -118,14 +110,12 @@ impl FileSelection {
                 let raw = if let Some(raw) = cache.get(&key) {
                     raw
                 } else {
-                    let raw = archive
+                    archive
                         .content(&key, extent.encoded_size, archive.resolver())
-                        .await?;
-                    crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
-                    cache.retain(key, &raw);
-                    raw
+                        .await?
                 };
                 crate::checked_range(extent.offset, extent.size, raw.len() as u64)?;
+                cache.retain(key, &raw);
                 let start = (extent.offset + within) as usize;
                 let selected = raw.slice(start..start + length);
                 Ok(if length < raw.len() / 4 {
@@ -139,27 +129,24 @@ impl FileSelection {
     }
 }
 
-/// Authenticated random-access member selection created by [`Archive::open_cursor`].
+/// Validated random-access member selection created by [`crate::backend::open_cursor`].
 ///
 /// The caller supplies the live archive for each operation. Positional reads
 /// borrow the cursor immutably and can run concurrently. Each cursor privately
 /// retains one decoded source within a 2 MiB budget; dropping it releases the cache.
 /// Separate handles do not share completed decoded caches.
 pub struct FileCursor {
-    owner: Weak<crate::ManifestReader>,
+    owner: Weak<crate::ManifestDirectory>,
     selection: FileSelection,
 }
 impl FileCursor {
     /// Returns the logical payload length in bytes.
     #[must_use]
     pub const fn size(&self) -> u64 {
-        self.selection.size
+        self.selection.selected.size
     }
 
-    pub(crate) fn new(entry: Entry, owner: Weak<crate::ManifestReader>) -> Result<Self> {
-        if entry.kind != EntryKind::File {
-            return Err(Error::Unsupported("entry is not a file"));
-        }
+    pub(crate) fn new(entry: Entry, owner: Weak<crate::ManifestDirectory>) -> Result<Self> {
         Ok(Self {
             owner,
             selection: FileSelection::new(entry)?,
@@ -185,25 +172,27 @@ impl FileCursor {
     }
 }
 
-/// An owned archive entry with metadata and async file I/O.
+/// An owned regular-file handle with metadata and async file I/O.
 ///
-/// Regular files implement [`AsyncRead`] and [`AsyncSeek`]. Directory and
-/// symlink handles expose metadata and reject reads. Seeking beyond EOF is
+/// Implements [`AsyncRead`] and [`AsyncSeek`]. Seeking beyond EOF is
 /// permitted; negative and overflowing positions return an invalid-input error.
 ///
 /// The handle retains its archive and pending read state. Dropping it cancels
 /// pending source I/O. One decoded source is retained within a 2 MiB cache budget.
 pub struct File<R: AsyncRangeReader + ?Sized> {
     archive: Archive<R>,
+    metadata: EntryMetadata,
     selection: FileSelection,
     position: u64,
     pending: Option<(u64, Load)>,
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     pub(crate) fn new(archive: Archive<R>, entry: Entry) -> Result<Self> {
+        let metadata = EntryMetadata::from_entry(&entry)?;
         let selection = FileSelection::new(entry)?;
         Ok(Self {
             archive,
+            metadata,
             selection,
             position: 0,
             pending: None,
@@ -212,17 +201,33 @@ impl<R: AsyncRangeReader + ?Sized + 'static> File<R> {
     /// Returns the archive-relative path.
     #[must_use]
     pub fn path(&self) -> &str {
-        &self.selection.entry.path
+        &self.selection.selected.entry.path
     }
     /// Returns the logical payload length in bytes.
     #[must_use]
     pub const fn size(&self) -> u64 {
-        self.selection.size
+        self.selection.selected.size
     }
-    /// Borrows the entry's immutable metadata and extents.
+    /// Borrows the entry's immutable logical metadata.
     #[must_use]
-    pub const fn metadata(&self) -> &Entry {
-        &self.selection.entry
+    pub const fn metadata(&self) -> &EntryMetadata {
+        &self.metadata
+    }
+    /// Reads an exact range without changing the stream position.
+    ///
+    /// Concurrent positional reads share this handle's bounded decoded cache.
+    /// Cancellation leaves the stream position unchanged.
+    ///
+    /// # Errors
+    /// Returns range, budget, source, or content-validation errors.
+    pub fn read_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> impl Future<Output = Result<Bytes>> + Send + 'static + use<R> {
+        match range.end.checked_sub(range.start) {
+            Some(length) => self.selection.read(&self.archive, range.start, length),
+            None => Box::pin(std::future::ready(Err(Error::Range))),
+        }
     }
 }
 impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
@@ -236,18 +241,13 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncRead for File<R> {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.selection.entry.kind != EntryKind::File {
-            return Poll::Ready(Err(io::Error::from(Error::Unsupported(
-                "entry is not a file",
-            ))));
-        }
-        if buffer.remaining() == 0 || this.position >= this.selection.size {
+        if buffer.remaining() == 0 || this.position >= this.selection.selected.size {
             return Poll::Ready(Ok(()));
         }
         if this.pending.is_none() {
             let start = this.position;
-            let index = this.selection.extent_index(start);
-            let end = this.selection.ends[index];
+            let index = this.selection.selected.extent_index(start);
+            let end = this.selection.selected.ends[index];
             let length = (end - start)
                 .min(this.archive.max_read_bytes())
                 .min(buffer.remaining() as u64);
@@ -277,7 +277,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> AsyncSeek for File<R> {
         let this = self.get_mut();
         let position = match seek {
             SeekFrom::Start(position) => i128::from(position),
-            SeekFrom::End(offset) => i128::from(this.selection.size) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(this.selection.selected.size) + i128::from(offset),
             SeekFrom::Current(offset) => i128::from(this.position) + i128::from(offset),
         };
         this.position = u64::try_from(position).map_err(|_| {
@@ -317,6 +317,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursors_keep_archive_identity_across_clones_and_full_scans() {
+        let mut builder = Builder::try_new(Vec::new()).await.unwrap();
+        builder.append_bytes("file", b"hello").await.unwrap();
+        let source = Arc::new(Bytes::from(builder.finish().await.unwrap()));
+        let archive = Archive::open(source.clone()).await.unwrap();
+        let cursor = archive.open_cursor("file").await.unwrap();
+        let clone = archive.clone();
+        clone.validate_all_metadata().await.unwrap();
+        drop(archive);
+        assert_eq!(cursor.read(&clone, 1, 3).await.unwrap(), b"ell"[..]);
+
+        let other = Archive::open(source).await.unwrap();
+        assert!(matches!(
+            cursor.read(&other, 0, 1).await,
+            Err(Error::Unsupported("cursor belongs to another archive"))
+        ));
+        drop(clone);
+        assert!(cursor.owner.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn cross_extent_reads_reuse_handle_cache_and_validate_every_selection() {
         let mut builder = Builder::try_new(Vec::new()).await.unwrap();
         builder.append_bytes("file", b"abcdef").await.unwrap();
@@ -326,7 +347,7 @@ mod tests {
         });
         let archive = Archive::open(source.clone()).await.unwrap();
         let mut cursor = archive.open_cursor("file").await.unwrap();
-        let mut entry = cursor.selection.entry.clone();
+        let mut entry = cursor.selection.selected.entry.clone();
         assert_eq!(entry.extents.len(), 1);
         let mut second = entry.extents[0].clone();
         entry.extents[0].size = 3;
@@ -339,7 +360,7 @@ mod tests {
             assert_eq!(cursor.read(&archive, 2, 2).await.unwrap(), b"cd"[..]);
         }
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
-        cursor.selection.entry.extents[1].offset = u64::MAX;
+        cursor.selection.selected.entry.extents[1].offset = u64::MAX;
         assert!(matches!(
             cursor.read(&archive, 3, 1).await,
             Err(Error::Range)

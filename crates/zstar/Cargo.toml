@@ -5,17 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Async indexed tar archive reader and writer"
+description = "Blocking and async indexed tar archive readers and writers"
 readme = "README.md"
 keywords = ["tar", "zstd", "archive", "seekable", "async"]
 categories = ["compression", "filesystem", "asynchronous"]
 
 [features]
-default = ["async", "disk"]
-disk = ["dep:tempfile"]
-fs = ["async", "dep:cap-fs-ext", "dep:cap-std"]
+default = ["async"]
+fs = ["dep:cap-fs-ext", "dep:cap-std"]
 http = ["async", "dep:reqwest"]
-s3 = ["http", "dep:object_store"]
+s3 = ["http", "dep:object_store", "dep:quick-xml"]
 async = ["dep:tokio", "dep:async-trait", "dep:bytes", "dep:futures-util"]
 
 [dependencies]
@@ -27,11 +26,11 @@ ciborium.workspace = true
 fastcdc.workspace = true
 futures-util = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, features = ["aws"] }
+quick-xml = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 zstd.workspace = true
@@ -43,16 +42,20 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 
 [[example]]
+name = "blocking_file"
+required-features = ["fs"]
+
+[[example]]
 name = "in_memory"
 required-features = ["async"]
 
 [[example]]
 name = "local_range"
-required-features = ["fs"]
+required-features = ["fs", "async"]
 
 [[example]]
 name = "tutorial_file"
-required-features = ["fs"]
+required-features = ["fs", "async"]
 
 [[example]]
 name = "tutorial_s3"

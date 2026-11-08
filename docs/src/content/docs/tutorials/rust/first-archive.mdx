@@ -35,7 +35,7 @@ drop the returned file handle before reopening the archive.
 
 ## Read a file and a byte range
 
-Open the archive with `AsyncLocalFileSource`. `read()` returns the whole member;
+Open the archive with `Archive::open_path`. `read()` returns the whole member;
 `read_range()` uses a half-open range, so `0..5` returns `Hello`.
 
 <Example source={source} lang="rust" region="read" />

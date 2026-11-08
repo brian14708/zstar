@@ -1,6 +1,4 @@
 //! Write an archive to a file, read its contents.
-use std::sync::Arc;
-use zstar::fs::AsyncLocalFileSource;
 use zstar::{Archive, Builder};
 
 #[tokio::main]
@@ -16,8 +14,7 @@ async fn main() -> zstar::Result<()> {
     // endregion create
 
     // region read
-    let source = Arc::new(AsyncLocalFileSource::open("example.zstar").await?);
-    let archive = Archive::open(source).await?;
+    let archive = Archive::open_path("example.zstar").await?;
     let content = archive.read("example.txt").await?;
     let selected = archive.read_range("example.txt", 0..5).await?;
     assert_eq!(content.as_ref(), b"Hello from Zstar\n");

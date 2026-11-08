@@ -35,20 +35,20 @@ uv run tutorial_s3.py
 ```
 
 PEP 723 metadata declares the script's Python version and dependencies, which uv
-installs automatically. boto3 uploads and deletes the object; Zstar reads archive
-ranges directly.
+installs automatically. Zstar writes and reads the archive directly; boto3 deletes the object.
 
 ## Configure access
 
 The example reads environment variables and passes credentials explicitly to
-both clients. Zstar's native S3 reader does not discover environment credentials,
+both clients. Zstar's native S3 storage does not discover environment credentials,
 profiles, or instance roles on its own. `AWS_SESSION_TOKEN` is optional.
 
 <Example source={source} lang="python" region="configure" />
 
 ## Create and upload the archive
 
-Finalize the archive before uploading it to a unique key under `zstar-tutorial/`.
+Write to a unique key under `zstar-tutorial/`. Successful context exit finalizes
+the archive and publishes the upload; failure aborts it.
 
 <Example source={source} lang="python" region="upload" />
 

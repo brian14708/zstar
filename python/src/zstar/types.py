@@ -1,41 +1,7 @@
-"""Structural interfaces for custom storage and typed reader options."""
-
-from __future__ import annotations
+"""Structural contracts for borrowed storage objects and callback values."""
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from tarfile import TarInfo
-from typing import Literal, NamedTuple, NotRequired, TypeAlias, TypedDict
-
-from typing_extensions import Protocol, Reader, Writer
-
-__all__ = [
-    "AsyncBinaryWriter",
-    "AsyncObjectResolver",
-    "AsyncObjectWriter",
-    "AsyncRangeSource",
-    "AsyncReader",
-    "AsyncReaderOptions",
-    "BinaryWriter",
-    "EntryMetadata",
-    "ErrorCategory",
-    "ExtensionValue",
-    "FileInfo",
-    "FileSystemReaderOptions",
-    "Limits",
-    "ObjectResolver",
-    "ObjectWriter",
-    "ProgressCallback",
-    "RangeSource",
-    "ReadReport",
-    "ReadRequest",
-    "ReaderOptions",
-    "RequestProvider",
-    "SeekableReader",
-    "SignedRequest",
-    "SpillStore",
-    "WriterOptions",
-]
+from typing import Literal, NotRequired, Protocol, TypeAlias, TypedDict
 
 ErrorCategory: TypeAlias = Literal[
     "not-zstar",
@@ -56,146 +22,6 @@ ErrorCategory: TypeAlias = Literal[
     "resource-limit",
     "io",
 ]
-"""Stable archive and storage error categories reported by ZstarError.category."""
-
-
-class SeekableReader(Reader[bytes], Protocol):
-    """Borrowed binary input with a cursor; no write or close method required."""
-
-    def seek(self, offset: int, whence: int = 0, /) -> int: ...
-    def tell(self) -> int: ...
-
-
-class BinaryWriter(Writer[bytes], Protocol):
-    """Borrowed binary output; only write and flush are required."""
-
-    def flush(self) -> None: ...
-
-
-class RangeSource(Protocol):
-    """Borrowed immutable source; calls may run concurrently on worker threads.
-
-    Return exactly length bytes for a valid offset/length range, or raise an
-    exception. Do not share an unprotected seek cursor or reenter this archive.
-    The archive never closes the source. Blocking calls cannot be interrupted.
-    """
-
-    def read_range(self, offset: int, length: int, /) -> bytes: ...
-
-
-class ObjectResolver(Protocol):
-    """Borrowed, concurrently callable resolver of complete encoded objects.
-
-    address is sha256: followed by 64 lowercase hex digits. hint is advisory;
-    enforce max_bytes against actual bytes before unbounded buffering. Raise
-    FileNotFoundError for missing objects. Do not reenter the calling archive.
-    The archive decodes and applies its hash policy; it never closes the resolver.
-    """
-
-    def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
-
-
-class SpillStore(Reader[bytes], BinaryWriter, Protocol):
-    """Exclusive temporary binary store used by bounded metadata spools."""
-
-    def seek(self, offset: int, whence: int = 0, /) -> int: ...
-
-
-class ProgressCallback(Protocol):
-    """Progress reporting used by filesystem uploads and downloads."""
-
-    def set_size(self, size: int, /) -> None: ...
-    def relative_update(self, inc: int = 1, /) -> None: ...
-
-
-class SignedRequest(TypedDict):
-    """Signed HTTP URL, optional headers, and expiry returned by a request provider."""
-
-    url: str
-    headers: NotRequired[dict[str, str]]
-    expires_in: NotRequired[float]
-
-
-RequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], Awaitable[SignedRequest]]
-"""Async signer receiving an HTTP method and refresh flag, returning a signed request."""
-
-
-class Limits(TypedDict, total=False):
-    """Caller budgets; zero or omission disables each additional limit."""
-
-    max_frame_encoded_bytes: int
-    max_frame_decoded_bytes: int
-    max_window_bytes: int
-    max_entry_bytes: int
-    max_extents: int
-    max_pointer_bytes: int
-
-
-class WriterOptions(TypedDict, total=False):
-    """Typed archive-writer keyword options for compression, buffering, and storage limits."""
-
-    limits: Limits | None
-    workers: int
-    root_extensions: dict[str, ExtensionValue] | None
-    extension_pages: dict[str, list[ExtensionValue]] | None
-    frame_size: int
-    compression_level: int
-    memory_bytes: int
-    block_target: int
-    max_spool_bytes: int
-    create_spill_store: Callable[[], SpillStore] | None
-
-
-class _ReaderBudgets(TypedDict, total=False):
-    """Reader budgets and concurrency shared by raw and filesystem APIs."""
-
-    limits: Limits | None
-    memory_bytes: int
-    max_encoded_bytes: int
-    max_decoded_bytes: int
-    max_read_bytes: int
-    max_retained_entry_bytes: int
-    max_entries: int
-    max_spool_bytes: int
-    create_spill_store: Callable[[], SpillStore] | None
-
-    concurrent_chunks: int
-
-
-class FileSystemReaderOptions(_ReaderBudgets, total=False):
-    """Filesystem reader budgets; use external= and verify_external= for object policy."""
-
-
-class ReaderOptions(_ReaderBudgets, total=False):
-    """Synchronous reader budgets and borrowed synchronous resolver."""
-
-    verify_external: bool
-    resolver: ObjectResolver | None
-
-
-class AsyncReaderOptions(_ReaderBudgets, total=False):
-    """Async reader budgets with synchronous or coroutine-based resolution."""
-
-    verify_external: bool
-    resolver: ObjectResolver | AsyncObjectResolver | None
-
-
-class ReadReport(TypedDict):
-    """Content and validation checks performed while reading an archive member."""
-
-    metadata_validated: bool
-    data_frames_checked: list[int]
-    external_objects_sha256_checked: list[str]
-    external_objects_unchecked: list[str]
-
-
-class FileInfo(TypedDict):
-    """File metadata returned by the fsspec filesystem."""
-
-    name: str
-    size: int
-    type: Literal["file", "directory", "link"]
-
 
 ExtensionValue: TypeAlias = (
     bool
@@ -206,71 +32,101 @@ ExtensionValue: TypeAlias = (
     | tuple["ExtensionValue", ...]
     | dict[str, "ExtensionValue"]
 )
-"""Restricted metadata values: no floats, nulls, tags, or non-string map keys."""
+"""Restricted extension values: no floats, nulls, tags, or non-string map keys."""
 
 
-class ReadRequest(NamedTuple):
-    """One member request using offset and length, not an end position."""
+class RangeSource(Protocol):
+    """One immutable snapshot. Calls run serially on blocking workers.
 
-    path: str
-    offset: int
-    length: int
+    Opening queries size once. Return exactly length bytes from read_at, or
+    raise. The archive borrows this object and never closes it.
+    """
+
+    def size(self) -> int: ...
+    def read_at(self, offset: int, length: int, /) -> bytes: ...
 
 
 class AsyncRangeSource(Protocol):
-    """Borrowed async source; exact offset/length reads on the opening event loop.
+    """Snapshot source on the owning loop; independent range calls may overlap."""
 
-    The loop must stay running for the archive lifetime. Calls may overlap;
-    cancellation cancels pending coroutine work. Keep the source immutable.
-    """
-
-    async def read_range(self, offset: int, length: int, /) -> bytes: ...
+    def size(self) -> Awaitable[int]: ...
+    def read_at(self, offset: int, length: int, /) -> Awaitable[bytes]: ...
 
 
-class AsyncObjectResolver(Protocol):
-    """Async counterpart of ObjectResolver, using the opening event loop."""
+class Reader(Protocol):
+    """Borrowed body: return at most size bytes; empty bytes indicate EOF."""
 
-    async def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
+    def read(self, size: int, /) -> bytes: ...
 
 
 class AsyncReader(Protocol):
-    """Borrowed async body. Return at most size bytes; b'' indicates EOF."""
+    """Borrowed body returning awaitables on the owning loop."""
 
-    async def read(self, size: int, /) -> bytes: ...
+    def read(self, size: int, /) -> Awaitable[bytes]: ...
+
+
+class SeekableReader(Reader, Protocol):
+    """Borrowed binary file object; adapters preserve its cursor."""
+
+    def seek(self, offset: int, whence: int = 0, /) -> int: ...
+    def tell(self) -> int: ...
+
+
+class BinaryWriter(Protocol):
+    """Borrowed sink. Partial writes are valid; flush does not publish or close."""
+
+    def write(self, data: bytes, /) -> int: ...
+    def flush(self) -> None: ...
 
 
 class AsyncBinaryWriter(Protocol):
-    """Borrowed async sink. Writes return a byte count; flush does not close it."""
+    """Borrowed sink returning awaitables on the owning loop."""
 
-    async def write(self, data: bytes, /) -> int: ...
-    async def flush(self) -> None: ...
+    def write(self, data: bytes, /) -> Awaitable[int]: ...
+    def flush(self) -> Awaitable[None]: ...
 
 
-class ObjectWriter(Protocol):
-    """Store one complete encoded external object; return its stored byte length.
+class ObjectResolver(Protocol):
+    """Fetch complete encoded objects on serial blocking workers.
 
-    The SDK computes the address and compresses raw bytes. A deduplicating store
-    may retain another valid representation of the same raw bytes. Returned
-    lengths must be positive. Objects uploaded before a failure may remain;
-    publication/retention belongs to the caller. The SDK never closes this store.
+    Addresses are canonical sha256 strings. hint is advisory. Enforce max_bytes
+    during fetching, before unbounded buffering. Raise FileNotFoundError for
+    absent objects. The archive performs decoding and optional hash verification.
+    """
+
+    def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> bytes: ...
+
+
+class AsyncObjectResolver(Protocol):
+    """Object resolver on the owning loop, with the same bounded fetch contract."""
+
+    def get_encoded(self, address: str, hint: int, max_bytes: int, /) -> Awaitable[bytes]: ...
+
+
+class ObjectStore(Protocol):
+    """Store encoded content; return its positive stored length.
+
+    A deduplicating store may retain a different valid encoding. Objects already
+    uploaded when an operation fails remain subject to the caller's retention
+    policy. The writer never closes the store.
     """
 
     def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int: ...
 
 
-class AsyncObjectWriter(Protocol):
-    """Async counterpart of ObjectWriter, on the writer's event loop."""
+class AsyncObjectStore(Protocol):
+    """Store encoded content on the owning loop."""
 
-    async def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> int: ...
+    def put_encoded(self, address: str, encoded: bytes, raw_size: int, /) -> Awaitable[int]: ...
 
 
-@dataclass
-class EntryMetadata:
-    """Owned tar metadata plus Zstar entry extensions for lossless rewrites.
+class SignedRequest(TypedDict):
+    """Signed URL, optional headers, and validity duration in seconds."""
 
-    Pass info and extensions to writer.addfile(). Extent packing is regenerated;
-    root extensions are separate and passed when constructing the output writer.
-    """
+    url: str
+    headers: NotRequired[dict[str, str]]
+    expires_in: NotRequired[float]
 
-    info: TarInfo
-    extensions: dict[str, ExtensionValue]
+
+RequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], SignedRequest]
+AsyncRequestProvider: TypeAlias = Callable[[Literal["GET", "PUT"], bool], Awaitable[SignedRequest]]

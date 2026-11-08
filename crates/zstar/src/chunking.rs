@@ -78,7 +78,7 @@ impl Chunker {
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(strategy.max_size())
-            .map_err(|_| Error::Budget("chunk buffer"))?;
+            .map_err(|_| crate::Error::budget(crate::BudgetResource::ChunkBytes, "chunk buffer"))?;
         buffer.resize(strategy.max_size(), 0);
         let masks = match strategy {
             Chunking::Fixed { .. } => (0, 0),
@@ -219,9 +219,12 @@ pub async fn external_chunks(
         }
         total = total.checked_add(raw.len() as u64).ok_or(Error::Range)?;
         if total > size {
-            return Err(Error::Budget("external file size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::ExternalFileBytes,
+                "external file size",
+            ));
         }
-        let digest = *crate::Digest::sha256(&raw).as_bytes();
+        let digest = *crate::primitives::Digest::sha256(&raw).as_bytes();
         let length = raw.len() as u64;
         let extent = writer.put_chunk(raw).await?;
         if extent.size != length

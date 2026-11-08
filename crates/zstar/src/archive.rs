@@ -1,11 +1,11 @@
 //! Concurrent selective reads for the entry manifest, without a frame table.
-use crate::backend::{decode_content_with_limits, decode_object};
 use crate::decoded_body::DecodedBody;
-use crate::manifest::{Entry, EntryKind, Extent};
-use crate::manifest_io::{
-    EntryCursor, EntryLookup, ManifestIngest, ManifestOptions, ManifestReader, Spool,
+use crate::manifest::Entry;
+use crate::manifest_io::{EntryCursor, ManifestReader};
+use crate::read_plan::{Key, Plan, build_plan, record, validate_copy};
+use crate::{
+    AsyncRangeReader, EntryMetadata, Error, MAX_BATCH_REQUESTS, ReadReport, ReadRequest, Result,
 };
-use crate::{AsyncRangeReader, Error, MAX_BATCH_REQUESTS, ReadRequest, Result};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use std::collections::{BTreeMap, HashMap};
@@ -43,14 +43,60 @@ pub struct ReaderOptions {
     pub resolver: Option<Arc<dyn ObjectResolver>>,
 }
 impl ReaderOptions {
-    fn manifest_options(&self) -> ManifestOptions {
-        let mut options = ManifestOptions {
-            limits: self.limits,
-            max_read_bytes: self.max_read_bytes,
-            ..Default::default()
-        };
-        self.metadata.clone().apply(&mut options);
-        options
+    /// Finite resource policy with four concurrent chunks and an 8 MiB returned
+    /// buffer budget. Encoded/decoded frame and window limits are each 64 MiB.
+    /// Live file caches and caller-retained buffers have separate ownership.
+    #[must_use]
+    pub fn bounded() -> Self {
+        Self {
+            metadata: crate::MetadataReaderOptions::bounded(),
+            limits: crate::Limits::bounded(),
+            max_read_bytes: 8 << 20,
+            concurrent_chunks: 4,
+            ..Self::default()
+        }
+    }
+    /// Checks configuration without reading the source.
+    ///
+    /// # Errors
+    /// Returns an invalid-options error for zero read budgets, invalid concurrency,
+    /// or invalid metadata page limits.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=1024).contains(&self.concurrent_chunks) {
+            return Err(Error::InvalidOptions {
+                option: "concurrent_chunks",
+                reason: "must be between 1 and 1024",
+            });
+        }
+        if self.max_read_bytes == 0 {
+            return Err(Error::InvalidOptions {
+                option: "max_read_bytes",
+                reason: "must be positive",
+            });
+        }
+        self.metadata.validate()
+    }
+    crate::options::with_fields! { const
+        /// Sets metadata parsing and storage policy.
+        with_metadata(metadata: crate::MetadataReaderOptions);
+    }
+    crate::options::with_fields! { const
+        /// Sets per-frame and per-entry resource limits.
+        with_limits(limits: crate::Limits);
+        /// Sets the maximum returned bytes per allocating read or batch.
+        with_max_read_bytes(max_read_bytes: u64);
+        /// Enables SHA-256 verification of decoded external objects.
+        with_verify_external(verify_external: bool);
+    }
+    /// Sets the reader-wide external object resolver.
+    #[must_use]
+    pub fn with_resolver(mut self, value: Arc<dyn ObjectResolver>) -> Self {
+        self.resolver = Some(value);
+        self
+    }
+    crate::options::with_fields! { const
+        /// Sets concurrent content requests and decode jobs, from one through 1024.
+        with_concurrent_chunks(concurrent_chunks: usize);
     }
 }
 impl Default for ReaderOptions {
@@ -58,7 +104,7 @@ impl Default for ReaderOptions {
         Self {
             metadata: crate::MetadataReaderOptions::default(),
             limits: crate::Limits::default(),
-            max_read_bytes: 64 << 20,
+            max_read_bytes: crate::options::DEFAULT_MAX_READ_BYTES,
             concurrent_chunks: 8,
             verify_external: false,
             resolver: None,
@@ -75,32 +121,6 @@ impl std::fmt::Debug for ReaderOptions {
             .field("verify_external", &self.verify_external)
             .field("resolver", &self.resolver.as_ref().map(|_| "configured"))
             .finish()
-    }
-}
-/// Checks completed by a selective read; does not certify the whole archive.
-#[derive(Clone, Debug, Default)]
-pub struct ReadReport {
-    /// Whether directory, selected entry pages, and ancestor validation completed.
-    /// This does not claim validation of unrelated metadata pages.
-    pub metadata_validated: bool,
-    /// Encoded offsets of the data frames checked.
-    pub data_frames_checked: Vec<u64>,
-    /// Decoded object hashes checked against their addresses.
-    pub external_objects_sha256_checked: Vec<[u8; 32]>,
-    /// Object addresses read with external hash verification disabled.
-    pub external_objects_unchecked: Vec<[u8; 32]>,
-}
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Key {
-    Archive(u64, u64),
-    Object([u8; 32]),
-}
-impl Key {
-    pub(crate) const fn of(extent: &Extent) -> Self {
-        match extent.source {
-            crate::manifest::Source::Archive(at) => Self::Archive(at, extent.encoded_size),
-            crate::manifest::Source::Object(hash) => Self::Object(hash),
-        }
     }
 }
 struct Flight {
@@ -139,54 +159,6 @@ impl Drop for Cleanup<'_> {
         drop(flights);
     }
 }
-struct Copy {
-    output: usize,
-    selection: Range<u64>,
-    source: Range<usize>,
-    destination: Range<usize>,
-}
-struct Group {
-    hint: u64,
-    copies: Vec<Copy>,
-}
-struct Plan {
-    sizes: Vec<usize>,
-    groups: BTreeMap<Key, Group>,
-}
-
-struct MetadataSource<'a, R: AsyncRangeReader + ?Sized> {
-    source: &'a R,
-    end: u64,
-    start: u64,
-    buffer: Bytes,
-}
-impl<R: AsyncRangeReader + ?Sized> MetadataSource<'_, R> {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-    )]
-    async fn read(&mut self, range: Range<u64>) -> Result<Bytes> {
-        crate::checked_range(range.start, range.end - range.start, self.end)?;
-        if range.start >= self.start && range.end - self.start <= self.buffer.len() as u64 {
-            return Ok(self
-                .buffer
-                .slice((range.start - self.start) as usize..(range.end - self.start) as usize));
-        }
-        let length = (range.end - range.start)
-            .max(64 << 10)
-            .min(self.end - range.start);
-        self.buffer = self
-            .source
-            .read_range(range.start..range.start + length)
-            .await?;
-        if self.buffer.len() as u64 != length {
-            return Err(Error::MalformedToc("short metadata range".into()));
-        }
-        self.start = range.start;
-        Ok(self.buffer.slice(..(range.end - range.start) as usize))
-    }
-}
-
 /// An indexed archive backed by an immutable [`AsyncRangeReader`].
 ///
 /// Opening validates the metadata directory and loads entry pages on demand.
@@ -198,19 +170,18 @@ impl<R: AsyncRangeReader + ?Sized> MetadataSource<'_, R> {
 ///
 /// # Metadata integrity
 ///
-/// Authenticated metadata is immutable and cannot be replaced through the reader:
+/// Validated metadata is immutable and cannot be replaced through the reader:
 ///
 /// ```compile_fail
 /// use bytes::Bytes;
 /// use zstar::Archive;
 /// fn replace(mut archive: Archive<Bytes>, other: Archive<Bytes>) {
-///     archive.manifest = other.manifest;
+///     archive.paged = other.paged;
 /// }
 /// ```
 pub struct Archive<R: AsyncRangeReader + ?Sized> {
     source: Arc<R>,
-    manifest: Arc<ManifestReader>,
-    paged: Option<Arc<crate::paged_archive::PagedState<R>>>,
+    paged: Arc<crate::paged_archive::PagedState<R>>,
     options: ReaderOptions,
     semaphore: Arc<Semaphore>,
     metadata_semaphore: Arc<Semaphore>,
@@ -226,11 +197,34 @@ impl Archive<Bytes> {
         Self::open(Arc::new(bytes.into())).await
     }
 }
+#[cfg(feature = "fs")]
+impl Archive<crate::fs::AsyncLocalFileSource> {
+    /// Opens an immutable local archive path using positional filesystem reads.
+    ///
+    /// # Errors
+    /// Returns filesystem, format, validation, or resource-limit errors.
+    pub async fn open_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_path_with_options(path, ReaderOptions::default()).await
+    }
+    /// Opens an immutable local path with explicit reader policy.
+    ///
+    /// # Errors
+    /// Returns filesystem, format, validation, or resource-limit errors.
+    pub async fn open_path_with_options(
+        path: impl AsRef<std::path::Path>,
+        options: ReaderOptions,
+    ) -> Result<Self> {
+        Self::open_with_options(
+            Arc::new(crate::fs::AsyncLocalFileSource::open(path).await?),
+            options,
+        )
+        .await
+    }
+}
 impl<R: AsyncRangeReader + ?Sized> Clone for Archive<R> {
     fn clone(&self) -> Self {
         Self {
             source: self.source.clone(),
-            manifest: self.manifest.clone(),
             paged: self.paged.clone(),
             options: self.options.clone(),
             semaphore: self.semaphore.clone(),
@@ -256,7 +250,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// # Errors
     /// Returns errors from any metadata page or the complete namespace.
     pub async fn entry_count(&self) -> Result<u64> {
-        Ok(self.full_manifest().await?.root().entry_count)
+        Ok(self.paged.full_manifest().await?.root().entry_count)
     }
     /// Maximum bytes returned by a single allocating read operation.
     #[must_use]
@@ -266,7 +260,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// Returns the archive-level extension values.
     #[must_use]
     pub fn root_extensions(&self) -> &crate::Extensions {
-        &self.manifest.root().extensions
+        &self.paged.directory().root.extensions
     }
     #[expect(
         clippy::missing_errors_doc,
@@ -277,7 +271,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// Use [`Self::open_file`] to stream files larger than that budget.
     pub async fn read(&self, path: &str) -> Result<Bytes> {
         let entry = self
-            .entry(path)
+            .entry_layout(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
         self.read_range(path, 0..entry.size()?).await
@@ -301,7 +295,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// Reads an entire file and reports the integrity checks completed.
     pub async fn read_with_report(&self, path: &str) -> Result<(Bytes, ReadReport)> {
         let entry = self
-            .entry(path)
+            .entry_layout(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
         self.read_range_with_report(path, 0..entry.size()?).await
@@ -329,25 +323,18 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// Returns an error if the path is missing or identifies a directory or symlink.
     pub async fn open_file(&self, path: &str) -> Result<crate::File<R>> {
         let entry = self
-            .entry(path)
+            .entry_layout(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
-        if entry.kind != EntryKind::File {
-            return Err(Error::Unsupported("entry is not a file"));
-        }
         self.file(entry).await
     }
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Errors follow the documented operation contract and crate error types."
-    )]
     /// Opens a reusable cursor without retaining this archive's ownership.
-    pub async fn open_cursor(&self, path: &str) -> Result<crate::FileCursor> {
+    pub(crate) async fn open_cursor(&self, path: &str) -> Result<crate::file::FileCursor> {
         let entry = self
-            .entry(path)
+            .entry_layout(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?;
-        crate::FileCursor::new(entry, Arc::downgrade(&self.manifest))
+        crate::file::FileCursor::new(entry, Arc::downgrade(self.paged.directory()))
     }
     async fn file(&self, entry: Entry) -> Result<crate::File<R>> {
         if entry.extents.len() <= 64 {
@@ -359,32 +346,58 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
             .await
             .map_err(worker_error)?
     }
-    /// Owned stream of sorted entry handles. Skipping a handle performs no content I/O.
-    /// Pin the stream to use [`futures_util::TryStreamExt::try_next`], or consume it with stream
-    /// combinators. Both the stream and its handles can outlive this archive.
+    /// Streams immutable metadata in UTF-8 path order, loading pages on demand.
+    ///
+    /// Each yielded entry and its ancestors are validated. Optional extension
+    /// pages are not scanned; use [`Self::validate_all_metadata`] for a complete
+    /// metadata check. The stream can outlive this archive and is `Unpin`.
     pub fn entries(
         &self,
-    ) -> impl stream::FusedStream<Item = Result<crate::File<R>>> + Send + 'static {
-        let state = (self.clone(), None, std::collections::VecDeque::new());
-        stream::try_unfold(state, |(archive, cursor, mut pending)| async move {
-            let cursor = match cursor {
-                Some(cursor) => cursor,
-                None => archive.cursor().await?,
-            };
-            let (cursor, entry) = if let Some(entry) = pending.pop_front() {
-                (cursor, entry)
-            } else {
-                let (cursor, entries) = archive.next_entries(cursor, 128).await?;
-                pending.extend(entries);
-                let Some(entry) = pending.pop_front() else {
-                    return Ok(None);
-                };
-                (cursor, entry)
-            };
-            let file = archive.file(entry).await?;
-            Ok(Some((file, (archive, Some(cursor), pending))))
-        })
+    ) -> impl stream::FusedStream<Item = Result<EntryMetadata>> + Send + Unpin + 'static + use<R>
+    {
+        self.entries_with_prefix("")
+    }
+
+    /// Streams paths beginning with the exact string prefix. Loads candidate
+    /// entry pages and any pages required to validate ancestors.
+    pub fn entries_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> impl stream::FusedStream<Item = Result<EntryMetadata>> + Send + Unpin + 'static + use<R>
+    {
+        let page = self.paged.first_page(prefix);
+        let state = (
+            self.clone(),
+            page,
+            std::collections::VecDeque::new(),
+            prefix.to_owned(),
+        );
+        stream::try_unfold(
+            state,
+            |(archive, mut page, mut pending, prefix)| async move {
+                loop {
+                    if let Some(entry) = pending.pop_front() {
+                        return Ok(Some((entry, (archive, page, pending, prefix))));
+                    }
+                    let Some(entries) = archive.paged.entries_page(page, &prefix).await? else {
+                        return Ok(None);
+                    };
+                    page += 1;
+                    pending.extend(entries);
+                }
+            },
+        )
+        .boxed()
         .fuse()
+    }
+
+    /// Validates every metadata page, optional extension, and the complete namespace.
+    /// Content frames and external objects are checked only when read.
+    ///
+    /// # Errors
+    /// Returns metadata, source, or resource-limit errors from the complete scan.
+    pub async fn validate_all_metadata(&self) -> Result<()> {
+        self.paged.full_manifest().await.map(|_| ())
     }
 
     #[expect(
@@ -396,96 +409,20 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let paged =
             crate::paged_archive::PagedState::open_with_options(source.clone(), options.clone())
                 .await?;
-        let root = paged.directory().root.clone();
-        let mut archive = Self::from_directory(
-            source,
-            ManifestReader::from_entries(root, Vec::new(), false)?,
-            options,
-        );
-        archive.paged = Some(Arc::new(paged));
-        Ok(archive)
-    }
-    pub(crate) async fn load_full_manifest(
-        source: Arc<R>,
-        options: ReaderOptions,
-    ) -> Result<Arc<ManifestReader>> {
-        Ok(Self::open_indexed(source, options).await?.manifest)
-    }
-    async fn full_manifest(&self) -> Result<Arc<ManifestReader>> {
-        match &self.paged {
-            Some(paged) => paged.full_manifest().await,
-            None => Ok(self.manifest.clone()),
-        }
-    }
-    async fn open_indexed(source: Arc<R>, options: ReaderOptions) -> Result<Self> {
-        if !(1..=1024).contains(&options.concurrent_chunks) {
-            return Err(Error::Budget("invalid content concurrency"));
-        }
-        let size = source.size().await?;
-        if size < crate::FOOTER_SIZE as u64 {
-            return Err(Error::NotZstar);
-        }
-        let footer = crate::parse_footer(
-            &source
-                .read_range(size - crate::FOOTER_SIZE as u64..size)
-                .await?,
-        )?;
-        let buffer = Bytes::new();
-        let metadata_range = footer.metadata_range(size)?;
-        let mut ranges = MetadataSource {
-            source: source.as_ref(),
-            end: metadata_range.end,
-            start: metadata_range.start,
-            buffer,
-        };
-        let mut ingest = ManifestIngest::new(footer, size, Spool::new(options.manifest_options()))?;
-        while !ingest.complete() {
-            let at = ingest.position();
-            let header = ranges.read(ingest.header_range()?).await?;
-            let len = ingest.encoded_length(&header)?;
-            let encoded = ranges.read(at + 8..at + 8 + len).await?;
-            // Ingest is moved, never shared with abandoned work. Cancellation
-            // releases its temporary storage when the single worker finishes.
-            ingest = tokio::task::spawn_blocking(move || {
-                ingest.push(&header, &encoded)?;
-                Ok::<_, Error>(ingest)
-            })
-            .await
-            .map_err(worker_error)??;
-        }
-        let manifest = tokio::task::spawn_blocking(move || ingest.finish())
-            .await
-            .map_err(worker_error)??;
         Ok(Self {
             source,
-            manifest: Arc::new(manifest),
-            paged: None,
+            paged: Arc::new(paged),
             semaphore: Arc::new(Semaphore::new(options.concurrent_chunks)),
             metadata_semaphore: Arc::new(Semaphore::new(2)),
             flights: Arc::new(Mutex::new(HashMap::new())),
             options,
         })
     }
-    pub(crate) fn from_directory(
-        source: Arc<R>,
-        manifest: ManifestReader,
-        options: ReaderOptions,
-    ) -> Self {
-        Self {
-            source,
-            manifest: Arc::new(manifest),
-            paged: None,
-            semaphore: Arc::new(Semaphore::new(options.concurrent_chunks)),
-            metadata_semaphore: Arc::new(Semaphore::new(2)),
-            flights: Arc::new(Mutex::new(HashMap::new())),
-            options,
-        }
-    }
     async fn metadata<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&ManifestReader) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let manifest = self.full_manifest().await?;
+        let manifest = self.paged.full_manifest().await?;
         let permit = self
             .metadata_semaphore
             .clone()
@@ -499,30 +436,32 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         .await
         .map_err(worker_error)?
     }
-    fn cached_entry(&self, path: &str) -> EntryLookup {
-        self.manifest.entry_cached(path)
-    }
     #[expect(
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    /// Returns owned metadata, or `None` if the path is absent.
-    pub async fn entry(&self, path: &str) -> Result<Option<Entry>> {
-        if let Some(paged) = &self.paged {
-            return paged.entry(path).await;
-        }
-        if let EntryLookup::Ready(entry) = self.cached_entry(path) {
-            return Ok(entry);
-        }
-        let path = path.to_owned();
-        self.metadata(move |manifest| manifest.entry(&path)).await
+    /// Returns immutable logical metadata, or `None` if the path is absent.
+    pub async fn entry(&self, path: &str) -> Result<Option<EntryMetadata>> {
+        self.entry_layout(path)
+            .await?
+            .as_ref()
+            .map(EntryMetadata::from_entry)
+            .transpose()
+    }
+    /// Returns the validated physical layout for format tooling and bindings.
+    /// Prefer [`Self::entry`] for ordinary metadata access.
+    ///
+    /// # Errors
+    /// Returns metadata, ancestor validation, source, or resource-limit errors.
+    pub async fn entry_layout(&self, path: &str) -> Result<Option<Entry>> {
+        self.paged.entry(path).await
     }
     /// Creates a cursor for bounded metadata batches.
     ///
     /// Prefer [`Self::entries`] for ordinary enumeration.
     #[doc(hidden)]
     pub async fn cursor(&self) -> Result<EntryCursor> {
-        self.metadata(|manifest| Ok(manifest.cursor())).await
+        self.cursor_prefix("").await
     }
     /// Creates a bounded cursor over paths beginning with `prefix`.
     #[doc(hidden)]
@@ -539,7 +478,10 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         limit: usize,
     ) -> Result<(EntryCursor, Vec<Entry>)> {
         if limit == 0 || limit > MAX_BATCH_REQUESTS {
-            return Err(Error::Budget("cursor batch size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::BatchRequests,
+                "cursor batch size",
+            ));
         }
         self.metadata(move |manifest| {
             let mut entries = Vec::new();
@@ -558,14 +500,14 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     /// # Errors
     /// Returns an error if the entry is missing, is not a symlink, or cannot be read.
     pub async fn read_link(&self, path: &str) -> Result<String> {
-        self.entry(path)
+        self.entry_layout(path)
             .await?
             .ok_or_else(|| Error::MissingEntry(path.into()))?
             .linkname
             .ok_or(Error::Unsupported("entry is not a symlink"))
     }
-    pub(crate) fn owns_cursor(&self, owner: &std::sync::Weak<ManifestReader>) -> bool {
-        std::sync::Weak::ptr_eq(owner, &Arc::downgrade(&self.manifest))
+    pub(crate) fn owns_cursor(&self, owner: &Weak<crate::ManifestDirectory>) -> bool {
+        Weak::ptr_eq(owner, &Arc::downgrade(self.paged.directory()))
     }
     #[expect(
         clippy::option_if_let_else,
@@ -658,16 +600,7 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         let limits = self.options.limits;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let raw = match key_copy {
-                Key::Archive(..) => decode_content_with_limits(&encoded, true, limits)?,
-                Key::Object(_) => decode_object(&encoded, limits)?,
-            };
-            if let Key::Object(hash) = key_copy
-                && verify
-            {
-                crate::verify_sha256(&raw, hash)?;
-            }
-            let raw = DecodedBody::compact(raw);
+            let raw = crate::read_plan::decode(&key_copy, &encoded, verify, limits)?;
             Ok::<_, Error>(raw)
         })
         .await
@@ -675,44 +608,24 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
     }
     async fn plan(&self, requests: &[ReadRequest<'_>]) -> Result<Plan> {
         if requests.len() > MAX_BATCH_REQUESTS {
-            return Err(Error::Budget("batch request count"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::BatchRequests,
+                "batch request count",
+            ));
         }
+        let selected = self.paged.selected_manifests(requests).await?;
         let requests: Vec<_> = requests
             .iter()
             .map(|r| (r.path.to_owned(), r.offset, r.length))
             .collect();
         let budget = self.options.max_read_bytes;
-        let selected = match &self.paged {
-            Some(paged) => Some(
-                paged
-                    .selected_manifests(
-                        &requests
-                            .iter()
-                            .map(|(path, offset, length)| ReadRequest {
-                                path,
-                                offset: *offset,
-                                length: *length,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .await?,
-            ),
-            None => None,
-        };
-        let manifest = self.manifest.clone();
         tokio::task::spawn_blocking(move || {
             build_plan(
                 requests
                     .iter()
                     .map(|(path, offset, length)| (path.as_str(), *offset, *length)),
                 budget,
-                |path| {
-                    let page = selected
-                        .as_ref()
-                        .and_then(|pages| pages.get(path))
-                        .unwrap_or(&manifest);
-                    Ok(page.range_entry(path))
-                },
+                |path| Ok(selected.get(path).and_then(|page| page.range_entry(path))),
             )
         })
         .await
@@ -883,104 +796,29 @@ impl<R: AsyncRangeReader + ?Sized + 'static> Archive<R> {
         Ok(outputs.into_iter().map(BytesMut::freeze).collect())
     }
 }
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
-)]
-fn build_plan<'a, 'm>(
-    requests: impl Iterator<Item = (&'a str, u64, u64)>,
-    budget: u64,
-    mut lookup: impl FnMut(&str) -> Result<Option<(&'m Entry, &'m [u64])>>,
-) -> Result<Plan> {
-    let mut plan = Plan {
-        sizes: Vec::new(),
-        groups: BTreeMap::new(),
-    };
-    let mut total = 0_u64;
-    let mut copies = 0_usize;
-    for (output, (path, offset, length)) in requests.enumerate() {
-        total = total
-            .checked_add(length)
-            .ok_or(Error::Budget("batch output size"))?;
-        if total > budget || usize::try_from(total).is_err() {
-            return Err(Error::Budget("batch output size"));
-        }
-        let (entry, ends) = lookup(path)?.ok_or_else(|| Error::MissingEntry(path.into()))?;
-        if entry.kind != EntryKind::File {
-            return Err(Error::Unsupported("entry is not a file"));
-        }
-        let range = crate::checked_range(offset, length, ends.last().copied().unwrap_or(0))?;
-        plan.sizes.push(length as usize);
-        if length == 0 {
-            continue;
-        }
-        let first = ends.partition_point(|end| *end <= offset);
-        let mut position = if first == 0 { 0 } else { ends[first - 1] };
-        for extent in &entry.extents[first..] {
-            let next = position.checked_add(extent.size).ok_or(Error::Range)?;
-            if position >= range.end {
-                break;
-            }
-            if next > range.start {
-                copies += 1;
-                if copies > 65_536 {
-                    return Err(Error::Budget("batch extent copies"));
-                }
-                let start = range.start.max(position);
-                let end = range.end.min(next);
-                let at = extent
-                    .offset
-                    .checked_add(start - position)
-                    .ok_or(Error::Range)?;
-                let selection_end = extent.offset.checked_add(extent.size).ok_or(Error::Range)?;
-                let group = plan.groups.entry(Key::of(extent)).or_insert_with(|| Group {
-                    hint: extent.encoded_size,
-                    copies: Vec::new(),
-                });
-                group.copies.push(Copy {
-                    output,
-                    selection: extent.offset..selection_end,
-                    source: at as usize..(at + end - start) as usize,
-                    destination: (start - range.start) as usize..(end - range.start) as usize,
-                });
-            }
-            position = next;
-        }
-    }
-    Ok(plan)
-}
 fn worker_error(_: tokio::task::JoinError) -> Error {
     Error::Io(std::io::Error::other("entry reader worker failed"))
-}
-fn validate_copy(copy: &Copy, decoded: usize) -> Result<()> {
-    crate::checked_range(
-        copy.selection.start,
-        copy.selection.end - copy.selection.start,
-        decoded as u64,
-    )?;
-    Ok(())
-}
-fn record(report: Option<&mut ReadReport>, key: &Key, verify: bool) {
-    if let Some(report) = report {
-        match key {
-            Key::Archive(at, _) => report.data_frames_checked.push(*at),
-            Key::Object(hash) if verify => report.external_objects_sha256_checked.push(*hash),
-            Key::Object(hash) => report.external_objects_unchecked.push(*hash),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BlockingBuilder;
+    use crate::EntryKind;
+    use crate::blocking::Builder as BlockingBuilder;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
 
     fn fixture() -> Vec<u8> {
-        let mut writer =
-            BlockingBuilder::with_options(Vec::new(), 2048, 3, ManifestOptions::default()).unwrap();
+        let mut writer = BlockingBuilder::try_with_options(
+            Vec::new(),
+            crate::WriterOptions {
+                frame_size: 2048,
+                compression_level: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (path, raw) in [
             ("a", b"hello".to_vec()),
             ("b", b"world".to_vec()),
@@ -1241,7 +1079,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
-                .path,
+                .path(),
             "a"
         );
         let requests = [

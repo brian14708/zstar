@@ -3,19 +3,6 @@ use crate::Result;
 use bytes::Bytes;
 use std::ops::Range;
 
-/// Maximum number of ranges accepted by one [`crate::Archive::read_many`] call.
-pub const MAX_BATCH_REQUESTS: usize = 4096;
-/// One logical file range in a grouped batch.
-#[derive(Clone, Copy, Debug)]
-pub struct ReadRequest<'a> {
-    /// Archive-relative path to a regular file.
-    pub path: &'a str,
-    /// Start position within the logical file.
-    pub offset: u64,
-    /// Number of bytes to return.
-    pub length: u64,
-}
-
 /// Exact byte ranges from an immutable archive. Dropping a returned future
 /// cancels pending work; implementations must not detach network requests.
 ///

@@ -5,13 +5,14 @@
 //! [`extract_with_report`](crate::fs::extract_with_report) to learn exactly which metadata was not applied.
 //!
 //! `pack` and `pack_to_with_options` capture portable archives. `extract` and
-//! `extract_file_with_options` refuse collisions, preserve symlink target text,
+//! `extract_file_with_report` refuse collisions, preserve symlink target text,
 //! and stage a new destination before publishing it. `LocalFileSource` provides
 //! bounded positional reads; `AsyncLocalFileSource` runs them on blocking
 //! workers. `LocalObjects` resolves content-addressed external objects.
 
-use crate::backend::{BlockingArchive, BlockingBuilder, EncodedObjectResolver};
-use crate::capture::CaptureSpool;
+use crate::blocking::ObjectResolver as EncodedObjectResolver;
+use crate::blocking::{Archive as BlockingArchive, Builder as BlockingBuilder, ReaderOptions};
+use crate::capture::CaptureBuffer;
 use crate::manifest_io::ManifestOptions;
 #[cfg(unix)]
 use crate::manifest_io::ManifestReader;
@@ -33,33 +34,33 @@ use std::{
 };
 
 mod file_source;
+#[cfg(feature = "async")]
 pub use file_source::AsyncLocalFileSource;
 pub use file_source::LocalFileSource;
 
-pub type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-/// External-object verification and destination resource policy. Metadata,
-/// codec checksums, tar structure and no-follow restoration are always checked.
-#[derive(Clone, Debug)]
+/// Destination resource policy and the reader policy for opened archives.
+/// Metadata, codec checksums, tar structure and no-follow restoration are
+/// always checked.
+#[derive(Debug)]
 pub struct ExtractOptions {
-    /// Options for filesystem restoration. Metadata and codec checks remain
-    /// mandatory even when external hash verification is disabled.
+    /// Restore setuid and setgid mode bits; the sticky bit is always restored.
     pub allow_special_bits: bool,
-    pub verify_external: bool,
     /// Open directory handles retained at once, including the root handle; a
     /// local resource limit, not a wire entry cap. Directories beyond the limit
     /// are evicted least-recently-used and transparently reopened without
     /// following links, so any tree extracts with a limit of two or more.
     pub max_directory_handles: usize,
-    pub manifest: ManifestOptions,
+    /// Reader policy used when opening a local archive, including the external
+    /// object resolver and verification. Extracting an already-open archive
+    /// uses that archive's own reader policy instead.
+    pub reader: ReaderOptions,
 }
 impl Default for ExtractOptions {
     fn default() -> Self {
         Self {
             allow_special_bits: false,
-            verify_external: false,
             max_directory_handles: 64,
-            manifest: ManifestOptions::default(),
+            reader: ReaderOptions::default(),
         }
     }
 }
@@ -69,21 +70,19 @@ pub struct PackOptions {
     /// Options for bounded filesystem capture and frame encoding.
     /// Preserve source modes, ownership and modification times.
     pub preserve_metadata: bool,
-    pub frame_size: usize,
-    pub compression_level: i32,
-    pub workers: usize,
-    pub manifest: ManifestOptions,
+    /// Compression, metadata, limits, and temporary storage policy.
+    pub writer: crate::WriterOptions,
 }
 impl Default for PackOptions {
     fn default() -> Self {
         Self {
             preserve_metadata: false,
-            frame_size: 1 << 20,
-            compression_level: 3,
-            workers: std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(2),
-            manifest: ManifestOptions::default(),
+            writer: crate::WriterOptions {
+                workers: std::thread::available_parallelism()
+                    .map_or(1, std::num::NonZero::get)
+                    .min(2),
+                ..Default::default()
+            },
         }
     }
 }
@@ -98,7 +97,7 @@ impl LocalObjects {
         clippy::missing_errors_doc,
         reason = "Errors follow the documented operation contract and crate error types."
     )]
-    pub fn open(path: &Path) -> AnyResult<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             dir: Dir::open_ambient_dir(path, cap_std::ambient_authority())?,
         })
@@ -137,7 +136,7 @@ impl EncodedObjectResolver for LocalObjects {
     reason = "Lengths and offsets are bounded by validated buffers or wire-field limits."
 )]
 #[cfg(unix)]
-fn time(entry: &Entry) -> AnyResult<std::time::SystemTime> {
+fn time(entry: &Entry) -> Result<std::time::SystemTime> {
     let value = i128::from(entry.mtime_ns);
     let duration = Duration::from_nanos(value.unsigned_abs() as u64);
     if value < 0 {
@@ -145,7 +144,7 @@ fn time(entry: &Entry) -> AnyResult<std::time::SystemTime> {
     } else {
         UNIX_EPOCH.checked_add(duration)
     }
-    .ok_or_else(|| "filesystem timestamp out of range".into())
+    .ok_or(Error::InvalidInput("filesystem timestamp out of range"))
 }
 /// Which standard metadata an extraction could not apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -234,7 +233,7 @@ fn metadata(
     entry: &Entry,
     allow_special_bits: bool,
     report: &mut ExtractReport,
-) -> AnyResult<()> {
+) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mask = special_mask(allow_special_bits);
     file.set_permissions(std::fs::Permissions::from_mode((entry.mode & mask) as u32))?;
@@ -248,23 +247,15 @@ fn metadata(
     }
     Ok(())
 }
+/// Attaches an archive path to an I/O failure without erasing archive errors.
 #[cfg(unix)]
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-/// Prefix an error with the archive path it concerns, keeping `io::ErrorKind`.
-#[cfg(unix)]
-fn at(path: &str, error: impl Into<BoxError>) -> BoxError {
-    let error = error.into();
-    // Typed archive errors carry a category callers match on; keep them intact.
-    if error.is::<crate::Error>() {
-        return error;
-    }
-    let kind = error
-        .downcast_ref::<std::io::Error>()
-        .map(std::io::Error::kind);
-    let message = format!("{path}: {error}");
-    match kind {
-        Some(kind) => std::io::Error::new(kind, message).into(),
-        None => message.into(),
+fn at(path: &str, error: impl Into<crate::Error>) -> crate::Error {
+    match error.into() {
+        crate::Error::Io(source) => crate::Error::Filesystem {
+            path: path.into(),
+            source,
+        },
+        error => error,
     }
 }
 
@@ -314,7 +305,7 @@ impl DirCache {
         self.order.insert(self.clock, path.to_owned());
         Some(dir.clone())
     }
-    fn dir(&mut self, path: &str) -> AnyResult<Arc<Dir>> {
+    fn dir(&mut self, path: &str) -> Result<Arc<Dir>> {
         if path.is_empty() {
             return Ok(self.root.clone());
         }
@@ -344,7 +335,7 @@ impl DirCache {
         }
         Ok(current)
     }
-    fn parent<'a>(&mut self, path: &'a str) -> AnyResult<(Arc<Dir>, &'a str)> {
+    fn parent<'a>(&mut self, path: &'a str) -> Result<(Arc<Dir>, &'a str)> {
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
         Ok((self.dir(parent).map_err(|e| at(path, e))?, name))
     }
@@ -361,13 +352,11 @@ impl DirCache {
 pub fn extract<R: RangeReader>(
     archive: &mut BlockingArchive<R>,
     destination: &Path,
-    objects: Option<LocalObjects>,
     allow_special_bits: bool,
-) -> AnyResult<ExtractReport> {
-    extract_with_options(
+) -> Result<ExtractReport> {
+    extract_with_report(
         archive,
         destination,
-        objects,
         ExtractOptions {
             allow_special_bits,
             ..Default::default()
@@ -403,11 +392,7 @@ impl Drop for Staged {
 }
 #[cfg(unix)]
 impl Target {
-    #[expect(
-        clippy::or_fun_call,
-        reason = "The fallback is a cheap value conversion with no allocation or I/O."
-    )]
-    fn open(destination: &Path) -> AnyResult<Self> {
+    fn open(destination: &Path) -> Result<Self> {
         let Some(name) = destination.file_name() else {
             let path = if destination.as_os_str().is_empty() {
                 Path::new(".")
@@ -422,7 +407,7 @@ impl Target {
         let parent_path = destination
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+            .unwrap_or_else(|| Path::new("."));
         let parent = Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())?;
         match parent.symlink_metadata(name) {
             // Includes symlinks and files: opening without following rejects them.
@@ -457,22 +442,19 @@ impl Target {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Err("could not create a temporary extraction directory".into())
+                Err(Error::InvalidInput(
+                    "could not create a temporary extraction directory",
+                ))
             }
             Err(e) => Err(e.into()),
         }
     }
-    fn commit(&mut self) -> AnyResult<()> {
+    fn commit(&mut self) -> Result<()> {
         if let Some(staged) = &mut self.staged {
             staged
                 .parent
                 .rename(&staged.temp, &staged.parent, &staged.name)
-                .map_err(|e| {
-                    at(
-                        &staged.name.to_string_lossy(),
-                        format!("could not move extracted tree into place: {e}"),
-                    )
-                })?;
+                .map_err(|e| at(&staged.name.to_string_lossy(), e))?;
             staged.armed = false;
         }
         Ok(())
@@ -537,16 +519,19 @@ fn create_directories(
     max_handles: usize,
     progress: &mut Progress,
     report: &mut ExtractReport,
-) -> AnyResult<BTreeMap<String, Entry>> {
+) -> Result<BTreeMap<String, Entry>> {
     let mut metadata = BTreeMap::new();
-    let mut cursor = manifest.cursor();
+    let mut cursor = manifest.cursor_prefix("");
     while let Some(mut entry) = manifest.next_entry(&mut cursor)? {
         if entry.kind != EntryKind::Directory {
             continue;
         }
         // The root plus one working handle are the minimum to build a tree.
         if max_handles < 2 {
-            return Err(Error::Budget("destination directory handles").into());
+            return Err(crate::Error::budget(
+                crate::BudgetResource::DirectoryHandles,
+                "destination directory handles",
+            ));
         }
         let (parent, name) = cache.parent(&entry.path)?;
         parent.create_dir(name).map_err(|e| at(&entry.path, e))?;
@@ -571,16 +556,19 @@ fn finish_destination(
     allow_special_bits: bool,
     progress: &mut Progress,
     report: &mut ExtractReport,
-) -> AnyResult<()> {
+) -> Result<()> {
     use cap_std::fs::{MetadataExt, PermissionsExt};
     let mask = special_mask(allow_special_bits);
-    let mut cursor = manifest.cursor();
+    let mut cursor = manifest.cursor_prefix("");
     while let Some(entry) = manifest.next_entry(&mut cursor)? {
         if entry.kind != EntryKind::Symlink {
             continue;
         }
         let (parent, name) = cache.parent(&entry.path)?;
-        let target = entry.linkname.as_deref().ok_or("missing linkname")?;
+        let target = entry
+            .linkname
+            .as_deref()
+            .ok_or(Error::InvalidInput("missing linkname"))?;
         parent
             .symlink_contents(target, name)
             .map_err(|e| at(&entry.path, e))?;
@@ -654,33 +642,16 @@ fn finish_destination(
 pub fn extract_file(
     archive: &Path,
     destination: &Path,
-    objects: Option<LocalObjects>,
     allow_special_bits: bool,
-) -> AnyResult<ExtractReport> {
-    extract_file_with_options(
+) -> Result<ExtractReport> {
+    extract_file_with_report(
         archive,
         destination,
-        objects,
         ExtractOptions {
             allow_special_bits,
             ..Default::default()
         },
     )
-}
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-/// Extracts a local archive under the selected policies and reports metadata omissions.
-pub fn extract_file_with_options(
-    archive: &Path,
-    destination: &Path,
-    objects: Option<LocalObjects>,
-    options: ExtractOptions,
-) -> AnyResult<ExtractReport> {
-    let mut reader =
-        BlockingArchive::open(LocalFileSource::open(archive)?, options.manifest.clone())?;
-    extract_with_options(&mut reader, destination, objects, options)
 }
 
 #[expect(
@@ -698,33 +669,39 @@ pub fn extract_file_with_options(
 /// removes it. An existing destination, or one without a file name (`.`, `/`),
 /// is extracted into in place; pre-existing entries collide as errors and are
 /// never modified, and on failure the entries this call created are removed.
-/// Errors name the archive path involved.
+/// Errors name the archive path involved. External content is resolved and
+/// verified with the archive's reader policy.
 #[cfg(unix)]
 pub fn extract_with_report<R: RangeReader>(
     reader: &mut BlockingArchive<R>,
     destination: &Path,
-    objects: Option<LocalObjects>,
     options: ExtractOptions,
-) -> AnyResult<ExtractReport> {
+) -> Result<ExtractReport> {
     if reader
+        .engine
         .manifest()
         .root()
         .requires
         .iter()
         .any(|s| s == "external-content")
-        && objects.is_none()
+        && reader.options.resolver.is_none()
     {
-        return Err(Error::Unsupported("external content requires --objects").into());
+        return Err(Error::Unsupported(
+            "external content requires an object resolver",
+        ));
     }
     if options.max_directory_handles == 0 {
-        return Err(Error::Budget("destination directory handles").into());
+        return Err(crate::Error::budget(
+            crate::BudgetResource::DirectoryHandles,
+            "destination directory handles",
+        ));
     }
     let mut target = Target::open(destination)?;
     let mut progress = Progress {
         track_leaves: target.staged.is_none(),
         ..Default::default()
     };
-    match extract_into(reader, &target.root, objects, &options, &mut progress) {
+    match extract_into(reader, &target.root, &options, &mut progress) {
         Ok(report) => {
             target.commit()?;
             Ok(report)
@@ -739,22 +716,21 @@ pub fn extract_with_report<R: RangeReader>(
 fn extract_into<R: RangeReader>(
     reader: &mut BlockingArchive<R>,
     root: &Dir,
-    mut objects: Option<LocalObjects>,
     options: &ExtractOptions,
     progress: &mut Progress,
-) -> AnyResult<ExtractReport> {
+) -> Result<ExtractReport> {
     let mut report = ExtractReport::default();
     let mut cache = DirCache::new(root.try_clone()?, options.max_directory_handles);
     let directories = create_directories(
-        reader.manifest(),
+        reader.engine.manifest(),
         &mut cache,
         options.max_directory_handles,
         progress,
         &mut report,
     )?;
     let mut current: Option<(Entry, fs::File)> = None;
-    reader.visit_payloads(|entry, bytes| {
-        let mut write = || -> AnyResult<()> {
+    reader.engine.visit_payloads(|entry, bytes| {
+        let mut write = || -> Result<()> {
             if entry.is_external() {
                 return Ok(());
             }
@@ -779,27 +755,29 @@ fn extract_into<R: RangeReader>(
             }
             current
                 .as_mut()
-                .ok_or("missing output file")?
+                .ok_or(Error::InvalidInput("missing output file"))?
                 .1
                 .write_all(bytes)
                 .map_err(|e| at(&entry.path, e))?;
             Ok(())
         };
-        write().map_err(|error| Error::Io(std::io::Error::other(error)))
+        write()
     })?;
     if let Some((entry, file)) = current {
         metadata(&file, &entry, options.allow_special_bits, &mut report)
             .map_err(|e| at(&entry.path, e))?;
         report.files += 1;
     }
-    let mut cursor = reader.manifest().cursor();
-    while let Some(entry) = reader.manifest().next_entry(&mut cursor)? {
+    let mut cursor = reader.engine.manifest().cursor_prefix("");
+    while let Some(entry) = reader.engine.manifest().next_entry(&mut cursor)? {
         if !entry.is_external() {
             continue;
         }
-        let resolver = objects
-            .as_mut()
-            .ok_or(Error::Unsupported("external content requires --objects"))?;
+        if reader.options.resolver.is_none() {
+            return Err(Error::Unsupported(
+                "external content requires an object resolver",
+            ));
+        }
         let (parent, name) = cache.parent(&entry.path)?;
         let mut open = OpenOptions::new();
         open.write(true).create_new(true).follow(FollowSymlinks::No);
@@ -808,8 +786,7 @@ fn extract_into<R: RangeReader>(
             .map_err(|e| at(&entry.path, e))?
             .into_std();
         progress.leaf(&entry.path);
-        let copied = reader
-            .open_file(&entry.path, Some(resolver), options.verify_external)
+        let copied = crate::blocking::File::new(reader, entry.clone())
             .and_then(|mut f| f.copy_to(&mut file))
             .map_err(|e| at(&entry.path, e))?;
         if copied != entry.size()? {
@@ -820,7 +797,7 @@ fn extract_into<R: RangeReader>(
         report.files += 1;
     }
     finish_destination(
-        reader.manifest(),
+        reader.engine.manifest(),
         &mut cache,
         &directories,
         options.allow_special_bits,
@@ -838,23 +815,9 @@ fn extract_into<R: RangeReader>(
 pub fn extract_with_report<R: RangeReader>(
     _: &mut BlockingArchive<R>,
     _: &Path,
-    _: Option<LocalObjects>,
     _: ExtractOptions,
-) -> AnyResult<ExtractReport> {
-    Err("extraction requires a Unix filesystem".into())
-}
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "Errors follow the documented operation contract and crate error types."
-)]
-/// Extracts under the selected policies and returns the metadata-application report.
-pub fn extract_with_options<R: RangeReader>(
-    reader: &mut BlockingArchive<R>,
-    destination: &Path,
-    objects: Option<LocalObjects>,
-    options: ExtractOptions,
-) -> AnyResult<ExtractReport> {
-    extract_with_report(reader, destination, objects, options)
+) -> Result<ExtractReport> {
+    Err(Error::InvalidInput("extraction requires a Unix filesystem"))
 }
 #[expect(
     clippy::missing_errors_doc,
@@ -864,12 +827,13 @@ pub fn extract_with_options<R: RangeReader>(
 pub fn extract_file_with_report(
     archive: &Path,
     destination: &Path,
-    objects: Option<LocalObjects>,
-    options: ExtractOptions,
-) -> AnyResult<ExtractReport> {
-    let mut reader =
-        BlockingArchive::open(LocalFileSource::open(archive)?, options.manifest.clone())?;
-    extract_with_report(&mut reader, destination, objects, options)
+    mut options: ExtractOptions,
+) -> Result<ExtractReport> {
+    let mut reader = BlockingArchive::open_with_options(
+        LocalFileSource::open(archive)?,
+        std::mem::take(&mut options.reader),
+    )?;
+    extract_with_report(&mut reader, destination, options)
 }
 
 #[expect(
@@ -877,46 +841,30 @@ pub fn extract_file_with_report(
     reason = "Errors follow the documented operation contract and crate error types."
 )]
 /// Explicit in-memory convenience. Use `materialize_to` for large output archives.
-pub fn materialize<R: RangeReader>(
-    archive: &mut BlockingArchive<R>,
-    objects: Option<LocalObjects>,
-) -> AnyResult<Vec<u8>> {
+pub fn materialize<R: RangeReader>(archive: &mut BlockingArchive<R>) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    materialize_to(archive, &mut output, objects, true, PackOptions::default())?;
+    materialize_to(archive, &mut output, PackOptions::default())?;
     Ok(output)
 }
 #[expect(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-/// Resolve selected external objects once per adjacent extent group and stream
-/// a portable archive preserving entry/root extensions.
+/// Resolve selected external objects with the archive's reader policy and
+/// stream a portable archive preserving entry/root extensions.
 pub fn materialize_to<R: RangeReader>(
     archive: &mut BlockingArchive<R>,
     output: &mut impl Write,
-    mut objects: Option<LocalObjects>,
-    verify_external: bool,
     options: PackOptions,
-) -> AnyResult<()> {
-    let mut writer = BlockingBuilder::with_options(
-        output,
-        options.frame_size,
-        options.compression_level,
-        options.manifest,
-    )?
-    .with_workers(options.workers)?
-    .with_root_extensions(archive.manifest().root().extensions.clone())?;
-    let mut cursor = archive.manifest().cursor();
-    while let Some(mut entry) = archive.manifest().next_entry(&mut cursor)? {
+) -> Result<()> {
+    let mut writer_options = options.writer;
+    writer_options.root_extensions = archive.root_extensions().clone();
+    let mut writer = BlockingBuilder::try_with_options(output, writer_options)?;
+    let mut cursor = archive.engine.manifest().cursor_prefix("");
+    while let Some(mut entry) = archive.engine.manifest().next_entry(&mut cursor)? {
         if entry.kind == EntryKind::File {
             let size = entry.size()?;
-            let mut body = archive.open_file(
-                &entry.path,
-                objects
-                    .as_mut()
-                    .map(|r| r as &mut dyn EncodedObjectResolver),
-                verify_external,
-            )?;
+            let mut body = crate::blocking::File::new(archive, entry.clone())?;
             entry.extents.clear();
             writer.add_file(entry, size, &mut body)?;
         } else {
@@ -971,7 +919,7 @@ mod tests {
 )]
 /// Capture a directory tree and each link's own metadata. The root itself must
 /// be a real directory. Only the encoded archive is retained in memory.
-pub fn pack(input: &Path) -> AnyResult<Vec<u8>> {
+pub fn pack(input: &Path) -> Result<Vec<u8>> {
     let mut archive = Vec::new();
     pack_to(input, &mut archive)?;
     Ok(archive)
@@ -981,44 +929,36 @@ pub fn pack(input: &Path) -> AnyResult<Vec<u8>> {
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-/// Pack with disk-spooled capture records; no whole namespace or archive buffer.
-pub fn pack_to(input: &Path, output: &mut impl Write) -> AnyResult<()> {
+/// Pack with bounded in-memory capture records and streamed member payloads.
+pub fn pack_to(input: &Path, output: &mut impl Write) -> Result<()> {
     pack_to_with_options(input, output, PackOptions::default())
 }
 #[expect(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-#[expect(
-    clippy::or_fun_call,
-    reason = "The fallback is a cheap value conversion with no allocation or I/O."
-)]
 pub fn pack_to_with_options(
     input: &Path,
     output: &mut impl Write,
     options: PackOptions,
-) -> AnyResult<()> {
+) -> Result<()> {
     if !fs::symlink_metadata(input)?.is_dir() {
-        return Err("pack input must be a directory without following a root symlink".into());
+        return Err(Error::InvalidInput(
+            "pack input must be a directory without following a root symlink",
+        ));
     }
     let root = if let Some(name) = input.file_name() {
         let parent = input
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+            .unwrap_or_else(|| Path::new("."));
         Dir::open_ambient_dir(parent, cap_std::ambient_authority())?.open_dir_nofollow(name)?
     } else {
         Dir::open_ambient_dir(input, cap_std::ambient_authority())?
     };
-    let mut entries = CaptureSpool::new(options.manifest.clone());
+    let mut entries = CaptureBuffer::new(options.writer.metadata.max_buffer_bytes);
     collect_entries("", &root, &mut entries, options.preserve_metadata)?;
-    let mut writer = BlockingBuilder::with_options(
-        output,
-        options.frame_size,
-        options.compression_level,
-        options.manifest,
-    )?
-    .with_workers(options.workers)?;
+    let mut writer = BlockingBuilder::try_with_options(output, options.writer)?;
     append_captured(&root, "", entries, &mut writer, options.preserve_metadata)?;
     writer.finish()?;
     Ok(())
@@ -1028,10 +968,6 @@ pub fn pack_to_with_options(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-#[expect(
-    clippy::or_fun_call,
-    reason = "The fallback is a cheap value conversion with no allocation or I/O."
-)]
 /// Append a captured directory, including its root entry, to an existing
 /// archive builder. Filesystem traversal and reopening stay relative to
 /// captured no-follow directory handles.
@@ -1040,24 +976,56 @@ pub fn append_directory<W: Write>(
     archive_name: &str,
     writer: &mut BlockingBuilder<W>,
     preserve_metadata: bool,
-) -> AnyResult<()> {
+) -> Result<()> {
+    visit_directory(
+        input,
+        archive_name,
+        &mut |entry, size, body| append_captured_entry(writer, entry, size, body),
+        preserve_metadata,
+    )
+}
+
+fn append_captured_entry<W: Write>(
+    writer: &mut BlockingBuilder<W>,
+    entry: Entry,
+    size: u64,
+    body: Option<std::fs::File>,
+) -> Result<()> {
+    if let Some(mut body) = body {
+        writer.add_file(entry, size, &mut body)?;
+    } else {
+        writer.add_metadata(entry)?;
+    }
+    Ok(())
+}
+
+type CaptureVisitor<'a> = dyn FnMut(Entry, u64, Option<std::fs::File>) -> Result<()> + 'a;
+
+fn visit_directory(
+    input: &Path,
+    archive_name: &str,
+    visit: &mut CaptureVisitor<'_>,
+    preserve_metadata: bool,
+) -> Result<()> {
     if !crate::manifest::valid_path(archive_name) {
-        return Err("invalid archive directory name".into());
+        return Err(Error::InvalidInput("invalid archive directory name"));
     }
     if !fs::symlink_metadata(input)?.is_dir() {
-        return Err("pack input must be a directory without following a root symlink".into());
+        return Err(Error::InvalidInput(
+            "pack input must be a directory without following a root symlink",
+        ));
     }
     let root = if let Some(name) = input.file_name() {
         let parent = input
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+            .unwrap_or_else(|| Path::new("."));
         Dir::open_ambient_dir(parent, cap_std::ambient_authority())?.open_dir_nofollow(name)?
     } else {
         Dir::open_ambient_dir(input, cap_std::ambient_authority())?
     };
     let meta = root.dir_metadata()?;
-    let mut entries = CaptureSpool::new(ManifestOptions::default());
+    let mut entries = CaptureBuffer::new(ManifestOptions::default().max_buffer_bytes);
     let mut root_entry = Entry::directory(archive_name);
     root_entry.mode = if preserve_metadata {
         permissions(&meta)
@@ -1069,16 +1037,32 @@ pub fn append_directory<W: Write>(
     }
     entries.add(root_entry, 0)?;
     collect_entries(archive_name, &root, &mut entries, preserve_metadata)?;
-    append_captured(&root, archive_name, entries, writer, preserve_metadata)
+    visit_captured(&root, archive_name, entries, visit, preserve_metadata)
 }
 
 fn append_captured<W: Write>(
     root: &Dir,
     prefix: &str,
-    entries: CaptureSpool,
+    entries: CaptureBuffer,
     writer: &mut BlockingBuilder<W>,
     preserve_metadata: bool,
-) -> AnyResult<()> {
+) -> Result<()> {
+    visit_captured(
+        root,
+        prefix,
+        entries,
+        &mut |entry, size, body| append_captured_entry(writer, entry, size, body),
+        preserve_metadata,
+    )
+}
+
+fn visit_captured(
+    root: &Dir,
+    prefix: &str,
+    entries: CaptureBuffer,
+    visit: &mut CaptureVisitor<'_>,
+    preserve_metadata: bool,
+) -> Result<()> {
     for captured in entries.sorted()? {
         let (mut entry, size) = captured?;
         if entry.kind == EntryKind::File {
@@ -1089,27 +1073,23 @@ fn append_captured<W: Write>(
                     .path
                     .strip_prefix(prefix)
                     .and_then(|path| path.strip_prefix('/'))
-                    .ok_or("captured path prefix")?
+                    .ok_or(Error::InvalidInput("captured path prefix"))?
             };
-            let mut file = open_captured_file(root, path)?;
+            let file = open_captured_file(root, path)?;
             let meta = cap_std::fs::Metadata::from_just_metadata(file.metadata()?);
             if !meta.is_file() || meta.len() != size {
-                return Err("input file changed size while packing".into());
+                return Err(Error::InvalidInput("input file changed size while packing"));
             }
             capture_metadata(&mut entry, &meta, preserve_metadata)?;
-            writer.add_file(entry, size, &mut file)?;
+            visit(entry, size, Some(file))?;
         } else {
-            writer.add_metadata(entry)?;
+            visit(entry, 0, None)?;
         }
     }
     Ok(())
 }
 
-fn capture_metadata(
-    entry: &mut Entry,
-    meta: &cap_std::fs::Metadata,
-    preserve: bool,
-) -> AnyResult<()> {
+fn capture_metadata(entry: &mut Entry, meta: &cap_std::fs::Metadata, preserve: bool) -> Result<()> {
     entry.mode = if preserve {
         permissions(meta)
     } else {
@@ -1125,10 +1105,6 @@ fn capture_metadata(
     clippy::missing_errors_doc,
     reason = "Errors follow the documented operation contract and crate error types."
 )]
-#[expect(
-    clippy::or_fun_call,
-    reason = "The fallback is a cheap value conversion with no allocation or I/O."
-)]
 /// Append one filesystem path, without following the path's final symlink.
 pub fn append_path<W: Write>(
     input: &Path,
@@ -1136,9 +1112,28 @@ pub fn append_path<W: Write>(
     writer: &mut BlockingBuilder<W>,
     preserve_metadata: bool,
     recursive: bool,
-) -> AnyResult<()> {
+) -> Result<()> {
+    visit_path(
+        input,
+        archive_name,
+        &mut |entry, size, body| append_captured_entry(writer, entry, size, body),
+        preserve_metadata,
+        recursive,
+    )
+}
+
+/// Workspace capture visitor. Each owned file is opened with the same no-follow
+/// traversal used by blocking packing. The caller controls streaming/encoding.
+#[doc(hidden)]
+pub fn visit_path(
+    input: &Path,
+    archive_name: &str,
+    visit: &mut CaptureVisitor<'_>,
+    preserve_metadata: bool,
+    recursive: bool,
+) -> Result<()> {
     if !crate::manifest::valid_path(archive_name) {
-        return Err("invalid archive path".into());
+        return Err(Error::InvalidInput("invalid archive path"));
     }
     let meta = cap_std::fs::Metadata::from_just_metadata(fs::symlink_metadata(input)?);
     if meta.is_dir() {
@@ -1153,16 +1148,18 @@ pub fn append_path<W: Write>(
             if preserve_metadata {
                 (entry.uid, entry.gid, entry.mtime_ns) = owner_and_time(&meta)?;
             }
-            writer.add_metadata(entry)?;
+            visit(entry, 0, None)?;
             return Ok(());
         }
-        return append_directory(input, archive_name, writer, preserve_metadata);
+        return visit_directory(input, archive_name, visit, preserve_metadata);
     }
     let parent = input
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = input.file_name().ok_or("input filename required")?;
+        .unwrap_or_else(|| Path::new("."));
+    let name = input
+        .file_name()
+        .ok_or(Error::InvalidInput("input filename required"))?;
     let dir = Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
@@ -1171,18 +1168,18 @@ pub fn append_path<W: Write>(
             archive_name,
             dir.read_link_contents(name)?
                 .to_str()
-                .ok_or("symlink target must be UTF-8")?,
+                .ok_or(Error::InvalidInput("symlink target must be UTF-8"))?,
         );
         if preserve_metadata {
             entry.mode = permissions(&meta);
             (entry.uid, entry.gid, entry.mtime_ns) = owner_and_time(&meta)?;
         }
-        writer.add_metadata(entry)?;
+        visit(entry, 0, None)?;
     } else if meta.is_file() {
-        let mut file = dir.open_with(name, &options)?.into_std();
+        let file = dir.open_with(name, &options)?.into_std();
         let current = cap_std::fs::Metadata::from_just_metadata(file.metadata()?);
         if !current.is_file() || current.len() != meta.len() {
-            return Err("input file changed while packing".into());
+            return Err(Error::InvalidInput("input file changed while packing"));
         }
         let mut entry = Entry::file(archive_name);
         entry.mode = if preserve_metadata {
@@ -1193,14 +1190,16 @@ pub fn append_path<W: Write>(
         if preserve_metadata {
             (entry.uid, entry.gid, entry.mtime_ns) = owner_and_time(&current)?;
         }
-        writer.add_file(entry, current.len(), &mut file)?;
+        visit(entry, current.len(), Some(file))?;
     } else {
-        return Err("only regular files, directories, and symlinks are supported".into());
+        return Err(Error::InvalidInput(
+            "only regular files, directories, and symlinks are supported",
+        ));
     }
     Ok(())
 }
 
-fn open_captured_file(root: &Dir, path: &str) -> AnyResult<std::fs::File> {
+fn open_captured_file(root: &Dir, path: &str) -> Result<std::fs::File> {
     let mut parts = path.split('/').peekable();
     let mut current: Option<Dir> = None;
     while let Some(part) = parts.next() {
@@ -1213,19 +1212,21 @@ fn open_captured_file(root: &Dir, path: &str) -> AnyResult<std::fs::File> {
         let parent = current.as_ref().unwrap_or(root);
         current = Some(parent.open_dir_nofollow(part)?);
     }
-    Err("empty archive path".into())
+    Err(Error::InvalidInput("empty archive path"))
 }
 
 fn collect_entries(
     prefix: &str,
     dir: &Dir,
-    entries: &mut CaptureSpool,
+    entries: &mut CaptureBuffer,
     preserve_metadata: bool,
-) -> AnyResult<()> {
+) -> Result<()> {
     for child in dir.entries()? {
         let child = child?;
         let name = child.file_name();
-        let name_text = name.to_str().ok_or("archive paths must be UTF-8")?;
+        let name_text = name
+            .to_str()
+            .ok_or(Error::InvalidInput("archive paths must be UTF-8"))?;
         let relative = if prefix.is_empty() {
             name_text.to_string()
         } else {
@@ -1272,7 +1273,7 @@ fn collect_entries(
             entry.linkname = Some(
                 dir.read_link_contents(&name)?
                     .to_str()
-                    .ok_or("symlink target is not UTF-8")?
+                    .ok_or(Error::InvalidInput("symlink target is not UTF-8"))?
                     .to_string(),
             );
         } else if meta.is_dir() {
@@ -1280,7 +1281,13 @@ fn collect_entries(
         } else if meta.is_file() {
             // Read during the sorted streaming pass below.
         } else {
-            return Err(format!("unsupported filesystem entry: {relative}").into());
+            return Err(Error::Filesystem {
+                path: relative.into(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "unsupported filesystem entry",
+                ),
+            });
         }
         if !preserve_metadata {
             entry.mode = normalized_mode(entry.kind, mode);
@@ -1290,7 +1297,9 @@ fn collect_entries(
         if is_dir {
             collect_entries(
                 &relative,
-                opened_dir.as_ref().ok_or("input directory disappeared")?,
+                opened_dir
+                    .as_ref()
+                    .ok_or(Error::InvalidInput("input directory disappeared"))?,
                 entries,
                 preserve_metadata,
             )?;
@@ -1318,16 +1327,19 @@ const fn permissions(_: &cap_std::fs::Metadata) -> u64 {
 }
 
 #[cfg(unix)]
-fn owner_and_time(meta: &cap_std::fs::Metadata) -> AnyResult<(u64, u64, i64)> {
+fn owner_and_time(meta: &cap_std::fs::Metadata) -> Result<(u64, u64, i64)> {
     use cap_std::fs::MetadataExt;
     let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
     Ok((
         u64::from(meta.uid()),
         u64::from(meta.gid()),
-        i64::try_from(nanos)?,
+        i64::try_from(nanos)
+            .map_err(|_| Error::InvalidInput("filesystem timestamp out of range"))?,
     ))
 }
 #[cfg(not(unix))]
-fn owner_and_time(_: &cap_std::fs::Metadata) -> AnyResult<(u64, u64, i64)> {
-    Err("packing requires Unix filesystem metadata".into())
+fn owner_and_time(_: &cap_std::fs::Metadata) -> Result<(u64, u64, i64)> {
+    Err(Error::InvalidInput(
+        "packing requires Unix filesystem metadata",
+    ))
 }

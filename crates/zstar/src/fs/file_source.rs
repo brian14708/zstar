@@ -44,7 +44,10 @@ impl LocalFileSource {
     /// The default is 64 MiB; larger permitted TOCs may need a larger limit.
     pub fn with_max_range_bytes(mut self, limit: usize) -> Result<Self> {
         if limit == 0 {
-            return Err(Error::Budget("local range limit must be positive"));
+            return Err(Error::InvalidOptions {
+                option: "max_range_bytes",
+                reason: "must be positive",
+            });
         }
         self.max_range_bytes = limit;
         Ok(self)
@@ -60,9 +63,14 @@ impl LocalFileSource {
     fn range_len(&self, range: &Range<u64>) -> Result<usize> {
         let length = range.end.checked_sub(range.start).ok_or(Error::Range)?;
         crate::checked_range(range.start, length, self.size)?;
-        let count = usize::try_from(length).map_err(|_| Error::Budget("local range size"))?;
+        let count = usize::try_from(length).map_err(|_| {
+            crate::Error::budget(crate::BudgetResource::RangeBytes, "local range size")
+        })?;
         if count > self.max_range_bytes {
-            return Err(Error::Budget("local range size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::RangeBytes,
+                "local range size",
+            ));
         }
         Ok(count)
     }
@@ -75,9 +83,12 @@ impl LocalFileSource {
     pub fn read_range(&self, range: Range<u64>) -> Result<Vec<u8>> {
         let count = self.range_len(&range)?;
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(count)
-            .map_err(|_| Error::Budget("local range allocation"))?;
+        bytes.try_reserve_exact(count).map_err(|_| {
+            crate::Error::budget(
+                crate::BudgetResource::AllocationBytes,
+                "local range allocation",
+            )
+        })?;
         bytes.resize(count, 0);
         let mut remaining = bytes.as_mut_slice();
         let mut offset = range.start;
@@ -121,6 +132,7 @@ fn read_at(_: &File, _: &mut [u8], _: u64) -> io::Result<usize> {
     ))
 }
 
+#[cfg(feature = "async")]
 mod asynchronous {
     use super::LocalFileSource;
     use crate::{AsyncRangeReader, Error, Result};
@@ -158,9 +170,10 @@ mod asynchronous {
         /// Configure an existing source; concurrency must be in 1..=1024.
         pub fn new(source: LocalFileSource, concurrency: usize) -> Result<Self> {
             if !(1..=1024).contains(&concurrency) {
-                return Err(Error::Unsupported(
-                    "local read concurrency must be 1..=1024",
-                ));
+                return Err(Error::InvalidOptions {
+                    option: "concurrency",
+                    reason: "must be between 1 and 1024",
+                });
             }
             Ok(Self {
                 source: Arc::new(source),
@@ -206,24 +219,23 @@ mod asynchronous {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::backend::BlockingBuilder;
-        use crate::{Archive, Entry, ReaderOptions};
+        use crate::blocking::Builder as BlockingBuilder;
+        use crate::{Archive, ReaderOptions};
         use tokio::sync::Notify;
 
         #[tokio::test]
         async fn indexed_reads_are_exact_concurrent_and_verified() {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("archive");
-            let mut writer = BlockingBuilder::with_options(
+            let mut writer = BlockingBuilder::try_with_options(
                 Vec::new(),
-                1024,
-                3,
-                crate::ManifestOptions::default(),
+                crate::WriterOptions {
+                    frame_size: 1024,
+                    ..Default::default()
+                },
             )
             .unwrap();
-            writer
-                .add_file(Entry::file("a"), 16_384, &mut vec![7; 16_384].as_slice())
-                .unwrap();
+            writer.append_bytes("a", &vec![7; 16_384]).unwrap();
             std::fs::write(&path, writer.finish().unwrap()).unwrap();
             let source = Arc::new(AsyncLocalFileSource::open(&path).await.unwrap());
             let reader = Archive::open_with_options(source.clone(), ReaderOptions::default())
@@ -298,6 +310,7 @@ mod asynchronous {
         }
     }
 }
+#[cfg(feature = "async")]
 pub use asynchronous::AsyncLocalFileSource;
 
 #[cfg(test)]

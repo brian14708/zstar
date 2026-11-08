@@ -2,8 +2,9 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use zstar::backend::{BlockingArchive, EncodedObjectResolver};
-use zstar::backend::{ManifestOptions, SliceReader};
+use zstar::blocking::{
+    Archive as BlockingArchive, MemorySource, ObjectResolver as EncodedObjectResolver,
+};
 use zstar::{Error, Result};
 
 fn root() -> PathBuf {
@@ -58,16 +59,17 @@ impl EncodedObjectResolver for Objects {
             .ok_or(Error::MissingObject(address))
     }
 }
-fn options(case: &Value) -> ManifestOptions {
-    let mut options = ManifestOptions::default();
+fn options(case: &Value) -> zstar::blocking::ReaderOptions {
+    let mut options = zstar::blocking::ReaderOptions::default();
     if let Some(value) = case["limits"]["memory_bytes"].as_u64() {
-        options.memory_bytes = value;
+        options.metadata.max_retained_entry_bytes = value;
+        options.metadata.max_page_bytes = value;
     }
     if let Some(value) = case["limits"]["max_read_bytes"].as_u64() {
         options.max_read_bytes = value;
     }
     if let Some(value) = case["limits"]["max_decoded_bytes"].as_u64() {
-        options.max_decoded_bytes = value;
+        options.metadata.max_page_bytes = value;
     }
     if let Some(limits) = case["limits"]["limits"].as_object() {
         for (name, value) in limits {
@@ -119,19 +121,19 @@ fn entry_manifest_operations_match_independent_corpus() {
         let bytes = artifact(case["archive"].as_str().unwrap());
         check_hash(&case, &bytes);
         let result = (|| {
-            let mut reader = BlockingArchive::open(SliceReader::new(&bytes), options(&case))?;
-            let mut objects = Objects::from_case(&case);
+            let mut config = options(&case);
+            config.resolver = Some(Box::new(Objects::from_case(&case)));
+            config.verify_external = case["verify_external"].as_bool().unwrap_or(false);
+            let mut reader = BlockingArchive::open_with_options(MemorySource::new(&bytes), config)?;
             if case["request"].is_null() {
                 return Ok(());
             }
             let (path, offset, length) = request(&case);
-            let actual = reader.read(
+            let (actual, report) = reader.read_range_with_report(
                 path,
-                offset,
-                length,
-                Some(&mut objects),
-                case["verify_external"].as_bool().unwrap_or(false),
+                offset..offset.checked_add(length).ok_or(Error::Range)?,
             )?;
+            assert!(report.metadata_validated);
             assert_eq!(
                 actual,
                 hex::decode(case["range_result_hex"].as_str().unwrap()).unwrap(),
@@ -186,16 +188,7 @@ mod asynchronous {
                     ReaderOptions {
                         limits: config.limits,
                         max_read_bytes: config.max_read_bytes,
-                        metadata: zstar::MetadataReaderOptions {
-                            max_encoded_bytes: config.max_encoded_bytes,
-                            max_decoded_bytes: config.max_decoded_bytes,
-                            max_retained_entry_bytes: config.max_retained_entry_bytes,
-                            max_entries: config.max_entries,
-                            spool: zstar::SpoolOptions {
-                                memory_bytes: config.memory_bytes,
-                                ..Default::default()
-                            },
-                        },
+                        metadata: config.metadata,
                         resolver: Some(Arc::new(Objects::from_case(&case))),
                         verify_external: case["verify_external"].as_bool().unwrap_or(false),
                         ..Default::default()

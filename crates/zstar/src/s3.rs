@@ -27,6 +27,9 @@ use tokio::sync::{OnceCell, Semaphore};
 pub use object_store;
 pub use object_store::{aws::AmazonS3, path::Path};
 
+mod upload;
+pub use upload::{ArchiveUpload, MIN_PART_BYTES, UploadCleanupError, UploadMode};
+
 /// Explicit S3 configuration for the core adapter.
 ///
 /// This deliberately has no `from_env` constructor. Region and either static
@@ -274,7 +277,10 @@ impl S3RangeSource {
             .get_or_try_init(|| async {
                 let suffix = self.max_range_bytes.min(128 << 10);
                 if suffix == 0 {
-                    return Err(Error::Budget("S3 range size"));
+                    return Err(crate::Error::budget(
+                        crate::BudgetResource::RangeBytes,
+                        "S3 range size",
+                    ));
                 }
                 let result = self
                     .store
@@ -349,7 +355,10 @@ impl AsyncRangeReader for S3RangeSource {
             return Ok(Bytes::new());
         }
         if range.end - range.start > self.max_range_bytes {
-            return Err(Error::Budget("S3 range size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::RangeBytes,
+                "S3 range size",
+            ));
         }
         let tail_start = meta.size - pinned.tail.len() as u64;
         if range.start >= tail_start {
@@ -400,15 +409,23 @@ impl AsyncRangeReader for S3RangeSource {
 pub(crate) async fn read_exact(result: GetResult, count: u64) -> Result<Bytes> {
     use futures_util::StreamExt;
     let mut stream = result.into_stream();
-    let count = usize::try_from(count).map_err(|_| Error::Budget("S3 response size"))?;
+    let count = usize::try_from(count).map_err(|_| {
+        crate::Error::budget(crate::BudgetResource::ResponseBytes, "S3 response size")
+    })?;
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(count)
-        .map_err(|_| Error::Budget("S3 response allocation"))?;
+    bytes.try_reserve_exact(count).map_err(|_| {
+        crate::Error::budget(
+            crate::BudgetResource::AllocationBytes,
+            "S3 response allocation",
+        )
+    })?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(storage_error)?;
         if chunk.len() > count - bytes.len() {
-            return Err(Error::Budget("oversized storage response"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::ResponseBytes,
+                "oversized storage response",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -469,7 +486,7 @@ impl S3BlobStore {
             .permits
             .acquire()
             .await
-            .map_err(|_| Error::Budget("object store closed"))?;
+            .map_err(|_| Error::Unsupported("object store closed"))?;
         // Content addresses are verified by the reader, so a single bounded
         // GET suffices without a separate metadata probe or version pin.
         let result = match self.store.get(&(self.key)(digest)).await {
@@ -480,7 +497,10 @@ impl S3BlobStore {
         };
         let size = result.meta.size;
         if size == 0 || size > limit {
-            return Err(Error::Budget("encoded object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::EncodedObjectBytes,
+                "encoded object size",
+            ));
         }
         if result.range != (0..size) {
             return Err(Error::MalformedFrame(
@@ -496,14 +516,17 @@ impl S3BlobStore {
     )]
     pub async fn put(&self, raw: Bytes) -> Result<Extent> {
         if raw.is_empty() {
-            return Err(Error::Budget("external object size"));
+            return Err(crate::Error::budget(
+                crate::BudgetResource::ExternalObjectBytes,
+                "external object size",
+            ));
         }
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| Error::Budget("object store closed"))?;
+            .map_err(|_| Error::Unsupported("object store closed"))?;
         let raw_for_digest = raw.clone();
         let (digest, permit) = tokio::task::spawn_blocking(move || {
             (*Digest::sha256(&raw_for_digest).as_bytes(), permit)
@@ -525,7 +548,12 @@ impl S3BlobStore {
                     offset: 0,
                 });
             }
-            Ok(_) => return Err(Error::Budget("encoded object size")),
+            Ok(_) => {
+                return Err(crate::Error::budget(
+                    crate::BudgetResource::EncodedObjectBytes,
+                    "encoded object size",
+                ));
+            }
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(storage_error(error)),
         }
@@ -555,7 +583,10 @@ impl S3BlobStore {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let meta = self.store.head(&path).await.map_err(storage_error)?;
                 if meta.size == 0 {
-                    return Err(Error::Budget("encoded object size"));
+                    return Err(crate::Error::budget(
+                        crate::BudgetResource::EncodedObjectBytes,
+                        "encoded object size",
+                    ));
                 }
                 meta.size
             }
