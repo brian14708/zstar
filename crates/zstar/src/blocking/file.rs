@@ -149,7 +149,7 @@ impl<'a, R: RangeReader> File<'a, R> {
         Ok(count)
     }
     /// Copy the remaining content, preserving codec and resolver error types.
-    #[cfg(any(test, feature = "fs"))]
+    #[cfg(any(test, all(feature = "fs", unix)))]
     pub(crate) fn copy_to(&mut self, output: &mut impl std::io::Write) -> Result<u64> {
         let mut size = 0_u64;
         loop {

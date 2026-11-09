@@ -1338,7 +1338,7 @@ fn owner_and_time(meta: &cap_std::fs::Metadata) -> Result<(u64, u64, i64)> {
     ))
 }
 #[cfg(not(unix))]
-fn owner_and_time(_: &cap_std::fs::Metadata) -> Result<(u64, u64, i64)> {
+const fn owner_and_time(_: &cap_std::fs::Metadata) -> Result<(u64, u64, i64)> {
     Err(Error::InvalidInput(
         "packing requires Unix filesystem metadata",
     ))

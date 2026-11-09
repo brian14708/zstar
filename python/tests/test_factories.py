@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -42,7 +43,18 @@ def test_owned_round_trip(tmp_path, asynchronous, kind):
             assert archive.read("data") == b"hello"
 
 
-@pytest.mark.parametrize("name", ["file:archive", "https://bucket/archive"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "file:archive",
+        pytest.param(
+            "https://bucket/archive",
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="Windows reserves colons in directory names"
+            ),
+        ),
+    ],
+)
 def test_path_objects_preserve_literal_local_names(tmp_path, monkeypatch, name):
     monkeypatch.chdir(tmp_path)
     Path(name).parent.mkdir(parents=True, exist_ok=True)
@@ -76,8 +88,15 @@ def test_symlink_dot_dot_keeps_filesystem_resolution(tmp_path, asynchronous):
             writer.writestr("data", b"correct destination")
         with zstar.open(path) as archive:
             assert archive.read("data") == b"correct destination"
-    assert protected.read_bytes() == b"do not overwrite"
-    assert (remote / "archive").exists()
+    if os.name == "nt":
+        # Windows collapses '..' before following directory symlinks.
+        expected = protected
+        assert not (remote / "archive").exists()
+    else:
+        expected = remote / "archive"
+        assert protected.read_bytes() == b"do not overwrite"
+    with zstar.open(expected) as archive:
+        assert archive.read("data") == b"correct destination"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -211,7 +230,7 @@ def test_modes_and_missing_files(tmp_path):
 @pytest.mark.parametrize(
     "location,settings,message",
     [
-        ("file:///tmp/unused", {"headers": {"X-Test": "value"}}, "HTTP settings"),
+        ("local", {"headers": {"X-Test": "value"}}, "HTTP settings"),
         ("s3://bucket/archive", {}, "S3Options"),
         (
             "https://example.invalid/archive",
@@ -220,7 +239,10 @@ def test_modes_and_missing_files(tmp_path):
         ),
     ],
 )
-def test_storage_validation_precedes_io(asynchronous, location, settings, message):
+def test_storage_validation_precedes_io(tmp_path, asynchronous, location, settings, message):
+    if location == "local":
+        location = (tmp_path / "unused").as_uri()
+
     async def run():
         with pytest.raises(ValueError, match=message):
             await zstar.open(location, storage_options=AsyncSourceOptions(**settings), async_=True)

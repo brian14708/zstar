@@ -49,7 +49,7 @@ impl MetadataBuffer {
                 ..usize::try_from(range.end).map_err(|_| Error::Range)?],
         )
     }
-    #[cfg(any(feature = "fs", test))]
+    #[cfg(any(test, all(feature = "fs", unix)))]
     pub(crate) fn append_record(&mut self, value: &Value) -> Result<()> {
         self.append_encoded_record(&crate::cbor::encode_checked(value)?)
     }

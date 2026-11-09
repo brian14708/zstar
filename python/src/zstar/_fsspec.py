@@ -6,6 +6,7 @@ import asyncio
 import errno
 import io
 import os
+import sys
 import threading
 from collections.abc import Coroutine, Mapping
 from contextlib import suppress
@@ -69,41 +70,53 @@ def _write_all(output: BinaryIO, data: bytes) -> None:
         remaining = remaining[count:]
 
 
-def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
-    """Walk pinned directory descriptors; reject symlinks at every component."""
-    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+if sys.platform == "win32":
+
+    def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
         raise NotImplementedError(
             "confined local downloads require descriptor-relative no-follow I/O"
         )
-    # Resolve '.' and '..' lexically before opening anything, without following links.
-    absolute = Path(os.path.abspath(path))
-    parts = absolute.parts[1:]
-    fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        parents = parts if directory else parts[:-1]
-        for component in parents:
-            with suppress(FileExistsError):
-                os.mkdir(component, dir_fd=fd)
-            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = child
-        if directory:
-            return None
-        leaf = os.open(
-            parts[-1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666, dir_fd=fd
-        )
-        try:
-            import stat
 
-            if not stat.S_ISREG(os.fstat(leaf).st_mode):
-                raise OSError("local download destination must be a regular file")
-            os.ftruncate(leaf, 0)
-            return os.fdopen(leaf, "wb")
-        except BaseException:
-            os.close(leaf)
-            raise
-    finally:
-        os.close(fd)
+else:
+
+    def _local_destination(path: Path, *, directory: bool = False) -> BinaryIO | None:
+        """Walk pinned directory descriptors; reject symlinks at every component."""
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            raise NotImplementedError(
+                "confined local downloads require descriptor-relative no-follow I/O"
+            )
+        # Resolve '.' and '..' lexically before opening anything, without following links.
+        absolute = Path(os.path.abspath(path))
+        parts = absolute.parts[1:]
+        fd = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            parents = parts if directory else parts[:-1]
+            for component in parents:
+                with suppress(FileExistsError):
+                    os.mkdir(component, dir_fd=fd)
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            if directory:
+                return None
+            leaf = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o666,
+                dir_fd=fd,
+            )
+            try:
+                import stat
+
+                if not stat.S_ISREG(os.fstat(leaf).st_mode):
+                    raise OSError("local download destination must be a regular file")
+                os.ftruncate(leaf, 0)
+                return os.fdopen(leaf, "wb")
+            except BaseException:
+                os.close(leaf)
+                raise
+        finally:
+            os.close(fd)
 
 
 def _range_bounds(size: int, start: int | None, end: int | None) -> tuple[int, int]:

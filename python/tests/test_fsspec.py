@@ -694,8 +694,14 @@ def test_bulk_helpers_and_batched_ranges(tmp_path, monkeypatch):
             fs.cat_ranges(["missing"], 0, 2, on_error="raise")
         assert fs.cat(["a.txt", "b.txt"]) == {"a.txt": b"hello", "b.txt": b"world"}
         assert fs.find("") == ["a.txt", "b.txt"]
-        fs.get("a.txt", str(tmp_path / "copy.txt"))
-        assert (tmp_path / "copy.txt").read_bytes() == b"hello"
+        destination = tmp_path / "copy.txt"
+        if os.name == "posix":
+            fs.get("a.txt", str(destination))
+            assert destination.read_bytes() == b"hello"
+        else:
+            with pytest.raises(NotImplementedError, match="descriptor-relative no-follow I/O"):
+                fs.get("a.txt", str(destination))
+            assert not destination.exists()
         assert dict(fs.get_mapper())["b.txt"] == b"world"
 
 

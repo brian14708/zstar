@@ -1,5 +1,5 @@
 //! Shared bounded frame/object decoding and physical frame scanning.
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 use crate::primitives::RangeReader;
 use crate::{Error, Limits, Result};
 
@@ -164,7 +164,7 @@ pub fn fetch_frame<R: RangeReader>(source: &mut R, start: u64, end: u64) -> Resu
     clippy::items_after_statements,
     reason = "Keep local helpers next to the operation that uses them."
 )]
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 pub fn fetch_frame_with_limits<R: RangeReader>(
     source: &mut R,
     start: u64,

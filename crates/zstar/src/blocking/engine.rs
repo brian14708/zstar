@@ -1,12 +1,12 @@
 //! Eager metadata loading, selective reads, and internal physical validation.
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 use crate::Limits;
 use crate::decoded_body::DecodedBody;
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 use crate::frame::{decode_content_with_limits, fetch_frame_with_limits};
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 use crate::manifest::{Entry, EntryKind, Extent, Source, decode_pointer_bounded};
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 use crate::manifest_io::MetadataBuffer;
 use crate::manifest_io::{ManifestOptions, ManifestReader};
 use crate::primitives::RangeReader;
@@ -16,7 +16,7 @@ use crate::ReadReport;
 use crate::blocking::ObjectResolver as EncodedObjectResolver;
 use crate::read_plan::{Key, Plan, build_plan, decode, record, validate_copy};
 
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 fn invalid(reason: &str) -> Error {
     Error::MalformedToc(reason.into())
 }
@@ -24,7 +24,7 @@ fn invalid(reason: &str) -> Error {
 pub struct BlockingArchive<R: RangeReader> {
     source: R,
     manifest: ManifestReader,
-    #[cfg(any(test, feature = "fs"))]
+    #[cfg(any(test, all(feature = "fs", unix)))]
     data_end: u64,
     options: ManifestOptions,
 }
@@ -46,7 +46,7 @@ impl<R: RangeReader> BlockingArchive<R> {
         Ok(Self {
             source,
             manifest,
-            #[cfg(any(test, feature = "fs"))]
+            #[cfg(any(test, all(feature = "fs", unix)))]
             data_end: footer.metadata_range(len)?.start,
             options,
         })
@@ -168,7 +168,7 @@ impl<R: RangeReader> BlockingArchive<R> {
     /// External payloads are pointer JSON.
     /// # Errors
     /// Returns physical tar/manifest mismatch, frame, source, budget, or visitor errors.
-    #[cfg(any(test, feature = "fs"))]
+    #[cfg(any(test, all(feature = "fs", unix)))]
     pub fn visit_payloads(
         &mut self,
         mut visitor: impl FnMut(&Entry, &[u8]) -> Result<()>,
@@ -383,7 +383,7 @@ impl<R: RangeReader> BlockingArchive<R> {
     }
 }
 
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 fn normalized_extents(extents: &[Extent]) -> impl Iterator<Item = Extent> + '_ {
     let mut entries = extents.iter().peekable();
     std::iter::from_fn(move || {

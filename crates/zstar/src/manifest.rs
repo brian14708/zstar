@@ -831,7 +831,7 @@ pub(crate) fn decode_pointer(bytes: &[u8]) -> Result<Vec<Extent>> {
     decode_pointer_bounded(bytes, usize::MAX)
 }
 
-#[cfg(any(test, feature = "fs"))]
+#[cfg(any(test, all(feature = "fs", unix)))]
 pub(crate) fn decode_pointer_bounded(bytes: &[u8], maximum_chunks: usize) -> Result<Vec<Extent>> {
     struct ChunkVisitor(usize);
     impl<'de> serde::de::Visitor<'de> for ChunkVisitor {

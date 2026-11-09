@@ -82,7 +82,7 @@ impl LocalOutput {
                 }
                 match parent.open_with(&name, &options) {
                     Ok(file) => {
-                        output = Some((name, file.into_std()));
+                        output = Some((name, file));
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
@@ -96,7 +96,7 @@ impl LocalOutput {
                 )
             })?
         } else {
-            let file = parent.open_with(&destination, &options)?.into_std();
+            let file = parent.open_with(&destination, &options)?;
             (destination.clone(), file)
         };
         let metadata = file.metadata()?;
@@ -104,7 +104,7 @@ impl LocalOutput {
             return Err(io::Error::other("file sink requires a regular file"));
         }
         Ok(Self {
-            file: Arc::new(Mutex::new(file)),
+            file: Arc::new(Mutex::new(file.into_std())),
             parent,
             name,
             identity: (metadata.dev(), metadata.ino()),
